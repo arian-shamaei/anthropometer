@@ -20,8 +20,8 @@ ground-truth PDF report of the whole session.
 
 ## 🎛️ AI usage
 
-```text
- hand-written ▕████████████████████████████████████████████▏ vibe coded  ◄ 100%
+```text                                                             **100% ↴** 
+ hand-written ▕████████████████████████████████████████████████████████████▏ vibe coded  
               └── none ──── copilot ──── pair-programmed ──── VIBE CODED ──┘
 ```
 
