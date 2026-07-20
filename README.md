@@ -110,6 +110,20 @@ the session actually did.
 
 ## Install
 
+### Quick install (prebuilt binary)
+
+No Rust, no Homebrew — one line downloads the binary + engine for your platform
+(macOS arm64/x86_64, Linux x86_64/arm64) and installs it under `~/.local`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/arian-shamaei/anthropometer/main/install.sh | sh
+```
+
+If `~/.local/bin` isn't on your `PATH`, the installer tells you how to add it.
+Override the install prefix with `AMTR_PREFIX` or pin a version with `AMTR_VERSION`.
+The live TUI needs only `python3` (≥3.9, stdlib); the **report** extras (`R`) still
+need `pip install matplotlib pillow` plus `brew install tectonic`.
+
 ### Homebrew (recommended)
 
 ```sh

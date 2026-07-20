@@ -1,0 +1,91 @@
+name: release
+
+# Fires when a version tag is pushed (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+# Builds `amtr` natively on each platform, bundles it WITH the Python engine, and
+# attaches the tarballs (plus install.sh) to the GitHub release for that tag.
+on:
+  push:
+    tags:
+      - "v*"
+
+# softprops/action-gh-release needs write access to create/attach release assets.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon macOS — native on the arm64 runner.
+          - target: aarch64-apple-darwin
+            os: macos-14
+          # Intel macOS — native on the x86_64 runner. (macos-13 was retired by
+          # GitHub; macos-15-intel is the current Intel-hardware macOS runner.)
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          # x86_64 Linux (glibc) — native on the standard runner.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # arm64 Linux (glibc) — native on GitHub's arm64 runner.
+          # NOTE: `ubuntu-24.04-arm` requires the arm64 runner to be available to
+          # this repo (public repos / enabled). If a release ever fails to
+          # schedule this job, drop this matrix entry and rebuild — the installer
+          # will simply have no aarch64-linux asset to fetch.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build amtr (release, locked)
+        run: >-
+          cargo build --release --locked
+          --manifest-path rust/Cargo.toml
+          --target ${{ matrix.target }}
+
+      - name: Assemble bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          target="${{ matrix.target }}"
+          bundle="amtr-${tag}-${target}"
+
+          # Everything a user needs at runtime lives side-by-side in the bundle:
+          # the binary, all 5 engine modules, and the license/readme. The engine
+          # sits RIGHT NEXT TO the binary so ipc.rs::default_engine_path()'s
+          # "next to the executable" check wins after install.
+          mkdir -p "$bundle"
+          cp "rust/target/${target}/release/amtr" "$bundle/"
+          cp amtr_engine.py amtr_figures.py amtr_paper.py amtr_phases.py amtr_turns.py "$bundle/"
+          cp LICENSE README.md "$bundle/"
+
+          # Flat tarball (no leading directory): `tar -C "$bundle" .` archives the
+          # bundle's CONTENTS. install.sh extracts these straight into libexec/amtr.
+          tar -czf "${bundle}.tar.gz" -C "$bundle" .
+
+          echo "TARBALL=${bundle}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Attach tarball to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TARBALL }}
+
+      # Upload install.sh from exactly ONE job so the four jobs don't race to
+      # attach the same asset. (The tarballs are uniquely named per target, so
+      # those upload concurrently without conflict.)
+      - name: Attach install.sh to release
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: install.sh
