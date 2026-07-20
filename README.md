@@ -13,27 +13,17 @@ ground-truth PDF report of the whole session.
 <sub>↑ replaying a session turn-by-turn: the context map fills, the composition shifts, the trend climbs.</sub>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-&nbsp;·&nbsp; [![vibe coded](https://img.shields.io/badge/AI%20usage-vibe%20coded-ff2d78)](#-ai-usage-vibe-coded)
+&nbsp;·&nbsp; [![vibe coded](https://img.shields.io/badge/AI%20usage-vibe%20coded-ff2d78)](#-ai-usage)
 &nbsp;·&nbsp; Rust + ratatui TUI · Python engine · terminal-only
 
 ---
 
-## 🎛️ AI usage: vibe coded
-
-**Full transparency.** `amtr` was **vibe coded** — designed and written end to end in a
-tight loop with Claude (Anthropic's Opus). A human owned the vision, the visual taste,
-and every judgment call; the model wrote essentially all of the code, tests, figures,
-and this README.
+## 🎛️ AI usage
 
 ```text
- AI usage
  hand-written ▕████████████████████████████████████████████▏ vibe coded  ◄ 100%
               └── none ──── copilot ──── pair-programmed ──── VIBE CODED ──┘
 ```
-
-No asterisks about it: if AI authorship is a dealbreaker for you, now you know. If it
-isn't — every line was built and checked against real Claude Code sessions' ground
-truth, and the tests, the report pipeline, and this repo are all here for you to judge.
 
 ---
 
@@ -124,6 +114,7 @@ the session actually did.
 
 ```sh
 brew tap arian-shamaei/anthropometer
+brew trust arian-shamaei/anthropometer   # newer Homebrew asks you to trust third-party taps
 brew install amtr
 ```
 
