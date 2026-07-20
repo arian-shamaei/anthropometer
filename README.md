@@ -8,10 +8,32 @@ spent, which files and tools are resident, when compactions fire, what subagents
 are doing, and the true cost of every turn. Press **`R`** and it compiles a
 ground-truth PDF report of the whole session.
 
-![amtr overview](docs/assets/tui-overview.png)
+![amtr — the context window filling up over a session](docs/assets/context-fill.gif)
+
+<sub>↑ replaying a session turn-by-turn: the context map fills, the composition shifts, the trend climbs.</sub>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-&nbsp;·&nbsp; Rust + ratatui TUI · Python engine · terminal-only, nothing leaves your machine
+&nbsp;·&nbsp; [![vibe coded](https://img.shields.io/badge/AI%20usage-vibe%20coded-ff2d78)](#-ai-usage-vibe-coded)
+&nbsp;·&nbsp; Rust + ratatui TUI · Python engine · terminal-only
+
+---
+
+## 🎛️ AI usage: vibe coded
+
+**Full transparency.** `amtr` was **vibe coded** — designed and written end to end in a
+tight loop with Claude (Anthropic's Opus). A human owned the vision, the visual taste,
+and every judgment call; the model wrote essentially all of the code, tests, figures,
+and this README.
+
+```text
+ AI usage
+ hand-written ▕████████████████████████████████████████████▏ vibe coded  ◄ 100%
+              └── none ──── copilot ──── pair-programmed ──── VIBE CODED ──┘
+```
+
+No asterisks about it: if AI authorship is a dealbreaker for you, now you know. If it
+isn't — every line was built and checked against real Claude Code sessions' ground
+truth, and the tests, the report pipeline, and this repo are all here for you to judge.
 
 ---
 
@@ -34,6 +56,8 @@ A fast, keyboard-driven terminal UI. Tabs `1`–`6`, `f` for the session picker,
 `i` to inspect, `R` to build a report, `?` for help, `q` to quit.
 
 ### Context map — where your budget actually goes
+
+![context map, composition legend, and resident trend](docs/assets/tui-overview.png)
 
 The resident context as a **fixed-scale grid**: the whole box *is* the budget, and
 every cell is colored by what occupies it — system overhead, file content, hidden
