@@ -699,13 +699,30 @@ pub struct SpawnCfg {
     pub passthrough: Vec<String>,
 }
 
-/// Compile-time default engine path: `amtr_engine.py` in the repo root
-/// (the parent of this crate's manifest dir). Overridable at runtime by the
-/// `AMTR_ENGINE` env var and the `--engine` flag (SPEC §e).
+/// Where to find `amtr_engine.py`, checked in order (overridable by `--engine`):
+///   1. the `AMTR_ENGINE` env var (Homebrew's wrapper sets this),
+///   2. next to the executable, or `../libexec` / `../lib/amtr` beside it — how
+///      prebuilt-binary bundles and Homebrew-style layouts ship the engine,
+///   3. the compile-time repo path (dev builds / `cargo install --path`).
 pub fn default_engine_path() -> PathBuf {
     if let Ok(p) = std::env::var("AMTR_ENGINE") {
         if !p.is_empty() {
             return PathBuf::from(p);
+        }
+    }
+    // beside the running binary — makes a downloaded `amtr` + `amtr_engine.py`
+    // bundle work from anywhere, no env var or repo needed
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for cand in [
+                dir.join("amtr_engine.py"),
+                dir.join("../libexec/amtr_engine.py"),
+                dir.join("../lib/amtr/amtr_engine.py"),
+            ] {
+                if cand.is_file() {
+                    return cand;
+                }
+            }
         }
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
