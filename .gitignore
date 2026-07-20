@@ -1,0 +1,10 @@
+rust/target/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# generated report artifacts (README assets live under docs/ and are committed)
+/*.pdf
+/*.gif
+/scratch/

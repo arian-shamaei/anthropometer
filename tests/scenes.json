@@ -1,0 +1,35 @@
+{
+  "launch": "./rust/target/release/amtr --demo",
+  "cwd": "..",
+  "size": [110, 34],
+  "settle_ms": 1600,
+  "relaunch_per_scene": true,
+  "chrome_rows": [0, 1, 2, 33],
+  "anim_threshold": 12,
+  "chrome": {
+    "rows": {
+      "0": ["amtr"],
+      "1": ["OVERVIEW", "SHELL"]
+    }
+  },
+  "scenes": [
+    {"name": "overview-class",   "keys": [],                    "animated": false, "expect_contains": ["class", "overhead", "LIVE"]},
+    {"name": "overview-heat",    "keys": ["m"],                 "animated": true,  "expect_contains": ["heat"]},
+    {"name": "overview-age",     "keys": ["m", "m"],            "animated": false, "expect_contains": ["age"]},
+    {"name": "overview-cache",   "keys": ["m", "m", "m"],       "animated": false, "expect_contains": ["cache"]},
+    {"name": "inspect-spotlight","keys": ["i", "Right", "Right", "Right", "Right", "Right"], "animated": true, "focus_rows": [3,4,5,6,7,8,9,10,11,12], "expect_contains": ["#", "tok"]},
+    {"name": "inspect-peek",     "keys": ["i", "Enter"],        "animated": false, "overlay": true, "expect_contains": ["PEEK", "overhead"]},
+    {"name": "files-history",    "keys": ["2"],                 "animated": false, "expect_contains": ["waste", "path"]},
+    {"name": "files-now",        "keys": ["2", "v"],            "animated": true,  "expect_contains": ["AGE", "hot", "cold"]},
+    {"name": "turns",            "keys": ["3"],                 "animated": false, "expect_contains": ["cr", "hit"]},
+    {"name": "agents",           "keys": ["4"],                 "animated": true,  "expect_contains": ["fan-out", "own-tok"]},
+    {"name": "events",           "keys": ["5"],                 "animated": false, "expect_contains": ["compaction", "thrash"]},
+    {"name": "shell-console",    "keys": ["6"],                 "animated": false, "expect_contains": ["cmds", "FOLLOW"]},
+    {"name": "shell-retrieval",  "keys": ["6", "v"],            "animated": false, "expect_contains": ["pulls", "web"]},
+    {"name": "fleet",            "keys": ["f"],                 "animated": false, "overlay": true, "expect_contains": ["brisk-otter", "notes-site"]},
+    {"name": "help-keys",        "keys": ["?"],                 "animated": false, "overlay": true, "expect_contains": ["keys + legend"]},
+    {"name": "help-numbers",     "keys": ["?", "?"],            "animated": false, "overlay": true, "expect_contains": ["hot/cold", "waste", "ku"]},
+    {"name": "help-anatomy",     "keys": ["?", "?", "?"],       "animated": false, "overlay": true, "expect_contains": ["MAP modes", "cache"]},
+    {"name": "postmortem",       "keys": ["c"],                 "animated": false, "overlay": true, "expect_contains": ["COMPACTION", "dropped"]}
+  ]
+}
