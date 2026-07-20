@@ -4123,7 +4123,7 @@ mod screenshots {
         press(&mut app, KeyCode::Enter);
         let s = draw(&mut app, 110, 30);
         assert!(s.contains("# build the workspace"), "desc comment missing:\n{s}");
-        assert!(s.contains("Compiling amtr v0.1.0"), "full tail missing:\n{s}");
+        assert!(s.contains("Compiling amtr v0.1.1"), "full tail missing:\n{s}");
         press(&mut app, KeyCode::Enter);
         let s = draw(&mut app, 110, 30);
         assert!(!s.contains("# build the workspace"), "collapse failed:\n{s}");
