@@ -2,11 +2,11 @@ class Amtr < Formula
   desc "Btop-style real-time context monitor for Claude Code sessions"
   homepage "https://github.com/arian-shamaei/anthropometer"
   # TODO-confirm(tag): confirm the first release tag. NOTE: rust/Cargo.toml is
-  url "https://github.com/arian-shamaei/anthropometer/archive/refs/tags/v0.1.1.tar.gz"
+  url "https://github.com/arian-shamaei/anthropometer/archive/refs/tags/v0.1.2.tar.gz"
   # TODO-fill(sha256): filled AFTER the release exists. Get it with either
   #   shasum -a 256 v0.1.0.tar.gz        # on the downloaded release tarball
   #   brew fetch --formula ./amtr.rb     # brew prints the computed SHA-256
-  sha256 "9338446a4771b98733ecf3c86d4eddf0d62c6edd625bbe50ce26edf67251ec03"
+  sha256 "TODO_V012"
   license "MIT"
   head "https://github.com/arian-shamaei/anthropometer.git", branch: "main"
 
