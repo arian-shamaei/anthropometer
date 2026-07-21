@@ -3782,6 +3782,24 @@ fn help_frame(title: &str, lines: Vec<Line<'static>>, f: &mut Frame<'_>, area: R
 pub const TAB_NAMES: [&str; 6] = ["OVERVIEW", "FILES", "TURNS", "AGENTS", "EVENTS", "SHELL"];
 
 /// Row 0 — status ribbon.
+/// The `amtr` wordmark for the ribbon — bold-script letterforms swept by a
+/// cyan→magenta gradient. Renders single-width in a Nerd Font; falls back to
+/// plain glyphs elsewhere (still colored), so the brand always reads as amtr.
+fn amtr_wordmark() -> Vec<Span<'static>> {
+    const MARK: [(&str, (u8, u8, u8)); 4] = [
+        ("𝓪", (64, 202, 226)),
+        ("𝓶", (108, 154, 240)),
+        ("𝓽", (176, 138, 255)),
+        ("𝓻", (232, 100, 180)),
+    ];
+    let mut out: Vec<Span<'static>> = MARK
+        .iter()
+        .map(|(g, c)| Span::styled((*g).to_string(), fg(*c).add_modifier(Modifier::BOLD)))
+        .collect();
+    out.push(Span::raw(" "));
+    out
+}
+
 pub fn render_ribbon(
     st: &State,
     engine_dead: bool,
@@ -3826,10 +3844,7 @@ pub fn render_ribbon(
                 .to_string()
         })
         .unwrap_or_default();
-    let mut spans: Vec<Span<'static>> = vec![Span::styled(
-        "amtr ".to_string(),
-        fg(C_FG).add_modifier(Modifier::BOLD),
-    )];
+    let mut spans: Vec<Span<'static>> = amtr_wordmark();
     if engine_dead {
         spans.push(Span::styled(
             "ENGINE DEAD ".to_string(),

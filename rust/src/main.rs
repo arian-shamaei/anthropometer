@@ -2877,9 +2877,10 @@ mod screenshots {
             );
             assert!(ribbon.contains("busy"), "health lost at {w}:\n{ribbon}");
         }
-        // narrow: never panics, still leads with the app name
+        // narrow: never panics, still leads with the amtr wordmark (bold-script
+        // glyphs — first letter is 𝓪 / U+1D4EA)
         let s = draw(&mut app, 60, 30);
-        assert!(s.lines().next().unwrap_or("").starts_with("amtr"));
+        assert!(s.lines().next().unwrap_or("").starts_with('𝓪'));
     }
 
     #[test]
