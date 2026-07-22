@@ -26,6 +26,17 @@ pub(crate) fn populate(app: &mut App, now: f64) {
     let seg = |id: u64, c: &str, tok: u64, file: Option<u64>, born: u64, age_s: f64| -> Seg {
         Seg { id, cat: cat(c), tok, file, born, ts: now - age_s }
     };
+    // per-agent context map (SPEC b `agent.map`): the stripped {cat,tok,file}
+    // seg shape (id/born/ts default), resident summed from the composition so
+    // the mini-map renders richly in `--demo` for screenshots/tests.
+    let amap = |budget: u64, comp: &[(&str, u64, Option<u64>)]| -> MapMsg {
+        let segs: Vec<Seg> = comp
+            .iter()
+            .map(|&(c, tok, file)| Seg { id: 0, cat: cat(c), tok, file, born: 0, ts: now })
+            .collect();
+        let resident: u64 = comp.iter().map(|&(_, tok, _)| tok).sum();
+        MapMsg { rev: 0, alpha: 1.0, segs, resident: Some(resident), budget: Some(budget) }
+    };
     let fa = |turn: u64, file: u64, op: Op, tok: u64| -> Faccess {
         Faccess { turn, ts: format!("16:{:02}:00", turn % 60), file, op, tok }
     };
@@ -206,6 +217,8 @@ pub(crate) fn populate(app: &mut App, now: f64) {
             rev: 2,
             alpha: 0.97,
             segs,
+            resident: None,
+            budget: None,
         }));
         let cats: HashMap<String, u64> = [
             ("overhead", 18_000u64),
@@ -271,6 +284,19 @@ pub(crate) fn populate(app: &mut App, now: f64) {
             dur_ms: Some(480_000),
             t0: now - 2_000.0,
             ts_last: now - 1_520.0,
+            // explore: file-heavy survey, moderate fill
+            map: Some(amap(
+                200_000,
+                &[
+                    ("overhead", 14_000, None),
+                    ("user", 3_000, None),
+                    ("file", 40_000, Some(0)),
+                    ("assistant", 30_000, None),
+                    ("thinking", 8_000, None),
+                    ("file", 20_000, Some(1)),
+                    ("bash", 5_000, None),
+                ],
+            )),
         }));
         st.apply(Update::Agent(AgentRec {
             id: "agent-b2".into(),
@@ -288,6 +314,17 @@ pub(crate) fn populate(app: &mut App, now: f64) {
             dur_ms: Some(90_000),
             t0: now - 800.0,
             ts_last: now - 710.0,
+            // builder: assistant/tool weighted, lighter fill
+            map: Some(amap(
+                200_000,
+                &[
+                    ("overhead", 12_000, None),
+                    ("assistant", 20_000, None),
+                    ("file", 15_000, Some(0)),
+                    ("tool", 8_000, None),
+                    ("user", 5_000, None),
+                ],
+            )),
         }));
         st.apply(Update::Agent(AgentRec {
             id: "agent-cr".into(),
@@ -305,6 +342,17 @@ pub(crate) fn populate(app: &mut App, now: f64) {
             dur_ms: Some(400_000),
             t0: now - 1_500.0,
             ts_last: now - 1_100.0,
+            // code-review: massive multi-file read, nearly full context
+            map: Some(amap(
+                200_000,
+                &[
+                    ("overhead", 18_000, None),
+                    ("file", 90_000, Some(0)),
+                    ("file", 40_000, Some(1)),
+                    ("assistant", 22_000, None),
+                    ("thinking", 10_000, None),
+                ],
+            )),
         }));
         // wf_refactor ×12: k01..k09 done, k10 failed, k11 running (heated),
         // k12 running with t0/ts_last unknown (old-engine degrade row)
@@ -332,6 +380,22 @@ pub(crate) fn populate(app: &mut App, now: f64) {
                     now - 560.0 - i as f64,
                 ),
             };
+            // maps vary per child; k10 (failed) and k12 (old-engine, t0=0) are
+            // left mapless to exercise the "no map" placeholder cell
+            let map = if i == 10 || i == 12 {
+                None
+            } else {
+                Some(amap(
+                    200_000,
+                    &[
+                        ("overhead", 7_000, None),
+                        ("file", 3_000 + i * 900, Some(i % 4)),
+                        ("assistant", 2_500 + i * 400, None),
+                        ("thinking", 800 + i * 150, None),
+                        ("bash", 1_200, None),
+                    ],
+                ))
+            };
             st.apply(Update::Agent(AgentRec {
                 id: format!("agent-k{i:02}"),
                 state: state.into(),
@@ -350,6 +414,7 @@ pub(crate) fn populate(app: &mut App, now: f64) {
                 dur_ms: dur,
                 t0,
                 ts_last,
+                map,
             }));
         }
 
@@ -396,7 +461,7 @@ pub(crate) fn populate(app: &mut App, now: f64) {
                 "16:47:18",
                 "cargo build 2>&1 | tail -20",
                 Some("build the workspace"),
-                "Compiling amtr v0.1.2\nFinished dev [unoptimized] in 4.82s",
+                "Compiling amtr v0.1.3\nFinished dev [unoptimized] in 4.82s",
                 "",
                 true,
                 false,

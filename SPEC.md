@@ -153,7 +153,7 @@ strings on the wire ("HH:MM:SS") are UTC, including engine-synthesized events.
 | `faccess` | `turn:int, ts:str, file:int, op:"r"\|"w"\|"e", tok:int` | one per file access |
 | `cats` | `totals:{cat:int}` | change-detected |
 | `compaction` | `n:int, turn:int, ts, trigger:"auto"\|"manual", pre:int, post:int, dropped:int, cum_dropped:int, dur_ms:int, dropped_cats:{cat:int}, dropped_files:[{file:int,tok:int}]≤16, preserved_msgs:int` | per compact_boundary |
-| `agent` | `id:str, state:"running"\|"done"\|"failed", agent_type?, desc?, wf?:str, path?:str, turn0:int, ts0:str, t0:float, ts_last:float, turn1?:int, own_tok:int, ret_tok?:int, tools?:{r:int,s:int,b:int,e:int}, dur_ms?:int` | upsert per lifecycle change (also on own_tok growth); `t0`/`ts_last` = epoch UTC of launch / newest own-transcript activity, 0 = unknown; `path` = the agent's own transcript (drill-in target), absent until dir-scanned |
+| `agent` | `id:str, state:"running"\|"done"\|"failed", agent_type?, desc?, wf?:str, path?:str, turn0:int, ts0:str, t0:float, ts_last:float, turn1?:int, own_tok:int, ret_tok?:int, tools?:{r:int,s:int,b:int,e:int}, dur_ms?:int, map?:{resident:int, budget:int, segs:[{cat,tok,file}]}` | upsert per lifecycle change (also on own_tok growth); `t0`/`ts_last` = epoch UTC of launch / newest own-transcript activity, 0 = unknown; `path` = the agent's own transcript (drill-in target), absent until dir-scanned; `map` = the agent's OWN context map — its sidechain transcript parsed through a Session (`sidechain_ok`) and laid out via `build_map_segs`, carrying the agent's own `resident`/`budget` so the mini-map renders on its own fixed budget scale (stripped `Seg`: `{cat,tok,file}` only, no id/born/ts). Built cached by (path,mtime) — never re-parsed while unchanged. Omitted (null) for an empty/unparseable transcript |
 | `cmd` | `turn:int, ts:str, epoch:float, cmd:str(≤240), desc:str\|null, out:str(≤600), err:str(≤300), ok:bool, interrupted:bool, bg:bool, tok_out:int` | one per completed Bash execution (the SHELL console feed). `cmd` is the command's head, `out`/`err` are TAILS of stdout/stderr with control characters stripped (ESC sequences, \r) — truncation is engine-side, marked with a leading `…` when cut; `tok_out` = estimated tokens of the FULL result as charged to context (ties the console to context cost); `bg` = backgrounded. Never anything but Bash — file tools stay in FILES |
 | `ret` | `turn:int, ts:str, epoch:float, kind:"search"\|"fetch"\|"toolsearch"\|"mcp", src:str, q:str(≤160), n:int\|null, bytes:int\|null, dur_ms:int\|null, tok:int, ok:bool` | one per completed EXTERNAL retrieval — the agentic-retrieval feed (SHELL's second perspective). WebSearch → kind search, src "web", q = query, n = searchCount; WebFetch → fetch, src = host, q = url, bytes/dur_ms from the result; ToolSearch → toolsearch, src "tools", n = matches; `mcp__<server>__<tool>` → mcp, src = server, q = tool + primary arg. `tok` = estimated tokens the result injected into context. File tools NEVER appear here (FILES owns file retrieval) |
 | `tasks` | `total:int, done:int, in_progress:int, active:str\|null` | change-detected |
@@ -430,6 +430,23 @@ hit 96.6%  cost 21.4ku  dur 8.4s  stop tool_use  tools 3  fa 2r/1w
 
 At 60+ agents per session, per-agent gantt bars are the wrong projection;
 the temporal truth is CONCURRENCY.
+- **Centerpiece — GRID of per-agent context maps** (`v` toggles GRID ⇄
+  ledger; GRID default): each spawned subagent renders its OWN version of the
+  OVERVIEW context-map graphic (its `agent.map`, fixed budget scale, class
+  palette — the stripped segs carry no ts/born/waterline so heat/age/cache
+  degenerate), autosized and auto-sorted into a grid. One cell per ledger row
+  (agent or wf rollup), so the grid respects the same `s` sort / `a` filter /
+  wf-expansion and the same selection index as the ledger. AUTOSIZE:
+  `cols ≈ round(√(n·w/(2·h)))` (the `2` corrects the ~1:2 char aspect so
+  cells read square), clamped to what fits at a minimum legible cell; the last
+  row may be partial; pages when cells exceed the pane. Each cell: the agent's
+  mini context-map + a 1-line label (`glyph agent_type own-tok · desc`,
+  state-colored: running cyan / done green / failed red) that makes it
+  unmistakable which agent it is; the selected cell's label is reversed.
+  Agents with no map show a dim "no map" placeholder cell, still labeled. At
+  Compact tier (or a pane too small for one legible cell) the tab falls back
+  to the numeric ledger below. The per-agent numeric ledger stays accessible
+  for the SELECTED agent on the detail line, and in full via the `v` toggle.
 - **Header**: `fan-out 312k ≡ 0.31× main · 3● 54○ 3✖ · sort:<mode> ·
   filter:<mode>`.
 - **LOAD strip** (2 rows, Full/Medium): x = shared turn axis, y = agents alive
@@ -533,12 +550,22 @@ offline). Columns: status glyph, name, project tail, resident 8-cell mini-bar
 ### Keybindings (dispatch: overlay > tab-contextual > global)
 
 Global: `q` quit · `?` help · `1–5` tabs · `f`/`0` fleet · `p` pause render ·
-`←/→` cursor ±1 · `Shift+←/→` ±10 · `Home` first · `End`/`Esc` LIVE · `m` MAP
-mode · `c` latest post-mortem · `R` write report · `+/-` MAP rung override.
+`x` amtr3d mode · `←/→` cursor ±1 · `Shift+←/→` ±10 · `Home` first ·
+`End`/`Esc` LIVE · `m` MAP mode · `c` latest post-mortem · `R` write report ·
+`+/-` MAP rung override.
+
+`x` (amtr3d mode) toggles the memspace bridge: a child process (env
+`AMTR3D_BRIDGE`, default `~/Projects/amtr3d/bridge/amtr-bridge.py`) serving
+this session's Update stream on `0.0.0.0:4517` (Bonjour-advertised) so the
+amtr3d Vision Pro app renders it live. The ribbon shows a bold cyan `3D`
+badge while on. The bridge follows re-attaches (fleet pick, drill-in), is
+SIGTERM'd cleanly on toggle-off and on quit, and a bridge that dies on its
+own (port busy) clears the mode with a logged warning.
 Contextual: `j/k` select (FILES rows, AGENTS rows, EVENTS entries) · `g/G`
 ends · `Enter` drill (FILES detail · AGENTS wf-expand/agent-jump · EVENTS
 post-mortem/jump) · `s` sort (FILES history view, AGENTS) · `v` FILES
-history↔now · `a` AGENTS state filter · `o` `$EDITOR` · `r` (fleet) refresh.
+history↔now / AGENTS map-grid↔ledger · `a` AGENTS state filter · `o`
+`$EDITOR` · `r` (fleet) refresh.
 Replay: cursor off tail sends `seek{turn}` (UI ALSO coalesces: at most one
 in-flight seek, newest wins); `snapshot` re-renders MAP/FILES/cats/AGENTS/tasks
 at that turn using the snapshot's own `resident/waterline/cc` (never live

@@ -1051,5 +1051,85 @@ class TestReport(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestAgentMap(unittest.TestCase):
+    """Per-agent context map (SPEC b `agent.map`): a subagent's own
+    sidechain transcript, laid out as its OVERVIEW map."""
+
+    def _write_sidechain(self, path):
+        # a minimal but real agent sidechain: a sidechain user prompt and one
+        # assistant turn carrying usage + a Read tool_use (a file segment)
+        recs = [
+            {"type": "user", "isSidechain": True, "uuid": "su1",
+             "timestamp": "2026-07-17T10:00:00.000Z",
+             "message": {"role": "user", "content": "survey the schema"}},
+            {"type": "assistant", "isSidechain": True, "uuid": "sa1",
+             "timestamp": "2026-07-17T10:00:05.000Z", "requestId": "sreq1",
+             "message": {"role": "assistant", "model": "claude-fable-5",
+                         "content": [
+                             {"type": "text",
+                              "text": "reading the loader now " * 40},
+                             {"type": "tool_use", "id": "tu1", "name": "Read",
+                              "input": {"file_path": "/proj/loader.py"}}],
+                         "usage": {"input_tokens": 500,
+                                   "cache_read_input_tokens": 4000,
+                                   "cache_creation_input_tokens": 200,
+                                   "output_tokens": 120}}},
+        ]
+        with open(path, "w", encoding="utf-8") as fh:
+            for r in recs:
+                fh.write(json.dumps(r) + "\n")
+
+    def test_build_agent_map(self):
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        try:
+            p = os.path.join(tmp, "agent-x.jsonl")
+            self._write_sidechain(p)
+            mp = ce.build_agent_map(p, 200_000)
+            self.assertIsNotNone(mp)
+            self.assertEqual(mp["budget"], 200_000)
+            # R = 500 + 4000 + 200 = 4700
+            self.assertEqual(mp["resident"], 4700)
+            self.assertTrue(mp["segs"], "map must carry segments")
+            # segs sum to R, each carries the stripped {cat,tok,file} shape
+            self.assertEqual(sum(s["tok"] for s in mp["segs"]), 4700)
+            for s in mp["segs"]:
+                self.assertEqual(set(s), {"cat", "tok", "file"})
+            self.assertEqual(mp["segs"][0]["cat"], "overhead")
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_empty_transcript_yields_no_map(self):
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        try:
+            p = os.path.join(tmp, "agent-empty.jsonl")
+            open(p, "w").close()
+            self.assertIsNone(ce.build_agent_map(p, 200_000))
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_agent_payload_includes_map(self):
+        # a Session's agent_payload surfaces a built map under `map`
+        s = ce.Session(FIX, budget=200_000, budget_pinned=True)
+        s.agents["a1"] = {
+            "id": "a1", "state": "done", "turn0": 1, "ts0": "10:00:00",
+            "own_tok": 4700, "t0": 0.0, "ts_last": 0.0,
+            "map": {"resident": 4700, "budget": 200_000,
+                    "segs": [{"cat": "overhead", "tok": 700, "file": None},
+                             {"cat": "file", "tok": 4000, "file": 0}]}}
+        pay = s.agent_payload("a1")
+        self.assertIn("map", pay)
+        self.assertTrue(pay["map"]["segs"])
+        self.assertEqual(pay["map"]["resident"], 4700)
+        # an agent with no map omits the key entirely (wire-null)
+        s.agents["a2"] = {"id": "a2", "state": "done", "turn0": 1,
+                          "ts0": "10:00:00", "own_tok": 10, "t0": 0.0,
+                          "ts_last": 0.0, "map": None}
+        self.assertNotIn("map", s.agent_payload("a2"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

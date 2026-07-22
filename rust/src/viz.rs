@@ -16,7 +16,8 @@ use ratatui::widgets::canvas::{Canvas, Line as CanvasLine, Points};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::ipc::{
-    AgentRec, Cat, CAT_ORDER, CmdRec, FileRec, Op, PeekMsg, RetKind, RetRec, Seg, Severity, Tasks,
+    AgentRec, Cat, CAT_ORDER, CmdRec, FileRec, MapMsg, Op, PeekMsg, RetKind, RetRec, Seg, Severity,
+    Tasks,
 };
 use crate::state::{fmt_age, fmt_dur, fmt_k0, fmt_k1, State, FILE_HUES};
 
@@ -487,9 +488,21 @@ fn cell_px(
             color = Some(rgb(C_WHITE));
         }
     }
-    // waterline marker: the cell containing address C — bright cyan, all modes
-    if ui.wl >= addr && ui.wl < addr + s_tok && ui.wl > 0 {
-        color = Some(rgb(C_WLINE));
+    // waterline marker: the cell containing address C — BLINKS RED in every
+    // mode. The cache boundary is the most consequential address in the window
+    // (everything before it is cache-served, everything after is re-billed), so
+    // it pulses instead of sitting quietly in one colour.
+    // CLAMPED to the drawn content: segs and the turn's waterline arrive as
+    // separate messages, so mid-update wl can briefly exceed the laid segments.
+    // Unclamped it painted a lone marker floating out in free space (field-
+    // reported). The boundary can never sit past the content that exists.
+    let wl_addr = ui.wl.min(total.saturating_sub(1));
+    if total > 0 && ui.wl > 0 && wl_addr >= addr && wl_addr < addr + s_tok {
+        color = Some(rgb(if ui.blink {
+            lerp(C_RED, C_WHITE, 0.35)
+        } else {
+            scale(C_RED, 0.50)
+        }));
     }
     CellPx { color, reversed }
 }
@@ -500,7 +513,6 @@ pub fn render_map(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
         return;
     }
     let segs = eff_segs(st);
-    let total: u64 = segs.iter().map(|s| s.tok).sum();
     let w = (area.width - MAP_GUTTER) as usize;
     let h = area.height as usize;
     let full_cell = ui.map_mode == MapMode::Age;
@@ -543,6 +555,46 @@ pub fn render_map(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
 
     // scale labels (mode · rung · alpha) render in a header line above the map
     // (render_map_header); the map itself is now full-width, no left gutter.
+    // The cell grid itself is drawn by the shared core so the per-agent
+    // mini-maps (AGENTS tab) render byte-identical cells.
+    render_map_cells(
+        f,
+        area,
+        segs,
+        s_tok,
+        n_cells,
+        &owners,
+        full_cell,
+        turns_now,
+        |owner, addr| cell_px(st, ui, segs, owner, addr, s_tok, total),
+    );
+}
+
+/// Shared cell-drawing core for the OVERVIEW map AND the per-agent mini-maps
+/// (SPEC b `agent.map`). Given pre-sized cells (`s_tok`, `n_cells`, `owners`)
+/// and a per-cell color resolver `px(owner, addr)`, it paints the row-major
+/// half-block grid (or the full-cell age ramp) into `area`. The OVERVIEW map
+/// passes a resolver that calls `cell_px` (pulses, waterline, INSPECT); a
+/// mini-map passes a plain class resolver. Cell LOGIC lives here once.
+#[allow(clippy::too_many_arguments)]
+fn render_map_cells<F>(
+    f: &mut Frame<'_>,
+    area: Rect,
+    segs: &[Seg],
+    s_tok: u64,
+    n_cells: usize,
+    owners: &[Option<usize>],
+    full_cell: bool,
+    turns_now: u64,
+    px: F,
+) where
+    F: Fn(Option<usize>, u64) -> CellPx,
+{
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let w = area.width as usize;
+    let h = area.height as usize;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(h);
     for row in 0..h {
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(w + 1);
@@ -569,11 +621,11 @@ pub fn render_map(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
                         } else {
                             4
                         };
-                        let px = cell_px(st, ui, segs, Some(oi), addr, s_tok, total);
+                        let cpx = px(Some(oi), addr);
                         let glyph = SHADE[4 - bucket]; // newest brightest
                         let mut style =
-                            Style::default().fg(px.color.unwrap_or(rgb(C_DIM)));
-                        if px.reversed {
+                            Style::default().fg(cpx.color.unwrap_or(rgb(C_DIM)));
+                        if cpx.reversed {
                             style = style.add_modifier(Modifier::REVERSED);
                         }
                         spans.push(Span::styled(glyph.to_string(), style));
@@ -592,7 +644,7 @@ pub fn render_map(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
                         return None;
                     }
                     let addr = ci as u64 * s_tok;
-                    Some(cell_px(st, ui, segs, owners[ci], addr, s_tok, total))
+                    Some(px(owners[ci], addr))
                 };
                 let (pt, pb) = (px_of(ci_t), px_of(ci_b));
                 let (tc, bc) = (
@@ -616,6 +668,25 @@ pub fn render_map(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Plain class-mode color for a per-agent mini-map cell: no waterline, no
+/// pulses, no cross-session selection (the agent's own `file` ids are local
+/// to its Session, so file segs use the LOCAL `FILE_HUES` wheel — never the
+/// main UI's `hue_of`, which would map to an unrelated file).
+fn agent_cell_px(segs: &[Seg], owner: Option<usize>) -> CellPx {
+    let color = owner.map(|oi| {
+        let sg = &segs[oi];
+        let base = match sg.file {
+            Some(fid) if sg.cat == Cat::File => FILE_HUES[(fid as usize) % FILE_HUES.len()],
+            _ => cat_color(sg.cat),
+        };
+        rgb(base)
+    });
+    CellPx {
+        color,
+        reversed: false,
+    }
 }
 
 /// Legend row under the map: `class:tokens` pairs in class colors.
@@ -2188,6 +2259,243 @@ pub struct AgentsView<'a> {
     pub sort: AgentSort,
     pub filter: AgentFilter,
     pub wf_open: &'a HashMap<String, bool>,
+    /// grid of per-agent context mini-maps (default) ⇄ numeric ledger (`v`)
+    pub grid: bool,
+}
+
+// ---------------------------------------------------------------------------
+// AGENTS — grid of per-agent context mini-maps (SPEC b `agent.map`)
+// ---------------------------------------------------------------------------
+
+/// Minimum legible mini-map cell: `MIN_CELL_W` wide (label + a few map cols)
+/// × `MIN_CELL_H` tall (1 label row + ≥2 map rows).
+const MIN_CELL_W: usize = 12;
+const MIN_CELL_H: usize = 3;
+
+/// Autosize the grid: pick `cols` ≈ round(√(n · aspect)) where `aspect =
+/// w/(2h)` corrects for the ~1:2 terminal cell (a char is roughly twice as
+/// tall as wide) so mini-maps read square, then clamp to what fits at
+/// `MIN_CELL_*`. Pure function of n + pane size (test-assertable).
+pub fn grid_dims(n: usize, w: u16, h: u16) -> (usize, usize) {
+    let w = (w as usize).max(1);
+    let h = (h as usize).max(1);
+    let n = n.max(1);
+    let max_cols = (w / MIN_CELL_W).max(1);
+    let max_rows = (h / MIN_CELL_H).max(1);
+    let aspect = w as f64 / (2.0 * h as f64);
+    let ideal = ((n as f64) * aspect).sqrt().round() as usize;
+    let cols = ideal.clamp(1, max_cols);
+    let rows = n.div_ceil(cols).clamp(1, max_rows);
+    // rows capped by height → widen cols to still cover as many as fit, then
+    // re-derive rows so the last row is never wholly empty
+    let cols = n.div_ceil(rows).clamp(1, max_cols);
+    let rows = n.div_ceil(cols).clamp(1, max_rows);
+    (cols, rows)
+}
+
+/// state glyph + color for an agent (mirrors the ledger's glyph law).
+fn agent_state_glyph(a: &AgentRec, ui: &Ui) -> (&'static str, (u8, u8, u8)) {
+    match a.state.as_str() {
+        "running" => ("●", scale(C_CYAN, if ui.blink { 1.0 } else { 0.55 })),
+        "done" => ("○", C_GREEN),
+        "failed" => ("✖", C_RED),
+        _ => ("·", C_DIM),
+    }
+}
+
+fn agent_state_color(a: &AgentRec) -> (u8, u8, u8) {
+    match a.state.as_str() {
+        "running" => C_CYAN,
+        "done" => C_GREEN,
+        "failed" => C_RED,
+        _ => C_DIM,
+    }
+}
+
+/// One per-agent mini-map on the FIXED budget rung (headroom = dim dots),
+/// pinned to CLASS mode — the stripped agent segs carry no ts/born/waterline,
+/// so heat/age/cache would degenerate. Reuses the shared cell core.
+fn render_agent_minimap(m: &MapMsg, fallback_budget: u64, f: &mut Frame<'_>, area: Rect) {
+    if area.width == 0 || area.height == 0 || m.segs.is_empty() {
+        return;
+    }
+    let segs = &m.segs;
+    let budget = m.budget.unwrap_or(fallback_budget).max(1);
+    let w = area.width as usize;
+    let h = area.height as usize;
+    let capacity = w * 2 * h; // half-block cells (class mode)
+    let s_tok = pick_rung(budget, capacity, 0);
+    let n_cells = (budget.div_ceil(s_tok) as usize).min(capacity);
+    let owners = cell_owners(segs, s_tok, n_cells);
+    render_map_cells(f, area, segs, s_tok, n_cells, &owners, false, 0, |owner, _addr| {
+        agent_cell_px(segs, owner)
+    });
+}
+
+/// One grid cell: a 1-line label (`glyph type own · desc`, state-colored) over
+/// the agent's mini-map (or a dim "no map" body). Selected cell's label is
+/// reversed so it's unmistakable which agent is active.
+fn render_agent_map_cell(
+    st: &State,
+    ui: &Ui,
+    agents: &[AgentRec],
+    row: &ARow,
+    selected: bool,
+    f: &mut Frame<'_>,
+    area: Rect,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let [label_a, map_a] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let w = label_a.width as usize;
+
+    // ---- label ------------------------------------------------------------
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let (map, budget): (Option<&MapMsg>, u64) = match row {
+        ARow::Ag { idx, child } => {
+            let a = &agents[*idx];
+            let (glyph, gcol) = agent_state_glyph(a, ui);
+            let scol = agent_state_color(a);
+            let ty = a.agent_type.clone().unwrap_or_else(|| "agent".into());
+            let own = fmt_k1(a.own_tok);
+            let prefix = if *child { "·" } else { glyph };
+            spans.push(Span::styled(format!("{prefix} "), fg(gcol)));
+            let mut used = 2usize;
+            let ty_room = w.saturating_sub(used + 1 + own.chars().count());
+            let ty_s = head_trunc(&ty, ty_room.max(1));
+            used += ty_s.chars().count();
+            spans.push(Span::styled(ty_s, fg(scol).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(format!(" {own}"), fg(C_FG)));
+            used += 1 + own.chars().count();
+            if let Some(d) = &a.desc {
+                let room = w.saturating_sub(used + 3);
+                if room >= 3 && !d.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" · {}", head_trunc(d, room)),
+                        fg(C_DIM),
+                    ));
+                }
+            }
+            (
+                a.map.as_ref(),
+                a.map.as_ref().and_then(|m| m.budget).unwrap_or(st.budget),
+            )
+        }
+        ARow::Wf { wf, kids, expanded } => {
+            let glyph = if *expanded { "▾" } else { "▸" };
+            let krun = kids
+                .iter()
+                .filter(|&&i| agents[i].state == "running")
+                .count();
+            let kfail = kids
+                .iter()
+                .filter(|&&i| agents[i].state == "failed")
+                .count();
+            let head = format!("{glyph} {wf} ×{}", kids.len());
+            spans.push(Span::styled(
+                head_trunc(&head, w.saturating_sub(6).max(1)),
+                fg(C_DIM).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(format!(" {krun}●"), fg(C_CYAN)));
+            spans.push(Span::styled(format!(" {kfail}✖"), fg(C_RED)));
+            (None, st.budget)
+        }
+    };
+    let mut label = Line::from(spans);
+    if selected {
+        label = label.patch_style(Style::default().add_modifier(Modifier::REVERSED));
+    }
+    f.render_widget(Paragraph::new(label), label_a);
+
+    // ---- body: mini-map, or a "no map" / "workflow" placeholder ------------
+    if map_a.height == 0 || map_a.width == 0 {
+        return;
+    }
+    match map {
+        Some(m) if !m.segs.is_empty() => render_agent_minimap(m, budget, f, map_a),
+        _ => {
+            let msg = if matches!(row, ARow::Wf { .. }) {
+                "workflow"
+            } else {
+                "no map"
+            };
+            let mid = Rect {
+                y: map_a.y + map_a.height / 2,
+                height: 1,
+                ..map_a
+            };
+            f.render_widget(
+                Paragraph::new(Line::styled(msg, fg(C_GRID))).alignment(Alignment::Center),
+                mid,
+            );
+        }
+    }
+}
+
+/// The AGENTS-tab centerpiece: an autosized, ledger-sorted GRID of per-agent
+/// context mini-maps. One cell per ledger row (agent or wf rollup), so the
+/// grid respects the `s` sort, the `a` filter and wf expansion exactly like
+/// the ledger; `sel` (the same index) highlights one cell. Pages when there
+/// are more cells than fit (tiny non-compact sizes).
+fn render_agent_maps_grid(
+    st: &State,
+    ui: &Ui,
+    agents: &[AgentRec],
+    rows: &[ARow],
+    sel: usize,
+    f: &mut Frame<'_>,
+    area: Rect,
+) {
+    let n = rows.len();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if n == 0 {
+        f.render_widget(
+            Paragraph::new(Line::styled(" no agents", fg(C_DIM))),
+            area,
+        );
+        return;
+    }
+    let (cols, grows) = grid_dims(n, area.width, area.height);
+    let cap = (cols * grows).max(1);
+    let sel = sel.min(n - 1);
+    let start = (sel / cap) * cap; // page containing the selection
+    let end = (start + cap).min(n);
+    let cell_w = (area.width / cols as u16).max(1);
+    let cell_h = (area.height / grows as u16).max(1);
+    for (vi, ri) in (start..end).enumerate() {
+        let gc = (vi % cols) as u16;
+        let gr = (vi / cols) as u16;
+        let x = area.x + gc * cell_w;
+        let y = area.y + gr * cell_h;
+        if x >= area.right() || y >= area.bottom() {
+            continue;
+        }
+        // last column / row absorb the remainder so the grid fills the pane;
+        // reserve a 1-col gutter between columns for visual separation
+        let right = if gc + 1 == cols as u16 {
+            area.right()
+        } else {
+            (x + cell_w).min(area.right())
+        };
+        let bottom = if gr + 1 == grows as u16 {
+            area.bottom()
+        } else {
+            (y + cell_h).min(area.bottom())
+        };
+        let cw = right.saturating_sub(x).saturating_sub(1).max(1);
+        let ch = bottom.saturating_sub(y).max(1);
+        let cell = Rect {
+            x,
+            y,
+            width: cw,
+            height: ch,
+        };
+        render_agent_map_cell(st, ui, agents, &rows[ri], ri == sel, f, cell);
+    }
 }
 
 pub fn render_agents_tab(
@@ -2207,8 +2515,14 @@ pub fn render_agents_tab(
     let full = ui.tier == Tier::Full;
     let bar_w: usize = if full { 12 } else { 8 };
 
+    // GRID mode (the new centerpiece): a grid of per-agent context mini-maps.
+    // Falls back to the numeric ledger at Compact tier or when the pane is too
+    // small for even a single legible cell.
+    let grid_mode =
+        view.grid && !compact && area.width as usize >= 2 * MIN_CELL_W && area.height >= 8;
     let strip_h: u16 = if !compact && area.height >= 7 { 2 } else { 0 };
-    let colhdr_h: u16 = if !compact && area.height >= 4 { 1 } else { 0 };
+    // the table column-header only applies to the ledger fallback
+    let colhdr_h: u16 = if !grid_mode && !compact && area.height >= 4 { 1 } else { 0 };
     let detail_h: u16 = if full && area.height >= 12 { 1 } else { 0 };
     let footer_h: u16 = if !compact && area.height >= 5 { 1 } else { 0 };
     let [hdr, strip, colhdr, list, detail, footer] = Layout::vertical([
@@ -2282,10 +2596,14 @@ pub fn render_agents_tab(
         f.render_widget(Paragraph::new(Line::styled(h, fg(C_DIM))), colhdr);
     }
 
-    // unified ledger
+    // unified ledger row sequence (shared by the grid and the fallback list —
+    // the grid renders one mini-map cell per row, so it respects the same
+    // sort/filter/wf-expansion and the same `sel` index)
     let rows = agent_view_rows(agents, view.sort, view.filter, view.wf_open, last);
     let sel = view.sel.min(rows.len().saturating_sub(1));
-    if list.height > 0 {
+    if grid_mode && list.height > 0 {
+        render_agent_maps_grid(st, ui, agents, &rows, sel, f, list);
+    } else if list.height > 0 {
         let visible = list.height as usize;
         let scroll = sel.saturating_sub(visible.saturating_sub(1));
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2468,17 +2786,31 @@ pub fn render_agents_tab(
         let line = match rows.get(sel) {
             Some(ARow::Ag { idx, .. }) => {
                 let a = &agents[*idx];
+                // the numeric ledger stays accessible on the detail line for
+                // the SELECTED agent (own/ret/amp/tools), since the grid cell
+                // shows only own-tok
+                let amp = match (a.state.as_str(), a.ret_tok) {
+                    ("running", _) | (_, None) => "—".to_string(),
+                    (_, Some(rt)) => format!("{:.1}×", a.own_tok as f64 / rt.max(1) as f64),
+                };
+                let tl = a.tools.unwrap_or_default();
                 Line::styled(
                     format!(
-                        "sel {} · {} · \"{}\" · t{}→{} · {}",
+                        "sel {} · {} · \"{}\" · own {} · ret {} · amp {} · {}r/{}s/{}b/{}e · t{}→{}",
                         a.id,
                         a.wf.clone().unwrap_or_else(|| "solo".into()),
                         a.desc.clone().unwrap_or_default(),
+                        fmt_k1(a.own_tok),
+                        a.ret_tok.map(fmt_k1).unwrap_or_else(|| "—".into()),
+                        amp,
+                        tl.r,
+                        tl.s,
+                        tl.b,
+                        tl.e,
                         a.turn0,
                         a.turn1
                             .map(|t| format!("t{t}"))
                             .unwrap_or_else(|| "…".into()),
-                        a.ts0
                     ),
                     fg(C_DIM),
                 )
@@ -3712,6 +4044,7 @@ pub fn render_help(page: usize, f: &mut Frame<'_>, area: Rect) {
             let mut lines: Vec<Line<'static>> = vec![
         key("1–6", "tabs: OVERVIEW FILES TURNS AGENTS EVENTS SHELL"),
         key("f / 0", "fleet picker · ? this help · q quit · p pause render"),
+        key("x", "amtr3d — stream this session to the Vision Pro memspace"),
         key("←/→  ⇧←/→", "turn cursor ±1 / ±10 · home first · end/esc LIVE"),
         key("m  +/-", "MAP color mode · MAP cell-size rung override"),
         key("c", "latest compaction post-mortem"),
@@ -3754,8 +4087,8 @@ pub fn render_help(page: usize, f: &mut Frame<'_>, area: Rect) {
         Span::styled("· T_auto rule = auto-compact threshold".to_string(), fg(C_DIM)),
     ]));
     lines.push(Line::from(""));
-    lines.push(dim("waterline (bright cyan): the exact end of the cache-served"));
-    lines.push(dim("prefix — everything below it was billed at 0.1×."));
+    lines.push(dim("waterline: end of the cache-served prefix (billed 0.1×) —"));
+    lines.push(dim("the MAP blinks that boundary cell RED; traces stay cyan."));
     lines.push(dim("thrash (red flash): the waterline FELL — prefix re-billed full"));
     lines.push(dim("glyphs  ▀ read · ▄ write/edit · █ both · ▼ cliff · ·░▒▓█ shade"));
     lines.push(dim("        ✝ evicted · ◆ compaction · ▲ thrash · « replay · ┃ playhead"));
@@ -3804,6 +4137,7 @@ pub fn render_ribbon(
     st: &State,
     engine_dead: bool,
     paused: bool,
+    amtr3d: bool,
     depth: usize,
     f: &mut Frame<'_>,
     area: Rect,
@@ -3856,6 +4190,13 @@ pub fn render_ribbon(
     }
     if paused {
         spans.push(Span::styled("⏸ ".to_string(), fg(C_AMBER)));
+    }
+    if amtr3d {
+        // memspace bridge live: this session is streaming to the headset
+        spans.push(Span::styled(
+            "3D ".to_string(),
+            fg(C_CYAN).add_modifier(Modifier::BOLD),
+        ));
     }
     spans.push(Span::styled("│ ".to_string(), fg(C_GRID)));
     if depth > 0 {

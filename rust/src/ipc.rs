@@ -167,6 +167,9 @@ pub struct Sess {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Seg {
+    /// segment id (INSPECT/peek target). Default 0 for stripped agent
+    /// mini-map segs, which carry only `{cat, tok, file}` (SPEC b `agent.map`).
+    #[serde(default)]
     pub id: u64,
     pub cat: Cat,
     pub tok: u64,
@@ -419,6 +422,11 @@ pub struct AgentRec {
     /// (old engine) → no heat glow. Drives working-vs-wedged brightness.
     #[serde(default)]
     pub ts_last: f64,
+    /// the agent's OWN context map (SPEC b `agent.map`) — reuses the MapMsg
+    /// deserialize path (`resident`/`budget` carry the agent's own scale).
+    /// None for agents with no parseable/empty transcript ("no map" cell).
+    #[serde(default)]
+    pub map: Option<MapMsg>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -503,6 +511,13 @@ pub struct MapMsg {
     pub alpha: f64,
     #[serde(default)]
     pub segs: Vec<Seg>,
+    /// present only on a per-agent map (SPEC b `agent.map`): the agent's own
+    /// resident/budget, so its mini-map renders on the fixed budget scale.
+    /// Absent (None) on the MAIN `map` message, which carries these elsewhere.
+    #[serde(default)]
+    pub resident: Option<u64>,
+    #[serde(default)]
+    pub budget: Option<u64>,
 }
 
 fn default_alpha() -> f64 {
@@ -884,6 +899,35 @@ mod tests {
         let a: AgentRec = serde_json::from_str(new).unwrap();
         assert!((a.t0 - 1_752_771_852.4).abs() < 1e-6);
         assert!((a.ts_last - 1_752_771_986.1).abs() < 1e-6);
+        assert!(a.map.is_none());
+    }
+
+    /// The per-agent `map` (SPEC b `agent.map`) rides the existing MapMsg/Seg
+    /// deserialize path. This is the ONLY test that exercises the real wire
+    /// shape — `--demo` builds AgentRec in-memory and bypasses serde entirely,
+    /// so a broken agent-seg schema would otherwise pass demo validation.
+    #[test]
+    fn agent_map_parses_stripped_segs() {
+        // exactly what the engine emits: segs carry only {cat, tok, file},
+        // no id/born/ts; the map object carries resident/budget.
+        let js = r#"{"type":"agent","id":"agent-x","state":"done","turn0":5,
+            "own_tok":4700,
+            "map":{"resident":4700,"budget":200000,
+                   "segs":[{"cat":"overhead","tok":700,"file":null},
+                           {"cat":"file","tok":4000,"file":0}]}}"#;
+        let u: Update = serde_json::from_str(js).unwrap();
+        let a = match u {
+            Update::Agent(a) => a,
+            other => panic!("expected Agent, got {other:?}"),
+        };
+        let m = a.map.expect("map must be present");
+        assert_eq!(m.resident, Some(4700));
+        assert_eq!(m.budget, Some(200_000));
+        assert_eq!(m.segs.len(), 2);
+        assert_eq!(m.segs[0].cat, Cat::Overhead);
+        assert_eq!(m.segs[0].id, 0); // stripped segs default id to 0
+        assert_eq!(m.segs[1].tok, 4000);
+        assert_eq!(m.segs[1].file, Some(0));
     }
 
     /// End-to-end subprocess round trip: spawn a real python3 child speaking

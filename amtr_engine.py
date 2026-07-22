@@ -19,7 +19,7 @@ import json, time, math, copy, glob, re, argparse, threading, zlib, subprocess
 from collections import deque
 from datetime import datetime, timezone
 
-ENGINE_VERSION = "0.1.2"
+ENGINE_VERSION = "0.1.3"
 _PROTO_LOCK = threading.Lock()
 _STANDALONE = False   # --validate/--report: fd 1 is the report, log() -> stderr
 
@@ -1193,7 +1193,7 @@ class Session:
              "t0": round(float(a.get("t0") or 0.0), 3),
              "ts_last": round(float(a.get("ts_last") or 0.0), 3)}
         for k in ("agent_type", "desc", "wf", "path", "turn1", "ret_tok", "tools",
-                  "dur_ms"):
+                  "dur_ms", "map"):
             if a.get(k) is not None:
                 p[k] = a[k]
         return p
@@ -1481,6 +1481,34 @@ def pid_alive(pid):
     except (OSError, ValueError, TypeError):
         return False
 
+def build_agent_map(path, budget):
+    """Build the OVERVIEW context-map for a subagent's OWN sidechain
+    transcript (SPEC b `agent.map`). The agent's records ARE its main
+    conversation from its own point of view, so parse them through a fresh
+    Session with `sidechain_ok=True` and lay out `build_map_segs()`.
+
+    Returns `{"resident": int, "budget": int, "segs": [{cat, tok, file}]}`
+    or None for a missing / empty / unparseable transcript (the caller then
+    omits `map`, wire-null). Pure (no protocol emission)."""
+    try:
+        sess = Session(path, budget=budget, sidechain_ok=True)
+        off = 0
+        with open(path, "rb") as fh:
+            for raw in fh:
+                sess.feed_line(raw.decode("utf-8", "replace"), off)
+                off += len(raw)
+    except Exception:
+        return None
+    if not sess.turns or sess.resident() <= 0:
+        return None
+    segs = [{"cat": s["cat"], "tok": int(s["tok"]), "file": s["file"]}
+            for s in sess.build_map_segs() if int(s["tok"]) > 0]
+    if not segs:
+        return None
+    return {"resident": int(sess.resident()), "budget": int(sess.budget),
+            "segs": segs}
+
+
 def tail_usage(path, span=65536):
     """Resident tokens of the newest non-synthetic assistant usage, from a
     bounded backward read. Returns int or None."""
@@ -1571,6 +1599,7 @@ class Engine:
         self._last_growth = time.time()
         self._roster_cache = []
         self._resident_cache = {}              # path -> (mtime, resident)
+        self._agent_map_cache = {}             # agent path -> (mtime, map|None)
         # seek coalescing (latest wins)
         self._seek_cond = threading.Condition()
         self._seek_pending = None
@@ -1908,6 +1937,19 @@ class Engine:
                 ag["turn1"] = None
                 ag["dur_ms"] = None
                 ag["ts_last"] = mt
+                sess.pending["agents"].add(aid)
+            # per-agent context map (SPEC b `agent.map`): parse the agent's
+            # own sidechain into its OVERVIEW map. Cached by (path, mtime) —
+            # a live fleet must never re-parse every subagent each tick;
+            # rebuild only when the transcript actually changed.
+            c = self._agent_map_cache.get(p)
+            if c and c[0] == mt:
+                mp = c[1]
+            else:
+                mp = build_agent_map(p, sess.budget)
+                self._agent_map_cache[p] = (mt, mp)
+            if ag.get("map") != mp:
+                ag["map"] = mp
                 sess.pending["agents"].add(aid)
         # workflow journals are the completion truth for wf-spawned agents
         # (they never produce a parent toolUseResult): a {"type":"result"}

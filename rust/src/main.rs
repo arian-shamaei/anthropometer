@@ -138,6 +138,9 @@ struct App {
     agent_sel: usize,
     agent_sort: AgentSort,
     agent_filter: AgentFilter,
+    /// AGENTS main content: the grid of per-agent context mini-maps (default)
+    /// ⇄ the numeric ledger (`v` toggles; SPEC e AGENTS)
+    agent_grid: bool,
     /// manual wf expand/collapse overrides (win over the automatic rule)
     wf_open: std::collections::HashMap<String, bool>,
     /// drill-in breadcrumb: parent session PATHS; Backspace pops (SPEC e)
@@ -194,6 +197,11 @@ struct App {
     notice: Option<(String, f64)>,
     /// fixed clock for tests (heat decay determinism)
     now_override: Option<f64>,
+    /// amtr3d mode (`x`): the memspace bridge child streaming this session
+    /// to the Vision Pro app. Some ⟺ mode on.
+    amtr3d_bridge: Option<std::process::Child>,
+    /// session switched while amtr3d was on: respawn once the new meta lands
+    amtr3d_restart: bool,
 }
 
 impl App {
@@ -216,6 +224,7 @@ impl App {
             agent_sel: 0,
             agent_sort: AgentSort::Recent,
             agent_filter: AgentFilter::All,
+            agent_grid: true,
             wf_open: std::collections::HashMap::new(),
             attach_stack: Vec::new(),
             event_sel: 0,
@@ -246,6 +255,8 @@ impl App {
             demo: false,
             notice: None,
             now_override: None,
+            amtr3d_bridge: None,
+            amtr3d_restart: false,
         }
     }
 
@@ -262,6 +273,106 @@ impl App {
         })
     }
 
+    // --- amtr3d mode (`x`): stream this session to the Vision Pro memspace ---
+
+    /// Bridge script resolution, house 3-tier style: env override → the
+    /// amtr3d workspace default. (No repo-relative tier: the bridge lives in
+    /// the amtr3d project, not this one.)
+    fn amtr3d_bridge_path() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("AMTR3D_BRIDGE") {
+            let pb = std::path::PathBuf::from(p);
+            if pb.is_file() {
+                return Some(pb);
+            }
+        }
+        let home = std::env::var("HOME").ok()?;
+        let pb = std::path::PathBuf::from(home).join("Projects/amtr3d/bridge/amtr-bridge.py");
+        pb.is_file().then_some(pb)
+    }
+
+    fn toggle_amtr3d(&mut self) {
+        if self.amtr3d_bridge.is_some() {
+            self.amtr3d_restart = false;
+            self.stop_amtr3d("amtr3d OFF — memspace bridge stopped");
+            return;
+        }
+        let Some(path) = self
+            .st
+            .meta
+            .as_ref()
+            .map(|m| m.path.clone())
+            .filter(|p| !p.is_empty())
+        else {
+            self.st.push_log("amtr3d: no session attached".into());
+            return;
+        };
+        let Some(bridge) = Self::amtr3d_bridge_path() else {
+            self.st
+                .push_log("amtr3d: bridge not found (set AMTR3D_BRIDGE)".into());
+            return;
+        };
+        // stdio nulled: the terminal belongs to the TUI; the bridge keeps its
+        // own log discipline. SIGTERM on stop gives it a clean shutdown.
+        match std::process::Command::new("python3")
+            .arg(&bridge)
+            .args(["--host", "0.0.0.0", "--port", "4517", "--session", &path])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                self.st.push_log(format!(
+                    "amtr3d ON — memspace bridge pid {} on :4517 (headset joins via backoff)",
+                    child.id()
+                ));
+                self.amtr3d_bridge = Some(child);
+            }
+            Err(e) => self.st.push_log(format!("amtr3d: bridge spawn failed: {e}")),
+        }
+        self.force_draw = true;
+    }
+
+    fn stop_amtr3d(&mut self, msg: &str) {
+        if let Some(mut child) = self.amtr3d_bridge.take() {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+            for _ in 0..10 {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.st.push_log(msg.into());
+            self.force_draw = true;
+        }
+    }
+
+    /// Run-loop poll: a bridge that died on its own (port conflict, engine
+    /// exit) clears the mode with a warning; a pending session-switch restart
+    /// respawns against the freshly applied meta.
+    fn poll_amtr3d(&mut self) {
+        let died = match self.amtr3d_bridge.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => false,
+        };
+        if died {
+            self.amtr3d_bridge = None;
+            self.st
+                .push_log("amtr3d bridge exited (port busy?) — mode off".into());
+            self.force_draw = true;
+        }
+        if self.amtr3d_restart && self.amtr3d_bridge.is_none() {
+            self.amtr3d_restart = false;
+            self.toggle_amtr3d();
+        }
+    }
+
     fn apply_update(&mut self, u: Update) {
         // FILES view + per-session AGENTS view state reset to defaults on a
         // re-attach (a meta for a DIFFERENT session; same-session re-emits —
@@ -274,6 +385,12 @@ impl App {
                 .map(|old| old.session_id != m.session_id)
                 .unwrap_or(true);
             if switched {
+                // amtr3d follows the instrument: restart the bridge on the
+                // new session once its meta has been applied (run-loop poll).
+                if self.amtr3d_bridge.is_some() {
+                    self.amtr3d_restart = true;
+                    self.stop_amtr3d("amtr3d: session switched — bridge follows");
+                }
                 self.reset_inspect(None);
                 self.files_view = FilesView::History;
                 self.file_sel = 0;
@@ -815,6 +932,19 @@ impl App {
                             .push_log(format!("agents filter: {}", self.agent_filter.label()));
                         true
                     }
+                    KeyCode::Char('v') => {
+                        // toggle the grid of context mini-maps ⇄ numeric ledger
+                        self.agent_grid = !self.agent_grid;
+                        self.st.push_log(
+                            if self.agent_grid {
+                                "agents: map grid"
+                            } else {
+                                "agents: ledger"
+                            }
+                            .into(),
+                        );
+                        true
+                    }
                     KeyCode::Enter => {
                         match rows.get(self.agent_sel.min(n.saturating_sub(1))) {
                             Some(viz::ARow::Wf { wf, expanded, .. }) => {
@@ -1068,6 +1198,7 @@ impl App {
                     "render resumed".into()
                 });
             }
+            KeyCode::Char('x') => self.toggle_amtr3d(),
             KeyCode::Left => {
                 let step = if shift { 10 } else { 1 };
                 self.set_cursor(self.cursor_pos() as i64 - step);
@@ -1262,6 +1393,7 @@ fn render_all(f: &mut Frame<'_>, app: &App) {
             &app.st,
             app.engine_dead,
             app.paused,
+            app.amtr3d_bridge.is_some(),
             app.attach_stack.len(),
             f,
             r,
@@ -1438,6 +1570,7 @@ fn render_tab_body(f: &mut Frame<'_>, app: &App, ui: &Ui, tier: Tier, body: Rect
                 sort: app.agent_sort,
                 filter: app.agent_filter,
                 wf_open: &app.wf_open,
+                grid: app.agent_grid,
             },
             f,
             body,
@@ -1608,6 +1741,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
             }
         }
 
+        app.poll_amtr3d();
+
         // `o`: suspend the TUI, run $EDITOR, resume (read-only otherwise)
         if let Some(path) = app.pending_editor.take() {
             ratatui::restore();
@@ -1694,6 +1829,7 @@ fn main() -> std::io::Result<()> {
     let res = run(&mut terminal, &mut app);
     ratatui::restore(); // restore-first shutdown
 
+    app.stop_amtr3d("amtr3d bridge stopped"); // never orphan the bridge
     app.send(Control::Quit); // defensive second quit
     let _ = handle.shutdown();
     res
@@ -1939,6 +2075,7 @@ mod screenshots {
         // AGENTS design test 1 (header counts) + general ledger sanity
         let mut app = demo_app();
         app.tab = 3;
+        app.agent_grid = false; // exercise the numeric-ledger view
         let s = draw(&mut app, 110, 30);
         assert!(s.contains("fan-out"), "fan-out header missing:\n{s}");
         assert!(s.contains("2●"), "running count missing:\n{s}");
@@ -1955,6 +2092,50 @@ mod screenshots {
         assert!(s.contains("2m14s"), "live elapsed dur missing:\n{s}");
         // detail line for the selected row (sel 0 = the wf rollup)
         assert!(s.contains("sel wf_refactor"), "detail line missing:\n{s}");
+    }
+
+    #[test]
+    fn agents_grid_semantics() {
+        // the new centerpiece: a grid of per-agent context mini-maps, each
+        // labeled, autosized + ledger-sorted, with a "no map" placeholder for
+        // the mapless agents (demo leaves k10/k12 without a map).
+        let mut app = demo_app();
+        app.tab = 3;
+        assert!(app.agent_grid, "grid is the default AGENTS view");
+        let s = draw(&mut app, 160, 40);
+        // every cell is labeled by agent_type (unmistakable which agent)
+        assert!(s.contains("explore"), "explore cell label missing:\n{s}");
+        assert!(s.contains("code-review"), "code-review cell label missing:\n{s}");
+        assert!(s.contains("builder"), "builder cell label missing:\n{s}");
+        // mapless agents get a labeled "no map" placeholder cell
+        assert!(s.contains("no map"), "no-map placeholder missing:\n{s}");
+        // the wf rollup renders as its own labeled cell
+        assert!(s.contains("wf_refactor"), "wf rollup cell missing:\n{s}");
+        // header + footer still present around the grid
+        assert!(s.contains("fan-out"), "header missing over grid:\n{s}");
+        assert!(s.contains("tasks 3/7"), "footer missing under grid:\n{s}");
+        // `v` toggles to the numeric ledger (own-tok column header returns)
+        press(&mut app, KeyCode::Char('v'));
+        assert!(!app.agent_grid, "v must toggle off the grid");
+        let s2 = draw(&mut app, 160, 40);
+        assert!(s2.contains("own-tok"), "ledger column header after v:\n{s2}");
+    }
+
+    #[test]
+    fn grid_dims_autosize() {
+        // pure autosize: cols·rows ≥ n, cells ≥ MIN, aspect-corrected.
+        for &n in &[1usize, 2, 3, 5, 8, 15, 40] {
+            let (c, r) = viz::grid_dims(n, 160, 40);
+            assert!(c >= 1 && r >= 1, "n={n}: degenerate {c}x{r}");
+            assert!(c * r >= n.min(c * r), "n={n}: grid can't be negative");
+            // wide pane → more columns than rows for a square-ish n
+            if n >= 4 {
+                assert!(c >= r, "n={n}: wide pane should favor columns ({c}x{r})");
+            }
+        }
+        // never panics or divides by zero at tiny sizes
+        let _ = viz::grid_dims(0, 1, 1);
+        let _ = viz::grid_dims(60, 3, 2);
     }
 
     #[test]
@@ -2111,6 +2292,8 @@ mod screenshots {
                 rev: 1,
                 alpha: 0.91,
                 segs: snap_segs,
+                resident: None,
+                budget: None,
             },
             files: vec![FileRec {
                 id: 4,
@@ -2190,6 +2373,8 @@ mod screenshots {
                 rev: 0,
                 alpha: 1.0,
                 segs: vec![],
+                resident: None,
+                budget: None,
             },
             files: vec![],
             cats: HashMap::new(),
@@ -2236,6 +2421,8 @@ mod screenshots {
                 rev: 0,
                 alpha: 1.0,
                 segs: vec![],
+                resident: None,
+                budget: None,
             },
             files: vec![],
             cats: HashMap::new(),
@@ -2338,6 +2525,7 @@ mod screenshots {
                     dur_ms: if i % 3 == 1 { Some(10_000) } else { None },
                     t0: if i % 4 == 0 { 0.0 } else { NOW - 100.0 },
                     ts_last: if i % 4 == 0 { 0.0 } else { NOW - 20.0 },
+                    map: None,
                 }));
             }
             let n = viz::agent_view_rows(
@@ -3554,6 +3742,7 @@ mod screenshots {
             dur_ms: Some(1_000),
             t0: 0.0,
             ts_last: 0.0,
+            map: None,
         };
         for i in 0..9u64 {
             app.st
@@ -3607,6 +3796,7 @@ mod screenshots {
         // render: the 10k bar is byte-identical across wildly different peers
         let bar_of = |extra_tok: u64| -> String {
             let mut app = strip_app();
+            app.agent_grid = false; // ledger view (fixed-log token bar row)
             app.st.apply(Update::Agent(AgentRec {
                 id: "probe".into(),
                 state: "done".into(),
@@ -3623,6 +3813,7 @@ mod screenshots {
                 dur_ms: Some(1_000),
                 t0: 0.0,
                 ts_last: 0.0,
+                map: None,
             }));
             app.st.apply(Update::Agent(AgentRec {
                 id: "whale".into(),
@@ -3640,6 +3831,7 @@ mod screenshots {
                 dur_ms: Some(1_000),
                 t0: 0.0,
                 ts_last: 0.0,
+                map: None,
             }));
             let buf = buffer_of(&mut app, 110, 30);
             for y in 0..30u16 {
@@ -3707,6 +3899,7 @@ mod screenshots {
     fn agents_sort_and_filter_keys() {
         let mut app = demo_app();
         app.tab = 3;
+        app.agent_grid = false; // ledger view (column header + row order)
         press(&mut app, KeyCode::Char('s'));
         assert!(app.agent_sort == AgentSort::Tok);
         let s = draw(&mut app, 110, 30);
@@ -3855,6 +4048,8 @@ mod screenshots {
                 rev: 1,
                 alpha: 1.0,
                 segs: vec![],
+                resident: None,
+                budget: None,
             },
             files: vec![],
             cats: HashMap::new(),
@@ -3874,6 +4069,7 @@ mod screenshots {
                 dur_ms: Some(9_000),
                 t0: 0.0,
                 ts_last: 0.0,
+                map: None,
             }],
             tasks: Tasks::default(),
         }));
@@ -3890,6 +4086,7 @@ mod screenshots {
     fn agents_old_engine_and_heat_degrade() {
         let mut app = demo_app();
         app.tab = 3;
+        app.agent_grid = false; // ledger view (row positions + dur/heat)
         let buf = buffer_of(&mut app, 110, 30);
         // rows: wf y=7, kids k01..k12 at y=8..19 → k11 y=18, k12 y=19
         // k12 (running, t0=ts_last=0): dur `—`, bar at the un-heated base
@@ -3927,6 +4124,7 @@ mod screenshots {
         assert_eq!(app.st.agent_pulse.get("agent-k11"), Some(&6));
         assert!(pulses_active(&app), "agent pulse must drive the pulse clock");
         app.tab = 3;
+        app.agent_grid = false; // ledger view (own-tok pulse cell)
         let buf = buffer_of(&mut app, 110, 30);
         // k11's own-tok number renders white while the pulse lives
         let row18: String = (0..110u16).map(|x| buf[(x, 18)].symbol()).collect();
@@ -4124,7 +4322,7 @@ mod screenshots {
         press(&mut app, KeyCode::Enter);
         let s = draw(&mut app, 110, 30);
         assert!(s.contains("# build the workspace"), "desc comment missing:\n{s}");
-        assert!(s.contains("Compiling amtr v0.1.2"), "full tail missing:\n{s}");
+        assert!(s.contains("Compiling amtr v0.1.3"), "full tail missing:\n{s}");
         press(&mut app, KeyCode::Enter);
         let s = draw(&mut app, 110, 30);
         assert!(!s.contains("# build the workspace"), "collapse failed:\n{s}");
@@ -4548,6 +4746,8 @@ mod screenshots {
             rev: 3,
             alpha: 0.97,
             segs: vec![seg(0, "overhead", 18_000, None, 0, 600.0)],
+            resident: None,
+            budget: None,
         }));
         assert!(!app.inspect, "map rebuild must exit INSPECT");
         assert!(
