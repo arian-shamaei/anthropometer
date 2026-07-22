@@ -6,7 +6,7 @@ class Amtr < Formula
   # TODO-fill(sha256): filled AFTER the release exists. Get it with either
   #   shasum -a 256 v0.1.0.tar.gz        # on the downloaded release tarball
   #   brew fetch --formula ./amtr.rb     # brew prints the computed SHA-256
-  sha256 "TODO_V013"
+  sha256 "cbd84adeb802910e626912bc73f16e6cdf890ba6fc2b9135b01bee228f1bf05a"
   license "MIT"
   head "https://github.com/arian-shamaei/anthropometer.git", branch: "main"
 
