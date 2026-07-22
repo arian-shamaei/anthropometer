@@ -602,7 +602,9 @@ fn render_map_cells<F>(
             for col in 0..w {
                 let ci = row * w + col;
                 if ci >= n_cells {
-                    spans.push(Span::styled("█", fg(C_FREE)));
+                    // past the budget — not context space; background, so the
+                    // box's area IS the budget and dim = free headroom only
+                    spans.push(Span::raw(" "));
                     continue;
                 }
                 let addr = ci as u64 * s_tok;
@@ -647,10 +649,19 @@ fn render_map_cells<F>(
                     Some(px(owners[ci], addr))
                 };
                 let (pt, pb) = (px_of(ci_t), px_of(ci_b));
+                // A half PAST the budget (px_of == None) is not context space at
+                // all — leave it as background so the box ends exactly at B. Only
+                // in-budget unowned halves get the dim free-headroom fill. (Both
+                // used to paint C_FREE, which drew a box bigger than the budget
+                // and made a 97%-full window look far emptier than it is.)
                 let (tc, bc) = (
-                    pt.and_then(|p| p.color).or(Some(rgb(C_FREE))),
-                    pb.and_then(|p| p.color).or(Some(rgb(C_FREE))),
+                    pt.map(|p| p.color.unwrap_or(rgb(C_FREE))),
+                    pb.map(|p| p.color.unwrap_or(rgb(C_FREE))),
                 );
+                if tc.is_none() && bc.is_none() {
+                    spans.push(Span::raw(" ")); // wholly beyond the budget
+                    continue;
+                }
                 if tc == Some(rgb(C_FREE)) && bc == Some(rgb(C_FREE)) {
                     // fully-free cell → solid dim block; no black gaps, no dots
                     spans.push(Span::styled("█", fg(C_FREE)));

@@ -461,7 +461,7 @@ pub(crate) fn populate(app: &mut App, now: f64) {
                 "16:47:18",
                 "cargo build 2>&1 | tail -20",
                 Some("build the workspace"),
-                "Compiling amtr v0.1.3\nFinished dev [unoptimized] in 4.82s",
+                "Compiling amtr v0.1.4\nFinished dev [unoptimized] in 4.82s",
                 "",
                 true,
                 false,
