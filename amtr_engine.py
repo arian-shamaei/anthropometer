@@ -19,7 +19,7 @@ import json, time, math, copy, glob, re, argparse, threading, zlib, subprocess
 from collections import deque
 from datetime import datetime, timezone
 
-ENGINE_VERSION = "0.1.4"
+ENGINE_VERSION = "0.1.5"
 _PROTO_LOCK = threading.Lock()
 _STANDALONE = False   # --validate/--report: fd 1 is the report, log() -> stderr
 
@@ -61,24 +61,330 @@ def est_text(s):
         return 0
     return int(math.ceil(len(s) / Est.chars_per_tok))
 
-def est_obj(o):
+def est_pair(o):
+    """(tokens, chars) for an object under the estimator's rules. `tokens` is
+    exactly what est_obj() returns; `chars` is the RAW character weight behind
+    it — the design matrix the per-category fit (`fit_cats`) regresses against
+    R. Token-priced blocks with no text (images) contribute their prior-implied
+    chars, so a fit regularized toward the prior leaves them where they are."""
     if o is None:
-        return 0
+        return 0, 0.0
     if isinstance(o, str):
-        return est_text(o)
+        return est_text(o), float(len(o))
     if isinstance(o, list):
-        t = 0
+        t, c = 0, 0.0
         for b in o:
-            t += est_obj(b)
-        return t
+            bt, bc = est_pair(b)
+            t += bt
+            c += bc
+        return t, c
     if isinstance(o, dict):
         if o.get("type") == "image":
-            return IMG_TOK
+            return IMG_TOK, IMG_TOK * Est.chars_per_tok
         try:
-            return est_text(json.dumps(o, ensure_ascii=False))
+            s = json.dumps(o, ensure_ascii=False)
         except Exception:
-            return 0
-    return est_text(str(o))
+            return 0, 0.0
+        return est_text(s), float(len(s))
+    s = str(o)
+    return est_text(s), float(len(s))
+
+def est_obj(o):
+    return est_pair(o)[0]
+
+# ------------------------------------------------------- per-category fit
+# One global chars/token constant is a lie: JSON and code tokenize near 3
+# chars/token, English prose near 4.5. The session already carries the ground
+# truth to do better — R (in + cache_read + cache_creation) is authoritative on
+# every turn and the engine knows how many CHARS of each category were resident
+# at that turn. Regressing R on those char counts recovers this model's actual
+# per-category rates, entirely offline (no tokenizer, no API, no network).
+FIT_CATS = tuple(c for c in CATS if c != "overhead")
+FIT_ON = True            # --no-fit / `set fit 0` turns the whole thing off
+FIT_MIN_TURNS = 24       # fewer rows than this: never leave the prior
+FIT_LAMBDA = 16.0        # ridge toward the prior, in pseudo-observations
+FIT_LAMBDA_B = 2.0       # ridge on the intercept (weaker: it is identifiable)
+FIT_MIN_CPT = 1.5        # plausible chars/token bounds; clamp, never trust
+FIT_MAX_CPT = 8.0
+FIT_MAX_ROWS = 4096      # newest rows only — the fit tracks the current model
+FIT_REFIT_EVERY = 16     # refit cadence floor (grows as n//8 with the session)
+FIT_HOLDOUT = 0.6        # train on the first 60% of turns, gate on the rest
+FIT_MIN_GAIN = 0.02      # out-of-sample gain a fit must show over the prior
+FIT_CATS_GAIN = 0.0      # extra gain per-category must show over one ratio
+
+def _solve(A, b):
+    """Gaussian elimination with partial pivoting on a small dense system.
+    Returns the solution vector, or None if the system is singular/ill-
+    conditioned (the caller then falls back to the global prior)."""
+    n = len(b)
+    M = [list(A[i]) + [b[i]] for i in range(n)]
+    scale = [max(abs(x) for x in M[i][:n]) or 1.0 for i in range(n)]
+    for c in range(n):
+        piv, pr = 0.0, c
+        for r in range(c, n):
+            v = abs(M[r][c]) / scale[r]
+            if v > piv:
+                piv, pr = v, r
+        if piv < 1e-10:
+            return None
+        M[c], M[pr] = M[pr], M[c]
+        scale[c], scale[pr] = scale[pr], scale[c]
+        d = M[c][c]
+        for r in range(n):
+            if r == c or M[r][c] == 0.0:
+                continue
+            f = M[r][c] / d
+            for k in range(c, n + 1):
+                M[r][k] -= f * M[c][k]
+    return [M[i][n] / M[i][i] for i in range(n)]
+
+def _scale_fit(rows, prior_cpt):
+    """Stage 1: ONE ratio for everything, plus an intercept — the smallest
+    honest model (2 params, always identifiable, no ridge needed). It is both
+    a control ('does per-category actually earn its keep?') and the shrinkage
+    target for stage 2: a category the data cannot speak to should fall back
+    to THIS session's own measured rate, not to a hardcoded constant."""
+    n = len(rows)
+    sx = sy = sxx = sxy = 0.0
+    for R, ch in rows:
+        x = sum(ch.values())
+        sx += x
+        sy += R
+        sxx += x * x
+        sxy += x * R
+    d = n * sxx - sx * sx
+    inv0 = 1.0 / max(0.5, prior_cpt)
+    meta = {"n": n, "cols": [], "clamped": [], "prior_cpt": prior_cpt}
+    if abs(d) < 1e-9 or sxx <= 0:
+        return dict(meta, inv={c: inv0 for c in FIT_CATS}, intercept=0.0,
+                    k=inv0, fitted=False)
+    k = (n * sxy - sx * sy) / d
+    b = (sy - k * sx) / n
+    lo, hi = 1.0 / FIT_MAX_CPT, 1.0 / FIT_MIN_CPT
+    ok = k == k and lo <= k <= hi and b >= 0
+    if not ok:
+        k, b = inv0, max(0.0, (sy - inv0 * sx) / n)
+    return dict(meta, inv={c: k for c in FIT_CATS}, intercept=b, k=k,
+                fitted=ok)
+
+def _fit_rows(rows, prior_cpt, base_hint, lam=None, sc=None):
+    """Stage 2: ridge-regress R on per-category resident chars.
+
+    rows = [(R:int, {cat: chars})]. Solves
+        R_t ≈ intercept + Σ_c chars[c,t] · inv[c]
+    for `inv` (tokens per char) with a Tikhonov pull toward the SESSION'S OWN
+    global rate (stage 1) — falling back to 1/chars_per_tok only when even that
+    is unidentifiable. Shrinking toward the session's measured rate rather than
+    a hardcoded 3.8 is what makes a barely-present category land somewhere
+    sensible instead of importing a constant this model may not obey. Columns
+    are RMS-scaled first, which both conditions the normal equations and makes
+    one λ mean the same thing for every category.
+    Returns {"inv","intercept",...} or None."""
+    n = len(rows)
+    if n < 4:
+        return None
+    lam = FIT_LAMBDA if lam is None else lam
+    if sc is None:
+        sc = _scale_fit(rows, prior_cpt)
+    inv0 = sc["k"]
+    base_hint = sc["intercept"] if sc["fitted"] else base_hint
+    scale = {}
+    for c in FIT_CATS:
+        s = math.sqrt(sum(r[1].get(c, 0.0) ** 2 for r in rows) / n)
+        scale[c] = s if s > 1.0 else 0.0     # 0 -> column carries no signal
+    cols = [c for c in FIT_CATS if scale[c]]
+    m = len(cols) + 1                        # + intercept
+    G = [[0.0] * m for _ in range(m)]
+    v = [0.0] * m
+    for R, ch in rows:
+        x = [1.0] + [ch.get(c, 0.0) / scale[c] for c in cols]
+        for a in range(m):
+            xa = x[a]
+            if xa == 0.0:
+                continue
+            Ga = G[a]
+            for b in range(a, m):
+                Ga[b] += xa * x[b]
+            v[a] += xa * R
+    for a in range(m):                       # symmetrize
+        for b in range(a):
+            G[a][b] = G[b][a]
+    beta0 = [float(base_hint)] + [inv0 * scale[c] for c in cols]
+    # ridge weight per category: λ scaled by how SMALL the category's share of
+    # the resident text is. A category holding 1% of the chars can shift R by
+    # at most ~1% whatever its true ratio, so it is unidentifiable and belongs
+    # on the prior; the dominant categories are the ones the data can speak to.
+    stot = math.sqrt(sum(sum(r[1].values()) ** 2 for r in rows) / n) or 1.0
+    lams = [FIT_LAMBDA_B] + [lam * max(1.0, stot / scale[c]) for c in cols]
+    for a in range(m):
+        G[a][a] += lams[a]
+        v[a] += lams[a] * beta0[a]
+    sol = _solve(G, v)
+    if sol is None or any(x != x for x in sol):   # singular / NaN
+        return None
+    # keep every ratio inside a plausible chars/token band. Post-hoc clamping
+    # would leave the other coefficients at a now-wrong optimum, so when the
+    # unconstrained solution leaves the box, re-minimize the SAME ridge
+    # objective subject to it (cyclic coordinate descent on the quadratic —
+    # exact for a box-constrained convex QP, ~20k flops).
+    lo, hi = 1.0 / FIT_MAX_CPT, 1.0 / FIT_MIN_CPT
+    box = [(lo * scale[c], hi * scale[c]) for c in cols]
+    bound = [i for i, (a, b) in enumerate(box)
+             if not (a <= sol[i + 1] <= b)]
+    if bound:
+        beta = [sol[0]] + [min(b, max(a, sol[i + 1]))
+                           for i, (a, b) in enumerate(box)]
+        for _ in range(400):
+            delta = 0.0
+            for a in range(m):
+                r = v[a] - sum(G[a][b] * beta[b] for b in range(m) if b != a)
+                x = r / G[a][a] if G[a][a] > 0 else beta[a]
+                if a:
+                    x = min(box[a - 1][1], max(box[a - 1][0], x))
+                delta = max(delta, abs(x - beta[a]))
+                beta[a] = x
+            if delta <= 1e-9 * (1.0 + abs(beta[0])):
+                break
+        sol = beta
+        bound = [i for i, (a, b) in enumerate(box)
+                 if sol[i + 1] <= a * (1 + 1e-9) or sol[i + 1] >= b * (1 - 1e-9)]
+    inv = {c: inv0 for c in FIT_CATS}
+    for i, c in enumerate(cols):
+        inv[c] = sol[i + 1] / scale[c]
+    return {"inv": inv, "intercept": sol[0], "n": n, "cols": cols,
+            "clamped": [cols[i] for i in bound], "prior_cpt": prior_cpt}
+
+def fit_predict(f, ch):
+    inv = f["inv"]
+    t = f["intercept"]
+    for c, v in ch.items():
+        t += v * inv.get(c, 0.0)
+    return t
+
+def _errs(rows, f):
+    return sorted(abs(fit_predict(f, ch) - R) / max(1.0, float(R))
+                  for R, ch in rows)
+
+def _mae_pct(rows, f):
+    """Mean |error| as a fraction of R — the honest score for a predictor
+    whose target is authoritative."""
+    if not rows:
+        return 0.0
+    e = _errs(rows, f)
+    return sum(e) / len(e)
+
+def _mdae_pct(rows, f):
+    """MEDIAN |error| / R. The gate scores on this, not the mean: a handful of
+    turns right after a server context rebuild are unpredictable for every
+    model and would otherwise drown out the typical turn."""
+    if not rows:
+        return 0.0
+    e = _errs(rows, f)
+    n = len(e)
+    return e[n // 2] if n % 2 else 0.5 * (e[n // 2 - 1] + e[n // 2])
+
+def _prior_fit(rows, prior_cpt):
+    """The OLD model as a frozen predictor: one global chars/token constant
+    plus a least-squares intercept (the invisible server-side overhead)."""
+    inv0 = 1.0 / max(0.5, prior_cpt)
+    b = sum(R - sum(v * inv0 for v in ch.values()) for R, ch in rows) / len(rows)
+    return {"inv": {c: inv0 for c in FIT_CATS}, "intercept": b, "n": len(rows),
+            "cols": [], "clamped": [], "prior_cpt": prior_cpt}
+
+def fit_cats(rows, prior_cpt=None, base_hint=0.0, min_turns=None):
+    """Fit + GATE. Always returns a state dict; `mode` says which model earned
+    its keep on turns it was NOT fitted to:
+
+        cats   per-category ratios (stage 2)
+        scale  one fitted ratio + intercept (stage 1) — the per-category split
+               did not beat it, but the session's own scale still beats 3.8
+        prior  neither did: the global constant, exactly as before
+
+    The gate is out-of-sample by construction — fit on the first FIT_HOLDOUT of
+    the turns, score on the rest — because in-sample a 10-parameter model always
+    'wins'. Only on held-out turns does a better SPLIT show up as a better
+    prediction of authoritative R."""
+    prior_cpt = prior_cpt or Est.chars_per_tok
+    mt = FIT_MIN_TURNS if min_turns is None else min_turns
+    st = {"active": False, "mode": "prior", "reason": "", "n": len(rows),
+          "prior_cpt": round(prior_cpt, 3)}
+    if len(rows) < mt:
+        st["reason"] = "too few turns (%d < %d)" % (len(rows), mt)
+        return st
+    rows = rows[-FIT_MAX_ROWS:]
+    k = max(4, int(len(rows) * FIT_HOLDOUT))
+    train, test = rows[:k], rows[k:]
+    if len(test) < 4:
+        st["reason"] = "too few holdout turns"
+        return st
+    sc_tr = _scale_fit(train, prior_cpt)
+    ftr = _fit_rows(train, prior_cpt, base_hint, sc=sc_tr)
+    h_prior = _mdae_pct(test, _prior_fit(train, prior_cpt))
+    h_scale = _mdae_pct(test, sc_tr)
+    h_cats = _mdae_pct(test, ftr) if ftr is not None else None
+    st["holdout_prior_pct"] = round(100.0 * h_prior, 3)
+    st["holdout_scale_pct"] = round(100.0 * h_scale, 3)
+    if h_cats is not None:
+        st["holdout_cats_pct"] = round(100.0 * h_cats, 3)
+    def beats(a, b, m=FIT_MIN_GAIN):
+        return a < b * (1.0 - m)
+    if (h_cats is not None and beats(h_cats, h_scale, FIT_CATS_GAIN)
+            and beats(h_cats, h_prior)):
+        mode, hold = "cats", h_cats
+    elif beats(h_scale, h_prior) and sc_tr["fitted"]:
+        mode, hold = "scale", h_scale
+    else:
+        st["reason"] = ("no out-of-sample gain (per-category %s, global scale "
+                        "%.2f%%, prior %.2f%%, median |err|/R)"
+                        % ("%.2f%%" % (100.0 * h_cats) if h_cats is not None
+                           else "n/a", 100.0 * h_scale, 100.0 * h_prior))
+        return st
+    sc = _scale_fit(rows, prior_cpt)
+    full = sc if mode == "scale" else _fit_rows(rows, prior_cpt, base_hint,
+                                                sc=sc)
+    if full is None:
+        st["reason"] = "singular system"
+        return st
+    if full["intercept"] < 0:
+        st["reason"] = "negative overhead intercept"
+        return st
+    ybar = sum(R for R, _ in rows) / len(rows)
+    ss_t = sum((R - ybar) ** 2 for R, _ in rows)
+    ss_r = sum((fit_predict(full, ch) - R) ** 2 for R, ch in rows)
+    rms = math.sqrt(ss_r / len(rows))
+    st.update(full)
+    st["active"] = True
+    st["mode"] = mode
+    st["holdout_fit_pct"] = round(100.0 * hold, 3)
+    st["gain"] = round((h_prior - hold) / h_prior if h_prior > 0 else 0.0, 4)
+    st["reason"] = ("fitted per category" if mode == "cats"
+                    else "one fitted global ratio (per-category split did not "
+                         "beat it out of sample)")
+    st["rms"] = rms
+    st["rms_pct"] = round(100.0 * rms / max(1.0, ybar), 3)
+    st["r2"] = round(1.0 - ss_r / ss_t, 4) if ss_t > 0 else 0.0
+    st["mae_pct"] = round(100.0 * _mae_pct(rows, full), 3)
+    return st
+
+def fit_report(st):
+    """Wire/report view of a fit state: chars/token per category (the human
+    unit), the fitted overhead intercept, and how well it actually did."""
+    out = {"active": bool(st.get("active")), "mode": st.get("mode", "prior"),
+           "reason": st.get("reason", ""), "turns": int(st.get("n", 0)),
+           "prior_cpt": st.get("prior_cpt", Est.chars_per_tok)}
+    for k in ("rms_pct", "r2", "mae_pct", "holdout_prior_pct",
+              "holdout_scale_pct", "holdout_cats_pct", "holdout_fit_pct",
+              "gain"):
+        if k in st:
+            out[k] = st[k]
+    if st.get("active"):
+        out["overhead"] = int(st["intercept"])
+        out["cpt"] = {c: round(1.0 / r, 2)
+                      for c, r in sorted(st["inv"].items()) if r > 0}
+        out["fitted_cats"] = list(st.get("cols") or ())
+        if st.get("clamped"):
+            out["clamped"] = list(st["clamped"])
+    return out
 
 def hhmmss(ts):
     return ts[11:19] if isinstance(ts, str) and len(ts) >= 19 else ""
@@ -209,6 +515,15 @@ class Session:
         # live category estimates (raw, unscaled)
         self.cat_est = {c: 0 for c in CATS if c != "overhead"}
         self.est_live = 0
+        # resident CHARS per category + the per-turn snapshot of it: the
+        # design matrix the per-category ratio fit regresses against R
+        self.cat_chars = {c: 0.0 for c in CATS if c != "overhead"}
+        self.turn_chars = []     # parallel to self.turns (never on the wire)
+        self.fit = None          # active fit (see fit_cats) or None = prior
+        self.fit_state = {"active": False, "reason": "warming up", "n": 0,
+                          "prior_cpt": Est.chars_per_tok}
+        self.fit_on = FIT_ON
+        self.fit_next = FIT_MIN_TURNS
         # hidden reasoning (SPEC a): per-turn visible-assistant accumulator
         # and the ISO ts of the record that OPENED the current turn (gives
         # the synthetic reasoning seg a real epoch)
@@ -378,16 +693,24 @@ class Session:
     def _born(self):
         return max(0, len(self.turns) - 1)
 
-    def _alloc(self, cat, tok, uuid, ts, file_id=None):
+    def _alloc(self, cat, tok, uuid, ts, file_id=None, chars=None):
+        """`chars` = the raw character weight behind `tok`. Segments whose
+        tokens are NOT char-derived (hidden reasoning, images) pass None and
+        get the prior-implied chars, so the fit — regularized toward that same
+        prior — leaves their pricing alone."""
         if tok <= 0:
             return
+        if chars is None:
+            chars = tok * Est.chars_per_tok
         sid = self.seg_next
         self.seg_next += 1
         seg = {"id": sid, "uuid": uuid, "cat": cat, "est": tok,
+               "chars": float(chars),
                "file": file_id, "born": self._born(), "ts": ts_epoch(ts)}
         self.ring[sid] = seg
         self.by_uuid.setdefault(uuid, []).append(sid)
         self.cat_est[cat] = self.cat_est.get(cat, 0) + tok
+        self.cat_chars[cat] = self.cat_chars.get(cat, 0.0) + seg["chars"]
         self.est_live += tok
         self.pending["segs"].append(seg)
         # SPEC (b) weight rule: a fresh coalesced map must land BEFORE the UI
@@ -468,6 +791,9 @@ class Session:
                                 "model %s -> %s" % (self.model, model))
                 self.model = model or self.model
                 self.turn_epochs.append(ts_epoch(ts))
+                # design-matrix row: what was resident (in chars, per
+                # category) when the server priced THIS request's R
+                self.turn_chars.append(dict(self.cat_chars))
                 self.turns.append({"turn": len(self.turns), "ts": hhmmss(ts),
                                    "model": model, "in": 0, "cr": 0, "cc": 0,
                                    "cc_5m": 0, "cc_1h": 0, "out": 0,
@@ -501,20 +827,22 @@ class Session:
                     continue
                 bt = b.get("type")
                 if bt == "text":
-                    e = est_text(b.get("text") or "")
-                    self._alloc("assistant", e, uuid, ts)
+                    txt = b.get("text") or ""
+                    e = est_text(txt)
+                    self._alloc("assistant", e, uuid, ts, chars=len(txt))
                 elif bt == "thinking":
-                    e = est_text(b.get("thinking") or "")
-                    self._alloc("thinking", e, uuid, ts)
+                    txt = b.get("thinking") or ""
+                    e = est_text(txt)
+                    self._alloc("thinking", e, uuid, ts, chars=len(txt))
                 elif bt == "tool_use":
                     e = self._tool_use(b, uuid, ts)
                 else:
-                    e = est_obj(b)
-                    self._alloc("tool", e, uuid, ts)
+                    e, ch = est_pair(b)
+                    self._alloc("tool", e, uuid, ts, chars=ch)
                 self._vis_acc += e
         elif isinstance(content, str):
             e = est_text(content)
-            self._alloc("assistant", e, uuid, ts)
+            self._alloc("assistant", e, uuid, ts, chars=len(content))
             self._vis_acc += e
 
     def _close_turn_reasoning(self):
@@ -537,7 +865,7 @@ class Session:
         inp = b.get("input")
         tid = b.get("id")
         fp = tool_file(inp)
-        itok = est_obj(inp)
+        itok, ichars = est_pair(inp)
         if tid:
             self.tu[tid] = (name, fp)
         if name in AGENT_TOOLS:
@@ -545,10 +873,10 @@ class Session:
             if tid:
                 self.tu2agent[tid] = {"turn": self._born(), "ts": hhmmss(ts),
                                       "t0": ts_epoch(ts), "desc": desc}
-            self._alloc("tool", itok, uuid, ts)
+            self._alloc("tool", itok, uuid, ts, chars=ichars)
         elif name == "Read" and fp:
             # addressing only: rings as file context, no file-stat change
-            self._alloc("file", itok, uuid, ts, self._file_id(fp))
+            self._alloc("file", itok, uuid, ts, self._file_id(fp), chars=ichars)
         elif name in WRITE_TOOLS and fp:
             fid = self._file_id(fp)
             f = self.files[fid]
@@ -562,22 +890,61 @@ class Session:
                 f["edits"] += 1
             self._file_touch(fid, ts)
             self._faccess(fid, op, itok, ts)
-            self._alloc("file", itok, uuid, ts, fid)
+            self._alloc("file", itok, uuid, ts, fid, chars=ichars)
         elif name == "Bash":
             if tid and isinstance(inp, dict):
                 self.tu2cmd[tid] = {"cmd": inp.get("command"),
                                     "desc": inp.get("description")}
-            self._alloc("bash", itok, uuid, ts)
+            self._alloc("bash", itok, uuid, ts, chars=ichars)
         else:
             if tid:
                 r = _ret_classify(name, inp)
                 if r is not None:
                     self.tu2ret[tid] = r
-            self._alloc("tool", itok, uuid, ts)
+            self._alloc("tool", itok, uuid, ts, chars=ichars)
         if self.turns:
             self.turns[-1]["tools"] += 1
             self.pending["turns"].add(self.turns[-1]["turn"])
         return itok
+
+    # ---- per-category calibration ----------------------------------------
+    def live_est(self):
+        """Resident token estimate BEFORE alpha. With a fit active this is the
+        per-category sum Σ_c chars[c]·inv[c]; otherwise the single-constant
+        Σ est — the exact pre-fit number."""
+        if self.fit is None:
+            return self.est_live
+        inv = self.fit["inv"]
+        return sum(v * inv[c] for c, v in self.cat_chars.items())
+
+    def seg_est(self, s):
+        """Pre-alpha token estimate of ONE segment (the fit changes the split,
+        never the total: alpha still force-fits the sum to authoritative R)."""
+        if self.fit is None:
+            return s["est"]
+        return s["chars"] * self.fit["inv"].get(s["cat"], 0.0)
+
+    def _maybe_refit(self):
+        """Refit the per-category chars/token ratios against this session's own
+        authoritative R. Cadenced (never per record, never per turn) and a pure
+        function of (turns, turn_chars) so replay/seek reproduces it exactly."""
+        n = min(len(self.turns) - 1, len(self.turn_chars))   # in-flight turn out
+        if n < self.fit_next:
+            return
+        self.fit_next = n + max(FIT_REFIT_EVERY, n // 8)
+        if not self.fit_on:
+            self.fit_state = {"active": False, "reason": "disabled", "n": n,
+                              "prior_cpt": Est.chars_per_tok}
+            self.fit = None
+            return
+        rows = [(self.turns[i]["resident"], self.turn_chars[i])
+                for i in range(n) if self.turns[i]["resident"] > 0]
+        st = fit_cats(rows, base_hint=float(self.overhead0 or 0))
+        self.fit_state = st
+        self.fit = st if st.get("active") else None
+
+    def fit_payload(self):
+        return fit_report(self.fit_state)
 
     def _on_turn_usage(self, tr, ts, new_turn=False):
         R = tr["resident"]
@@ -596,17 +963,32 @@ class Session:
                     and R < self.turns[-2]["resident"] - 10_000):
                 self._server_rebuild(R, self.turns[-2]["resident"], ts)
             self._compact_between = False
+        # per-category ratio refit (cheap, cadenced): the split only
+        if new_turn:
+            self._maybe_refit()
         # overhead calibration (the honesty rule)
         if self.overhead0 is None or self.rebase_pending:
             self.overhead0 = max(0, R - self.est_live)
             self.rebase_pending = False
-        if self.overhead0 + self.est_live <= R:
+        E = self.live_est()
+        # with a fit active the invisible overhead is the FITTED intercept
+        # (bounded, so a stale intercept can never eat the whole context);
+        # without one it stays the re-based overhead0 — bit-identical to
+        # pre-fit amtr.
+        # ...capped by overhead₀, the DIRECT measurement at the last rebase:
+        # a fitted intercept is a regression parameter, not an observation, and
+        # after a compaction it can go stale. Never let it claim more invisible
+        # context than the honest R − Σest allowed.
+        base = self.overhead0 if self.fit is None \
+            else int(max(0, min(self.fit["intercept"], self.overhead0 or 0,
+                                0.9 * R)))
+        if base + E <= R:
             self.alpha = 1.0
-            self.overhead = R - self.est_live
+            self.overhead = int(round(R - E))
         else:
-            a = (R - self.overhead0) / max(1, self.est_live)
+            a = (R - base) / max(1, E)
             self.alpha = min(1.0, max(1e-6, a))
-            self.overhead = self.overhead0
+            self.overhead = int(base)
         # thrash signals run once per turn (streamed same-requestId records
         # must not re-trigger them after the post-compaction grace is spent)
         if tr["turn"] != self._sig_turn:
@@ -662,6 +1044,7 @@ class Session:
         for sid in gone:
             s = self.ring[sid]
             self.cat_est["reasoning"] -= s["est"]
+            self.cat_chars["reasoning"] -= s["chars"]
             self.est_live -= s["est"]
             flushed += s["est"]
             ids = self.by_uuid.get(s["uuid"])
@@ -693,17 +1076,19 @@ class Session:
         uuid = d.get("uuid") or ("anon-%d" % self.rec_count)
         content = m.get("content")
         if d.get("isCompactSummary"):
-            self._alloc("summary", est_obj(content), uuid, ts)
+            e, ch = est_pair(content)
+            self._alloc("summary", e, uuid, ts, chars=ch)
             return
         if isinstance(content, str):
-            self._alloc("user", est_text(content), uuid, ts)
+            self._alloc("user", est_text(content), uuid, ts,
+                        chars=len(content))
             return
         if not isinstance(content, list):
             return
         tur = d.get("toolUseResult")
         for b in content:
             if isinstance(b, str):
-                self._alloc("user", est_text(b), uuid, ts)
+                self._alloc("user", est_text(b), uuid, ts, chars=len(b))
                 continue
             if not isinstance(b, dict):
                 continue
@@ -711,13 +1096,14 @@ class Session:
             if bt == "text":
                 txt = b.get("text") or ""
                 cat = "attach" if "<system-reminder>" in txt else "user"
-                self._alloc(cat, est_text(txt), uuid, ts)
+                self._alloc(cat, est_text(txt), uuid, ts, chars=len(txt))
             elif bt == "image":
                 self._alloc("user", IMG_TOK, uuid, ts)
             elif bt == "tool_result":
                 self._tool_result(b, tur, uuid, ts)
             else:
-                self._alloc("user", est_obj(b), uuid, ts)
+                e, ch = est_pair(b)
+                self._alloc("user", e, uuid, ts, chars=ch)
 
     def _tool_result(self, b, tur, uuid, ts):
         tuid = b.get("tool_use_id")
@@ -730,11 +1116,13 @@ class Session:
         # raw structured copy. When both exist, the LARGER is what context
         # actually pays for (audit: preferring the raw copy ran ~3.6k low
         # on a real session).
-        rtok = est_obj(b.get("content"))
+        rtok, rchars = est_pair(b.get("content"))
         if isinstance(tur, dict):
             f = tur.get("file")
             if isinstance(f, dict) and isinstance(f.get("content"), str):
-                rtok = max(rtok, est_text(f["content"]))
+                ftok = est_text(f["content"])
+                if ftok > rtok:
+                    rtok, rchars = ftok, float(len(f["content"]))
         if name == "Read" and fp:
             fid = self._file_id(fp)
             f = self.files[fid]
@@ -743,15 +1131,16 @@ class Session:
             f["reads"] += 1
             self._file_touch(fid, ts)
             self._faccess(fid, "r", rtok, ts)
-            self._alloc("file", rtok, uuid, ts, fid)
+            self._alloc("file", rtok, uuid, ts, fid, chars=rchars)
         elif name in WRITE_TOOLS and fp:
             # ack/patch echo: resident context but not a new file copy
-            self._alloc("file", rtok, uuid, ts, self._file_id(fp))
+            self._alloc("file", rtok, uuid, ts, self._file_id(fp),
+                        chars=rchars)
         elif name == "Bash":
-            self._alloc("bash", rtok, uuid, ts)
+            self._alloc("bash", rtok, uuid, ts, chars=rchars)
             self._cmd_result(tuid, b, tur, rtok, ts)
         else:
-            self._alloc("tool", rtok, uuid, ts)
+            self._alloc("tool", rtok, uuid, ts, chars=rchars)
             if tuid in self.tu2ret:
                 self._ret_result(tuid, b, tur, rtok, ts)
 
@@ -856,7 +1245,8 @@ class Session:
         ts = d.get("timestamp") or ""
         uuid = d.get("uuid") or ("anon-%d" % self.rec_count)
         att = d.get("attachment")
-        self._alloc("attach", est_obj(att), uuid, ts)
+        e, ch = est_pair(att)
+        self._alloc("attach", e, uuid, ts, chars=ch)
         if isinstance(att, dict) and att.get("type") == "queued_command":
             self._event("queued_prompt", "info", ts,
                         "queued: %s" % str(att.get("prompt") or "")[:80])
@@ -939,6 +1329,7 @@ class Session:
             if s["file"] is not None:
                 dropped_files[s["file"]] = dropped_files.get(s["file"], 0) + s["est"]
             self.cat_est[s["cat"]] -= s["est"]
+            self.cat_chars[s["cat"]] -= s["chars"]
             self.est_live -= s["est"]
             evicted_est += s["est"]
         for sid in gone:
@@ -1006,7 +1397,7 @@ class Session:
         segs = [oh]
         total = oh["tok"]
         for s in self.ring.values():
-            tok = int(s["est"] * self.alpha)
+            tok = int(self.seg_est(s) * self.alpha)
             if tok <= 0:
                 continue
             segs.append({"id": s["id"], "cat": s["cat"], "tok": tok,
@@ -1117,7 +1508,7 @@ class Session:
             return base
         base.update({"cat": seg["cat"], "uuid": seg["uuid"],
                      "born": int(seg["born"]), "est": int(seg["est"]),
-                     "tok": int(seg["est"] * self.alpha),
+                     "tok": int(self.seg_est(seg) * self.alpha),
                      "file": seg["file"]})
         if seg["cat"] == "reasoning":
             # synthetic segment: its uuid names no transcript record, so
@@ -1181,8 +1572,13 @@ class Session:
 
     def cats_payload(self):
         out = {"overhead": int(self.overhead)}
-        for c, v in self.cat_est.items():
-            out[c] = int(v * self.alpha)
+        if self.fit is None:
+            for c, v in self.cat_est.items():
+                out[c] = int(v * self.alpha)
+        else:
+            inv = self.fit["inv"]
+            for c, v in self.cat_chars.items():
+                out[c] = int(v * inv[c] * self.alpha)
         return out
 
     def agent_payload(self, aid, a=None):
@@ -1203,7 +1599,7 @@ class Session:
         self.map_base_n = len(segs)          # rebuild resets the cadence counter
         self.map_adds_since = 0
         return {"rev": self.map_rev, "alpha": round(self.alpha, 4),
-                "segs": segs}
+                "fit": self.fit_payload(), "segs": segs}
 
     def meta_payload(self):
         return {"session_id": self.session_id, "path": self.path,
@@ -1769,7 +2165,8 @@ class Engine:
             send(dict({"type": "map"}, **sess.map_payload()))
         elif p["segs"]:
             segs = [{"id": s["id"], "cat": s["cat"],
-                     "tok": int(s["est"] * sess.alpha), "file": s["file"],
+                     "tok": int(sess.seg_est(s) * sess.alpha),
+                     "file": s["file"],
                      "born": s["born"], "ts": s["ts"]} for s in p["segs"]]
             segs = [s for s in segs if s["tok"] > 0]
             if segs:
@@ -2275,6 +2672,15 @@ class Engine:
             try:
                 if key == "chars_per_tok":
                     Est.chars_per_tok = max(0.5, float(val))
+                elif key == "fit":
+                    on = bool(int(val))
+                    globals()["FIT_ON"] = on
+                    with self.lock:
+                        if self.session:
+                            self.session.fit_on = on
+                            self.session.fit_next = 0     # re-decide next turn
+                            if not on:
+                                self.session.fit = None
                 elif key == "poll_ms":
                     self.poll_ms = max(20, int(val))
                 elif key == "t_auto":
@@ -2414,7 +2820,7 @@ def run_validate(args):
         lambda raw, o: sess.feed_line(raw.decode("utf-8", "replace"), o))
     dt = time.time() - t0
     R = sess.resident()
-    est = sess.overhead + int(sess.est_live * sess.alpha)
+    est = sess.overhead + int(sess.live_est() * sess.alpha)
     print("session   : %s" % path)
     print("parsed    : %d records, %d turns in %.2fs (%d malformed skipped)"
           % (sess.rec_count, len(sess.turns), dt, sess.malformed))
@@ -2424,8 +2830,34 @@ def run_validate(args):
     print("MODEL     : %s   waterline C=%s" % (sess.model or "?",
           "{:,}".format(sess.turns[-1]["waterline"] if sess.turns else 0)))
     print("estimate  : overhead %s + live est %s x alpha %.3f = %s (vs R %s)"
-          % ("{:,}".format(sess.overhead), "{:,}".format(sess.est_live),
+          % ("{:,}".format(sess.overhead),
+             "{:,}".format(int(sess.live_est())),
              sess.alpha, "{:,}".format(est), "{:,}".format(R)))
+    ft = sess.fit_payload()
+    if ft["active"]:
+        print("ratios    : %s, fitted from this session's own R over %d turns "
+              "(R² %.3f, residual RMS %.1f%% of mean R)"
+              % ("PER-CATEGORY" if ft["mode"] == "cats"
+                 else "ONE GLOBAL RATIO", ft["turns"], ft.get("r2", 0.0),
+                 ft.get("rms_pct", 0.0)))
+        print("            held-out median |err|/R: %.2f%% fitted vs %.2f%% "
+              "for the %.1f constant (one-ratio control %.2f%%)"
+              % (ft.get("holdout_fit_pct", 0.0),
+                 ft.get("holdout_prior_pct", 0.0), ft["prior_cpt"],
+                 ft.get("holdout_scale_pct", 0.0)))
+        print("            " + "  ".join(
+            "%s %.2f%s" % (c, v, "" if c in (ft.get("fitted_cats") or ())
+                           else "*")
+            for c, v in sorted(ft["cpt"].items())) + "   chars/token"
+            + "   [* = not identifiable, left on the fitted global rate]")
+        print("            fitted overhead intercept %s (vs measured %s)"
+              % ("{:,}".format(ft["overhead"]), "{:,}".format(sess.overhead)))
+        if ft.get("clamped"):
+            print("            pinned to the plausible-range bound: "
+                  + ", ".join(ft["clamped"]))
+    else:
+        print("ratios    : single global %.1f chars/token (fit inactive: %s)"
+              % (ft["prior_cpt"], ft["reason"]))
     print("cats      : " + "  ".join(
         "%s %s" % (c, "{:,}".format(int(v)))
         for c, v in sess.cats_payload().items() if v))
@@ -2501,7 +2933,7 @@ def build_report(sess, interrupted=False):
                "cum_dropped": int(sess.cum_dropped),
                "rebuilds": [dict(r) for r in sess.rebuilds],
                "cats": sess.cats_payload(), "alpha": round(sess.alpha, 4),
-               "overhead": int(sess.overhead)}
+               "overhead": int(sess.overhead), "fit": sess.fit_payload()}
     # -- 3 ECONOMICS (authoritative)
     tot = sess.usage_totals()
     cost = sess.cost_stats()
@@ -2673,11 +3105,40 @@ def render_report_md(rep):
                  % (rb["turn"], rb["ts"], _fc(rb["pre"]), _fc(rb["post"]),
                     _fc(rb["flushed"])))
     L.append("- composition at end (α %.3f):" % c["alpha"])
-    L += ["", "| category | tokens | %R |", "|:--|--:|--:|"]
+    ft = c.get("fit") or {}
+    cpt = ft.get("cpt") or {}
+    fitted = set(ft.get("fitted_cats") or ())
+    L += ["", "| category | tokens | %R | chars/tok |", "|:--|--:|--:|--:|"]
     for cat, v in c["cats"].items():
         if v:
-            L.append("| %s | %s | %.1f |"
-                     % (cat, _fc(v), 100.0 * v / max(1, c["final_r"])))
+            r = cpt.get(cat)
+            L.append("| %s | %s | %.1f | %s |"
+                     % (cat, _fc(v), 100.0 * v / max(1, c["final_r"]),
+                        "—" if r is None else
+                        ("%.2f" % r if cat in fitted else "%.2f*" % r)))
+    L.append("")
+    if ft.get("active"):
+        L.append("- token ratios: %s, fitted from this session's own "
+                 "authoritative R — %d turns, R² %.3f, residual RMS %.1f%% of "
+                 "mean R; held-out median |err|/R %.2f%% vs %.2f%% for the "
+                 "%.1f constant (one-ratio control %.2f%%). Fitted overhead "
+                 "intercept %s tokens. `*` = not identifiable here, left on "
+                 "the fitted global rate."
+                 % ("per category" if ft.get("mode") == "cats"
+                    else "ONE GLOBAL RATIO (the per-category split did not "
+                         "beat it out of sample)",
+                    ft.get("turns", 0), ft.get("r2", 0.0),
+                    ft.get("rms_pct", 0.0), ft.get("holdout_fit_pct", 0.0),
+                    ft.get("holdout_prior_pct", 0.0),
+                    ft.get("prior_cpt", 3.8), ft.get("holdout_scale_pct", 0.0),
+                    _fc(ft.get("overhead", 0))))
+        if ft.get("clamped"):
+            L.append("  - pinned to the plausible-range bound (the data could "
+                     "not identify them): %s" % ", ".join(ft["clamped"]))
+    else:
+        L.append("- token ratios: single global constant %.1f chars/token "
+                 "(fit inactive: %s)"
+                 % (ft.get("prior_cpt", 3.8), ft.get("reason") or "n/a"))
     # ECONOMICS
     e = rep["economics"]
     L += ["", "## ECONOMICS (authoritative)", ""]
@@ -2888,10 +3349,19 @@ def main():
     ap.add_argument("--idle-secs", type=float, default=60, dest="idle_secs",
                     help="with --watch: transcript-quiet seconds that end a "
                          "run with no live roster pid (default 60)")
-    ap.add_argument("--cal", type=float, help="chars per token (default 3.8)")
+    ap.add_argument("--cal", type=float,
+                    help="chars per token: the global prior the per-category "
+                         "fit regularizes toward and the constant used when "
+                         "it is inactive (default 3.8)")
+    ap.add_argument("--no-fit", action="store_true", dest="no_fit",
+                    help="disable the per-category ratio fit: size every "
+                         "category with the single global constant (the "
+                         "pre-fit behaviour, for comparison)")
     args = ap.parse_args()
     if args.cal:
         Est.chars_per_tok = args.cal
+    if args.no_fit or os.environ.get("AMTR_NO_FIT"):
+        globals()["FIT_ON"] = False
     if args.validate or args.report:
         _use_real_stdout()               # the report IS fd 1's payload
     if args.selftest:

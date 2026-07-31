@@ -49,6 +49,7 @@ pub const C_WHITE: (u8, u8, u8) = (245, 245, 245); // pulses
 
 pub const SHADE: [char; 5] = ['·', '░', '▒', '▓', '█'];
 pub const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+pub const LBLOCK: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
 
 pub fn rgb(c: (u8, u8, u8)) -> Color {
     Color::Rgb(c.0, c.1, c.2)
@@ -80,6 +81,60 @@ pub const HEAT_STATIC_S: f64 = 118.8;
 /// The shared decay-brightness law: `0.30 + 0.70·e^(−age/45 s)`.
 pub fn heat_k(age_s: f64) -> f64 {
     0.30 + 0.70 * (-age_s.max(0.0) / 45.0).exp()
+}
+
+/// Big-number tank palettes: art-historical color sets, each a 4-stop
+/// gradient ordered dark → vivid (the drain law: deep at the far end,
+/// luminous at the surface). Curated, not computed — each is the palette
+/// of a movement/painter, in rough chronological order.
+pub const ART_PALETTES: [[(u8, u8, u8); 4]; 11] = [
+    // renaissance: sienna underpainting → vermilion → gilded highlight
+    [(30, 22, 18), (98, 52, 30), (172, 72, 40), (218, 170, 74)],
+    // ukiyo-e: prussian-blue wave → foam
+    [(16, 32, 56), (34, 76, 120), (86, 142, 160), (238, 226, 198)],
+    // turner: storm smoke → sun through haze
+    [(36, 34, 44), (110, 86, 70), (198, 140, 80), (248, 214, 140)],
+    // monet: water-lily pond at dusk → lily pads
+    [(24, 42, 74), (70, 110, 140), (130, 170, 160), (204, 216, 170)],
+    // van gogh: indigo sky → cypress swirl → star
+    [(16, 24, 70), (34, 72, 138), (92, 160, 190), (240, 196, 60)],
+    // mucha: olive shadow → brass → blush (poster girl halo)
+    [(52, 44, 28), (110, 104, 50), (188, 150, 80), (228, 172, 130)],
+    // matisse: plum → magenta → flame → chrome yellow
+    [(60, 16, 60), (170, 40, 90), (235, 90, 40), (250, 180, 50)],
+    // art deco: lacquer black → emerald → brushed gold
+    [(18, 22, 28), (16, 84, 78), (60, 140, 120), (214, 168, 80)],
+    // bauhaus: primaries with the red doing the work
+    [(30, 40, 90), (190, 50, 40), (230, 120, 40), (240, 190, 50)],
+    // rothko: maroon → cadmium orange color fields
+    [(44, 10, 24), (120, 24, 32), (198, 60, 36), (240, 130, 50)],
+    // vaporwave: midnight → neon violet → hot pink → cyan sun
+    [(24, 16, 64), (110, 40, 140), (220, 80, 170), (90, 225, 230)],
+];
+
+/// One palette rolled per process (the only randomness in the renderer —
+/// fixed after first call, so frames stay deterministic).
+pub fn art_palette() -> &'static [(u8, u8, u8); 4] {
+    static PICK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let i = *PICK.get_or_init(|| {
+        let mut x = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15)
+            | 1;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x % ART_PALETTES.len() as u64) as usize
+    });
+    &ART_PALETTES[i]
+}
+
+/// Sample a 4-stop palette at t ∈ 0..=1 (piecewise-linear).
+pub fn palette_color(stops: &[(u8, u8, u8); 4], t: f64) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0) * 3.0;
+    let i = (t.floor() as usize).min(2);
+    lerp(stops[i], stops[i + 1], t - i as f64)
 }
 
 /// Zone color for a fill ratio (fixed 0.60 / 0.85 thresholds).
@@ -4512,21 +4567,12 @@ pub fn render_footer(
     f.render_widget(Paragraph::new(Line::styled(format!(" {hint}"), fg(C_DIM))), area);
 }
 
-// 3×5 block digits for the big-number mode
-const DIGITS: [[&str; 5]; 10] = [
-    ["███", "█ █", "█ █", "█ █", "███"],
-    ["  █", "  █", "  █", "  █", "  █"],
-    ["███", "  █", "███", "█  ", "███"],
-    ["███", "  █", "███", "  █", "███"],
-    ["█ █", "█ █", "███", "  █", "  █"],
-    ["███", "█  ", "███", "  █", "███"],
-    ["███", "█  ", "███", "█ █", "███"],
-    ["███", "  █", "  █", "  █", "  █"],
-    ["███", "█ █", "███", "█ █", "███"],
-    ["███", "█ █", "███", "  █", "███"],
-];
-
-/// Big-number mode (<50×15): R%, zone color, ETA, alert count.
+/// Big-number mode (<50×15): the whole screen is the gauge. An art-movement
+/// palette tank (one palette rolled per process — see `art_palette`) covers
+/// exactly the context-left fraction, draining as the window fills. Tall
+/// windows fill bottom-up; flat windows (w > 2h, visually wider than tall)
+/// fill left-to-right. Fractional edge = eighth-blocks, brightest at the
+/// surface. The only chrome: R% in the top-left corner.
 pub fn render_big(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -4534,58 +4580,98 @@ pub fn render_big(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
     let ratio = st.resident as f64 / st.budget.max(1) as f64;
     let pct = (ratio * 100.0).round() as u64;
     let zone = zone_color(ratio);
-    let digits: Vec<u32> = pct
-        .to_string()
-        .chars()
-        .filter_map(|c| c.to_digit(10))
-        .collect();
-    let big_w = digits.len() * 4 + 1; // 3 wide + 1 gap, plus '%'
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    if area.width as usize >= big_w + 2 && area.height >= 8 {
-        for row in 0..5 {
-            let mut s = String::new();
-            for d in &digits {
-                s.push_str(DIGITS[*d as usize][row]);
-                s.push(' ');
+
+    // gradient tank: cells covered = context left, palette sweeps its
+    // stops dark → vivid toward the surface edge
+    let pal = art_palette();
+    let grad = |t: f64| palette_color(pal, t);
+    let left = (1.0 - ratio).clamp(0.0, 1.0);
+    let horiz = area.width > 2 * area.height;
+    let span = if horiz { area.width } else { area.height };
+    let cells = span as f64 * left;
+    let full = (cells.floor() as u16).min(span);
+    let lvl = ((cells - full as f64) * 8.0).round() as usize;
+    for i in 0..full {
+        let t = if full > 1 {
+            i as f64 / (full - 1) as f64
+        } else {
+            1.0
+        };
+        let slice = if horiz {
+            Rect {
+                x: area.x + i,
+                y: area.y,
+                width: 1,
+                height: area.height,
             }
-            s.push(if row >= 3 { '%' } else { ' ' });
-            lines.push(Line::styled(s, fg(zone).add_modifier(Modifier::BOLD)));
-        }
-    } else {
-        lines.push(Line::styled(
-            format!("R {pct}%"),
-            fg(zone).add_modifier(Modifier::BOLD),
-        ));
+        } else {
+            Rect {
+                x: area.x,
+                y: area.y + area.height - 1 - i,
+                width: area.width,
+                height: 1,
+            }
+        };
+        f.render_widget(
+            Block::default().style(Style::default().bg(rgb(grad(t)))),
+            slice,
+        );
     }
-    lines.push(Line::from(""));
-    lines.push(Line::styled(
-        match st.compact_eta() {
-            Some(eta) => format!("compact ≈{:.0}t", eta.ceil()),
-            None => "compact —".to_string(),
-        },
-        fg(C_FG),
-    ));
-    let n_alerts = if st.alert.is_some() { 1 } else { 0 };
-    lines.push(Line::styled(
-        format!(
-            "R {} / {}  {}",
-            fmt_k0(st.resident),
-            fmt_k0(st.budget),
-            if n_alerts > 0 { "▲ alert" } else { "" }
-        ),
-        fg(C_DIM),
-    ));
+    if lvl > 0 && full < span {
+        // fractional surface slice: eighth-blocks growing toward the fill
+        let edge = fg(grad(1.0));
+        if horiz {
+            let col = Rect {
+                x: area.x + full,
+                y: area.y,
+                width: 1,
+                height: area.height,
+            };
+            let rows: Vec<Line<'static>> = (0..area.height)
+                .map(|_| Line::styled(LBLOCK[lvl - 1].to_string(), edge))
+                .collect();
+            f.render_widget(Paragraph::new(rows), col);
+        } else {
+            let row = Rect {
+                x: area.x,
+                y: area.y + area.height - 1 - full,
+                width: area.width,
+                height: 1,
+            };
+            let surface: String = std::iter::repeat(SPARK[lvl - 1])
+                .take(area.width as usize)
+                .collect();
+            f.render_widget(Paragraph::new(Line::styled(surface, edge)), row);
+        }
+    }
+
+    // simple readout: percentage + session handle in the top-left corner,
+    // nothing else
     let _ = ui;
-    let h = (lines.len() as u16).min(area.height);
-    let w = (lines
-        .iter()
-        .map(|l| l.width() as u16)
-        .max()
-        .unwrap_or(10))
-    .min(area.width);
-    let rect = centered(area, w, h);
-    f.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center),
-        rect,
-    );
+    let name = st
+        .meta
+        .as_ref()
+        .map(|m| {
+            if m.name.is_empty() {
+                m.session_id.chars().take(8).collect()
+            } else {
+                m.name.clone()
+            }
+        })
+        .unwrap_or_else(|| "—".to_string());
+    let spans = vec![
+        Span::styled(
+            format!(" {pct}%"),
+            fg(lerp(zone, C_WHITE, 0.20)).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {name} "), fg(C_FG)),
+    ];
+    let line = Line::from(spans);
+    let rect = Rect {
+        x: area.x,
+        y: area.y,
+        width: (line.width() as u16).min(area.width),
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(line), rect);
 }

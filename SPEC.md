@@ -147,7 +147,7 @@ strings on the wire ("HH:MM:SS") are UTC, including engine-synthesized events.
 | `backfill` | `turns:[Turn]≤512 (newest), faccess:[Faccess]≤4096 (newest), compactions:[Compaction] (all), agents:[Agent] (all), events:[Event]≤256, cmds:[Cmd]≤256 (newest), rets:[Ret]≤256 (newest)` | once per attach, after `meta`+`map`, before `ready` |
 | `ready` | `session_id, turns:int, resident:int, budget:int` | backfill complete; UI un-gates views |
 | `turn` | `turn:int, ts:str("HH:MM:SS"), model:str, in:int, cr:int, cc:int, cc_5m:int, cc_1h:int, out:int, resident:int, waterline:int, dur_ms:int\|null, stop:str\|null, tools:int, cost_u:float, hit:float` | one per new assistant turn |
-| `map` | `rev:int, alpha:float, segs:[Seg]` | on attach + every rebuild (compaction, seek-base change); `segs[0]` is the overhead segment (`cat:"overhead"`) |
+| `map` | `rev:int, alpha:float, fit:Fit, segs:[Seg]` | on attach + every rebuild (compaction, seek-base change); `segs[0]` is the overhead segment (`cat:"overhead"`); `fit` is the per-category calibration the segment sizes came from (additive: readers that predate it ignore the field, per the version-drift law) |
 | `map_add` | `rev:int, segs:[Seg]` | appended segments between rebuilds (same rev) |
 | `files` | `upserts:[File]` | change-detected batches, ≤ 1/tick |
 | `faccess` | `turn:int, ts:str, file:int, op:"r"\|"w"\|"e", tok:int` | one per file access |
@@ -171,6 +171,15 @@ Sub-objects:
   mtime:float, live:bool, resident:int|null, budget:int|null, last_prompt:str|null}`
 - `Seg  = {id:int, cat:str, tok:int, file:int|null, born:int (turn), ts:float (epoch
   of last access)}`
+- `Fit  = {active:bool, mode:"cats"|"scale"|"prior", reason:str, turns:int,
+  prior_cpt:float, cpt?:{cat:float}, fitted_cats?:[str], clamped?:[str],
+  overhead?:int, r2?:float, rms_pct?:float, mae_pct?:float,
+  holdout_prior_pct?:float, holdout_scale_pct?:float, holdout_cats_pct?:float,
+  holdout_fit_pct?:float, gain?:float}` — the token-ratio calibration (SPEC d).
+  `cpt` is chars/token PER CATEGORY; categories not in `fitted_cats` were left
+  on the fitted global rate, `clamped` ones hit the plausible-range bound.
+  `active:false` means the single global constant is in force and `reason` says
+  why. Everything here is ESTIMATED metadata — it never touches R
 - `File = {id:int, path:str, tok:int, reads:int, writes:int, edits:int, waste:int,
   last_ts:str, last_epoch:float, resident:bool}` — `last_epoch` = epoch seconds
   UTC of the newest access, 0 = unknown (drives the FILES NOW view's live decay;
@@ -189,7 +198,7 @@ Ordering per attach: `meta` → `map` → `backfill` → `ready` → incremental
 | `peek` | `seg:int` | on-demand content inspection (MAP INSPECT mode): the engine re-reads the segment's record from disk and replies with one `peek`. Explicit-request-only (sent on Enter, never per-cursor-move), so no coalescing is needed |
 | `live` | — | leave replay; engine stops answering stale seeks |
 | `report` | — | write a ground-truth report (§f) of the ATTACHED session — the live engine already has it parsed, so it is instant — to `~/.claude/amtr-reports/<name>-<id8>.md`; replies `report_done`. Bound to `R` in the TUI (one-key, seamless) |
-| `set` | `key:str, value` | `chars_per_tok:float`, `poll_ms:int`, `t_auto:float`; unknown keys silently ignored |
+| `set` | `key:str, value` | `chars_per_tok:float` (the global prior/fallback), `fit:0\|1` (per-category ratio fit on/off), `poll_ms:int`, `t_auto:float`; unknown keys silently ignored |
 | `fleet_refresh` | — | force roster rescan |
 | `quit` | — | cooperative shutdown; stdin EOF is the equivalent fallback |
 
@@ -226,10 +235,41 @@ its slug) > newest session anywhere under `~/.claude/projects`, cross-checked
 against the live roster (prefer live sessions). The engine must EXCLUDE its own
 monitoring session when auto-picking iff `AMTR_SELF_SESSION` env is set to that id.
 
+**Per-category token ratios (the calibration, `fit_cats`).** One global
+chars/token constant is a lie — JSON and code tokenize near 3 chars/token,
+English prose near 4.5 — and there is no offline tokenizer for these models.
+But the session already carries ground truth: R is authoritative every turn and
+the engine knows how many CHARS of each category were resident when the server
+priced it. So the engine regresses its OWN design matrix against R:
+`R_t ≈ intercept + Σ_c chars[c,t]·inv[c]`, stdlib only (normal equations +
+Gaussian elimination with partial pivoting; box-constrained coordinate descent
+when a ratio leaves the plausible 1.5–8.0 chars/token band), never a network
+call. Two stages: (1) ONE ratio + intercept — always identifiable — then
+(2) per-category ridge SHRUNK TOWARD stage 1, weighted by how small each
+category's share of the text is, so a category the data cannot speak to lands
+on the session's own measured rate instead of somewhere absurd. Refit on a
+growing cadence (never per record), a pure function of (turns, per-turn chars)
+so replay/seek reproduces it exactly.
+
+**The gate is out-of-sample** (a 10-parameter model always wins in-sample):
+train on the first 60% of turns, score the median |err|/R on the rest, and
+adopt per-category ratios only when they beat BOTH the single fitted ratio and
+the 3.8 constant; adopt the single fitted ratio only when it beats the
+constant; otherwise stay on the constant and SAY SO (`fit.reason`). The fit
+changes only the SPLIT — α still force-fits the segment sum to exactly R, and
+no authoritative number is ever touched by it. Measured on 43 real local
+sessions (23k turns, rolling-origin, frozen parameters): median |err|/R 13.96%
+→ 7.19%, mean 24.42% → 15.51%; most of that gain is the SCALE (one fitted
+ratio gets 8.8% median), per-category differentiation is the rest.
+
 **CLI (engine standalone, for tests & debugging):** `--selftest` (replay a fixture
 transcript at full speed, emit all messages to the protocol stream, exit 0 —
 doubles as the UI's demo feed via `amtr --engine-args`); `--validate` (print v1's
-authoritative-vs-estimate report to stderr and exit).
+authoritative-vs-estimate report to stderr and exit, including the calibration
+above); `--cal F` (the global chars/token prior the fit shrinks toward and the
+constant used when it is inactive, default 3.8); `--no-fit` / `AMTR_NO_FIT=1`
+(disable the fit entirely — the pre-fit single-constant behaviour, kept
+so the two are comparable).
 
 **Fixture:** `tests/fixtures/golden.jsonl` — SYNTHETIC transcript (no private
 data) exercising: ≥6 turns with realistic usage (growing cr, cc spikes), Read/
@@ -294,7 +334,15 @@ severity ≥ warn).
 **Size tiers** (pure `layout(area) -> Panes{Option<Rect>…}`, pane-dropping, never
 squishing): ≥110×30 full · ≥80×24 drop secondary columns, coarser MAP rung ·
 ≥50×15 one primary pane per tab, 1-line ribbon, no scrubber · <50×15 big-number
-mode (R%, zone color, ETA, alert count) · <14×6 centered `amtr ≥14×6`.
+mode (the screen itself is the gauge — an art-movement palette tank covers
+exactly the context-left fraction, draining as the window fills. One palette
+rolled per process from a curated set of 4-stop art-historical gradients
+(renaissance, ukiyo-e, turner, monet, van gogh, mucha, matisse, art deco,
+bauhaus, rothko, vaporwave), each ordered dark at the far end → vivid at the
+surface. Tall windows fill bottom-up, flat windows (w > 2h) left-to-right;
+eighth-block fractional surface slice. The only chrome: `R% · session-name`
+top-left — R% bold in a white-lifted zone tint, name in body text) · <14×6
+centered `amtr ≥14×6`.
 
 ### Tab 1 OVERVIEW — MAP + EKG
 
@@ -601,7 +649,9 @@ The report is markdown, ground truth first, sections in this order:
 2. **CONTEXT (authoritative)** — final R vs budget, PEAK R (max over turns),
    compactions (count, tokens dropped, per-event pre→post), server rebuilds
    (count, flushed), final composition by category (incl. overhead/reasoning
-   split, α), waterline at end.
+   split, α) with the chars/token each category was sized at, the CALIBRATION
+   line (fitted per category / one global ratio / the constant — with the
+   held-out error of each and the fitted overhead intercept), waterline at end.
 3. **ECONOMICS (authoritative)** — Σ input / cache-read / cc_5m / cc_1h /
    output tokens across ALL turns; overall hit rate; total cost_u; cost/turn
    mean & p95; thrash events; per-model breakdown when models switched.

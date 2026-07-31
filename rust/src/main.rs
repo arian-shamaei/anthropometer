@@ -2268,7 +2268,6 @@ mod screenshots {
         let mut app = demo_app();
         let s = draw(&mut app, 40, 12); // < 50×15 → big-number mode
         assert!(s.contains('%'), "big-number % missing:\n{s}");
-        assert!(s.contains("compact"), "big-number ETA missing:\n{s}");
         let s = draw(&mut app, 12, 5); // < 14×6 → centered floor message
         assert!(s.contains("amtr"), "floor message missing:\n{s}");
     }

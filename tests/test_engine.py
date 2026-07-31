@@ -1131,5 +1131,190 @@ class TestAgentMap(unittest.TestCase):
         self.assertNotIn("map", s.agent_payload("a2"))
 
 
+def synth_session(turns=60, cpt=None, fit_on=True, budget=1_000_000):
+    """Build a Session from a synthetic transcript whose categories tokenize at
+    KNOWN, different rates. Each turn adds one user prompt, one assistant text
+    and one Bash tool_use+result, and the authoritative usage R is computed
+    from the true rates + a fixed server-side overhead — exactly the world the
+    fit is supposed to recover."""
+    cpt = cpt or {"user": 4.5, "assistant": 4.0, "bash": 2.5}
+    OH = 12_000
+    s = ce.Session("/nonexistent.jsonl", budget=budget, budget_pinned=True)
+    s.fit_on = fit_on
+    chars = {"user": 0.0, "assistant": 0.0, "bash": 0.0}
+    for t in range(turns):
+        ts = "2026-07-17T10:%02d:%02d.000Z" % (t // 60, t % 60)
+        # varying mixes so the columns are not collinear multiples
+        up = "u" * (200 + 37 * (t % 7))
+        ap = "a" * (300 + 53 * (t % 5))
+        bo = "b" * (900 + 613 * (t % 11))
+        chars["user"] += len(up)
+        chars["assistant"] += len(ap)
+        R = int(OH + sum(chars[c] / cpt[c] for c in chars))
+        s.feed_obj({"type": "user", "uuid": "s-u%d" % t, "timestamp": ts,
+                    "message": {"role": "user", "content": up}})
+        s.feed_obj({"type": "assistant", "uuid": "s-a%d" % t,
+                    "requestId": "req_%d" % t, "timestamp": ts,
+                    "message": {"role": "assistant", "model": "claude-fable-5",
+                                "content": [{"type": "text", "text": ap}],
+                                "usage": {"input_tokens": R,
+                                          "output_tokens": 0,
+                                          "cache_read_input_tokens": 0,
+                                          "cache_creation_input_tokens": 0}}})
+        # the bash result lands AFTER the turn's usage: it is priced by R(t+1)
+        s.feed_obj({"type": "assistant", "uuid": "s-b%d" % t,
+                    "requestId": "req_%d" % t, "timestamp": ts,
+                    "message": {"role": "assistant", "model": "claude-fable-5",
+                                "content": [{"type": "tool_use", "id": "tu%d" % t,
+                                             "name": "Bash",
+                                             "input": {"command": "echo"}}],
+                                "usage": {"input_tokens": R,
+                                          "output_tokens": 0,
+                                          "cache_read_input_tokens": 0,
+                                          "cache_creation_input_tokens": 0}}})
+        s.feed_obj({"type": "user", "uuid": "s-r%d" % t, "timestamp": ts,
+                    "message": {"role": "user",
+                                "content": [{"type": "tool_result",
+                                             "tool_use_id": "tu%d" % t,
+                                             "content": bo}]}})
+        # the tool_result's own JSON framing counts too: take the engine's
+        # own char tally for bash rather than guessing it
+        chars["bash"] = s.cat_chars["bash"]
+    return s
+
+
+class TestCategoryFit(unittest.TestCase):
+    """The per-category ratio fit (SPEC d): estimated numbers get better, the
+    authoritative ones never move."""
+
+    def test_solve_small_system(self):
+        A = [[2.0, 1.0, -1.0], [-3.0, -1.0, 2.0], [-2.0, 1.0, 2.0]]
+        x = ce._solve(A, [8.0, -11.0, -3.0])
+        for got, want in zip(x, [2.0, 3.0, -1.0]):
+            self.assertAlmostEqual(got, want, places=6)
+        self.assertIsNone(ce._solve([[1.0, 2.0], [2.0, 4.0]], [1.0, 2.0]))
+
+    def test_fit_recovers_known_ratios(self):
+        # noiseless design with independent variation per category
+        true = {"user": 1 / 4.5, "file": 1 / 2.8, "bash": 1 / 3.2}
+        rows = []
+        for t in range(60):
+            ch = {"user": 1000.0 * (1 + (t % 7)), "file": 900.0 * (1 + (t % 5)),
+                  "bash": 700.0 * (1 + (t % 11))}
+            rows.append((int(9000 + sum(ch[c] * true[c] for c in true)), ch))
+        f = ce._fit_rows(rows, 3.8, 0.0, lam=1e-3)   # ridge out of the way
+        self.assertIsNotNone(f)
+        for c, r in true.items():
+            self.assertAlmostEqual(1.0 / f["inv"][c], 1.0 / r, delta=0.25)
+        self.assertAlmostEqual(f["intercept"], 9000, delta=600)
+        # a category that never appears stays on the prior, untouched
+        self.assertAlmostEqual(f["inv"]["thinking"],
+                               ce._scale_fit(rows, 3.8)["k"], places=9)
+        # with the shipped ridge the same fit shrinks toward the session's own
+        # global rate instead — never past it, never anywhere absurd
+        g = ce._fit_rows(rows, 3.8, 0.0)
+        k = ce._scale_fit(rows, 3.8)["k"]
+        for c in true:
+            self.assertLessEqual(abs(g["inv"][c] - k),
+                                 abs(f["inv"][c] - k) + 1e-9)
+
+    def test_fit_bounds_are_enforced(self):
+        rows = []
+        for t in range(40):
+            ch = {"file": 1000.0 * (1 + t % 9), "user": 300.0 * (1 + t % 4)}
+            # absurd rate: 0.5 chars/token, far outside the plausible band
+            rows.append((int(500 + ch["file"] / 0.5 + ch["user"] / 6.0), ch))
+        f = ce._fit_rows(rows, 3.8, 0.0)
+        self.assertIsNotNone(f)
+        for c in ("file", "user"):
+            cpt = 1.0 / f["inv"][c]
+            self.assertGreaterEqual(cpt, ce.FIT_MIN_CPT - 1e-9)
+            self.assertLessEqual(cpt, ce.FIT_MAX_CPT + 1e-9)
+        self.assertIn("file", f["clamped"])
+
+    def test_gate_falls_back_when_too_few_turns(self):
+        rows = [(1000 + 10 * t, {"user": 100.0 * t}) for t in range(5)]
+        st = ce.fit_cats(rows)
+        self.assertFalse(st["active"])
+        self.assertEqual(st["mode"], "prior")
+        self.assertIn("too few turns", st["reason"])
+
+    def test_gate_reports_holdout_scores(self):
+        _, rows = None, [(int(9000 + 1000.0 * (1 + t % 7) / 4.5),
+                          {"user": 1000.0 * (1 + t % 7)}) for t in range(60)]
+        st = ce.fit_cats(rows)
+        self.assertTrue(st["active"])
+        self.assertIn("holdout_prior_pct", st)
+        self.assertIn("holdout_fit_pct", st)
+        self.assertLessEqual(st["holdout_fit_pct"], st["holdout_prior_pct"])
+        rep = ce.fit_report(st)
+        self.assertIn("cpt", rep)
+        self.assertIn(rep["mode"], ("cats", "scale"))
+
+    def test_session_fit_activates_and_beats_the_constant(self):
+        s = synth_session()
+        self.assertTrue(s.fit_state["active"], s.fit_state["reason"])
+        self.assertLess(s.fit_state["holdout_fit_pct"],
+                        s.fit_state["holdout_prior_pct"])
+        self.assertGreater(s.fit_state["r2"], 0.99)
+
+    def test_map_still_sums_to_R_exactly_with_a_fit(self):
+        s = synth_session()
+        self.assertIsNotNone(s.fit)
+        segs = s.build_map_segs()
+        self.assertEqual(sum(x["tok"] for x in segs), s.resident())
+        self.assertEqual(segs[0]["cat"], "overhead")
+
+    def test_fit_off_is_the_old_behaviour_exactly(self):
+        on, off = synth_session(), synth_session(fit_on=False)
+        self.assertIsNone(off.fit)
+        self.assertEqual(off.fit_state["reason"], "disabled")
+        # pre-fit calibration path, unchanged: live_est() IS est_live and the
+        # honesty rule reproduces R from overhead + est x alpha
+        self.assertEqual(off.live_est(), off.est_live)
+        R = off.resident()
+        self.assertEqual(sum(x["tok"] for x in off.build_map_segs()), R)
+        # same authoritative numbers either way — only the SPLIT moves
+        self.assertEqual(on.resident(), off.resident())
+        self.assertEqual([t["resident"] for t in on.turns],
+                         [t["resident"] for t in off.turns])
+        self.assertNotEqual(on.cats_payload(), off.cats_payload())
+
+    def test_fit_is_deterministic_under_replay(self):
+        a, b = synth_session(), synth_session()
+        self.assertEqual(a.fit_payload(), b.fit_payload())
+        # a clone (checkpoint/seek path) carries the fit forward untouched
+        c = a.clone()
+        self.assertEqual(c.fit_payload(), a.fit_payload())
+        self.assertEqual(c.build_map_segs(), a.build_map_segs())
+
+    def test_cal_sets_the_prior(self):
+        old = ce.Est.chars_per_tok
+        try:
+            ce.Est.chars_per_tok = 3.0
+            s = synth_session()
+            self.assertEqual(s.fit_state["prior_cpt"], 3.0)
+        finally:
+            ce.Est.chars_per_tok = old
+
+    def test_report_carries_the_calibration(self):
+        s = synth_session()
+        rep = ce.build_report(s)
+        ft = rep["context"]["fit"]
+        self.assertTrue(ft["active"])
+        self.assertIn("cpt", ft)
+        self.assertIn("overhead", ft)
+        md = ce.render_report_md(rep)
+        self.assertIn("token ratios:", md)
+        self.assertIn("chars/tok", md)
+
+    def test_map_payload_carries_the_fit(self):
+        s = synth_session()
+        m = s.map_payload()
+        self.assertIn("fit", m)
+        self.assertTrue(m["fit"]["active"])
+        self.assertEqual(sum(x["tok"] for x in m["segs"]), s.resident())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
