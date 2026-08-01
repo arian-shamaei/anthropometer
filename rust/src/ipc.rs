@@ -718,7 +718,9 @@ pub struct SpawnCfg {
 ///   1. the `AMTR_ENGINE` env var (Homebrew's wrapper sets this),
 ///   2. next to the executable, or `../libexec` / `../lib/amtr` beside it — how
 ///      prebuilt-binary bundles and Homebrew-style layouts ship the engine,
-///   3. the compile-time repo path (dev builds / `cargo install --path`).
+///   3. the compile-time repo path (dev builds / `cargo install --path`),
+///   4. the engine embedded in the binary, materialized to the cache dir —
+///      makes a bare `cargo install amtr` fully self-contained.
 pub fn default_engine_path() -> PathBuf {
     if let Ok(p) = std::env::var("AMTR_ENGINE") {
         if !p.is_empty() {
@@ -741,10 +743,58 @@ pub fn default_engine_path() -> PathBuf {
         }
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .map(|repo| repo.join("amtr_engine.py"))
-        .unwrap_or_else(|| PathBuf::from("amtr_engine.py"))
+    if let Some(repo) = manifest.parent() {
+        let cand = repo.join("amtr_engine.py");
+        if cand.is_file() {
+            return cand;
+        }
+    }
+    extract_embedded_engine().unwrap_or_else(|_| PathBuf::from("amtr_engine.py"))
+}
+
+/// The whole python side, baked in at compile time (synced into `engine/` by
+/// `packaging/sync-engine.sh`). `amtr_paper.py` must sit beside the engine
+/// because the engine spawns it from its own directory for `R` reports.
+const EMBEDDED_ENGINE: &[(&str, &str)] = &[
+    ("amtr_engine.py", include_str!("../engine/amtr_engine.py")),
+    ("amtr_paper.py", include_str!("../engine/amtr_paper.py")),
+    ("amtr_figures.py", include_str!("../engine/amtr_figures.py")),
+    ("amtr_phases.py", include_str!("../engine/amtr_phases.py")),
+    ("amtr_turns.py", include_str!("../engine/amtr_turns.py")),
+];
+
+fn embedded_cache_dir() -> PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|h| PathBuf::from(h).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("amtr")
+        .join(concat!("engine-", env!("CARGO_PKG_VERSION")))
+}
+
+/// Materialize the embedded engine bundle into the cache dir (idempotent;
+/// rewrites a file only when its content drifted from the embedded copy).
+fn extract_embedded_engine() -> std::io::Result<PathBuf> {
+    let dir = embedded_cache_dir();
+    std::fs::create_dir_all(&dir)?;
+    for (name, body) in EMBEDDED_ENGINE {
+        let path = dir.join(name);
+        let stale = match std::fs::read_to_string(&path) {
+            Ok(cur) => cur != *body,
+            Err(_) => true,
+        };
+        if stale {
+            std::fs::write(&path, body)?;
+        }
+    }
+    Ok(dir.join("amtr_engine.py"))
 }
 
 /// Spawn the Python engine as a child process.

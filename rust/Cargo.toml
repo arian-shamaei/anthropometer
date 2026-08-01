@@ -2,6 +2,14 @@
 name = "amtr"
 version = "0.1.5"
 edition = "2024"
+description = "btop-style live monitor for Claude Code sessions: context-window memory map, cache economics, compaction forensics"
+license = "MIT"
+repository = "https://github.com/arian-shamaei/anthropometer"
+homepage = "https://github.com/arian-shamaei/anthropometer"
+readme = "README.md"
+keywords = ["claude", "claude-code", "tui", "ratatui", "monitoring"]
+categories = ["command-line-utilities", "development-tools::profiling", "visualization"]
+include = ["src/**", "engine/*.py", "README.md"]
 
 [dependencies]
 crossterm = "0.29"
