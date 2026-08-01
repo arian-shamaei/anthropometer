@@ -12,6 +12,10 @@ ground-truth PDF report of the whole session.
 
 <sub>↑ replaying a session turn-by-turn: the context map fills, the composition shifts, the trend climbs.</sub>
 
+> **▶ [The autopsy](docs/autopsy/):** amtr was built in one 153-hour Claude Code conversation —
+> so we pointed it at its own transcripts. 1,945 turns, 1.02 billion cache-read tokens,
+> 3 compactions, $1,472 at API list price. The instrument dissects its own birth.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 &nbsp;·&nbsp; [![vibe coded](https://img.shields.io/badge/AI%20usage-vibe%20coded-ff2d78)](#-ai-usage)
 &nbsp;·&nbsp; Rust + ratatui TUI · Python engine · terminal-only
