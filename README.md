@@ -24,7 +24,7 @@ ground-truth PDF report of the whole session.
 
 ## AI usage
 
-```text                                                              
+```text
  hand-written ▕█████████████████████████████████████████████████████████ ▏  vibe coded  
               └── none ──── copilot ──── pair-programmed ──── VIBE CODED ──┘
 ```
@@ -46,8 +46,9 @@ every session already writes a complete transcript. `amtr` just reads it in real
 
 ## The live TUI
 
-A fast, keyboard-driven terminal UI. Tabs `1`–`6`, `f` for the session picker,
-`i` to inspect, `R` to build a report, `?` for help, `q` to quit.
+A fast, keyboard-driven terminal UI. Tabs `1`–`6`, `f` for the session picker
+(`tab` there for the system-wide wall), `i` to inspect, `R` to build a report,
+`?` for help, `q` to quit.
 
 ### Context map — where your budget actually goes
 
@@ -187,25 +188,22 @@ claude -p "do the thing" &
 amtr-report --watch        # tails the live session; prints the report when it ends
 ```
 
-**Keys:** `1`–`6` tabs · `f` sessions · `i` inspect · `m` map mode · `←/→` scrub ·
-`R` report · `?` help · `q` quit.
+**Keys:** `1`–`6` tabs · `f` sessions (`tab` wall) · `i` inspect · `m` map mode ·
+`←/→` scrub · `R` report · `?` help · `q` quit.
 
 ---
 
 ## Authoritative vs. estimated
 
-`amtr` is careful about what it *knows* versus what it *estimates*:
+`amtr` is careful about what it *knows* versus what it *estimates* — every number
+on screen belongs to one of these rows, and the two are never blurred:
 
-- **R (resident context)** — exact: `input + cache_read + cache_creation` of the
-  newest assistant `usage` record (the same quantity `/context` reports).
-- **The cache waterline** — exact: `cache_read_input_tokens`; backward jumps are
-  real prefix invalidations (thrash).
-- **Per-item allocations** — estimated (`chars/3.8`), laid out in true prompt order
-  and force-fit to sum exactly to R, with the invisible server-side context
-  (system prompt, tool schemas) carried as an honest **overhead** segment and a
-  displayed calibration factor `α`.
-- **Compaction attribution** — from `compact_boundary` set-difference, cross-checked
-  against pre/post token counts.
+| quantity | status | where it comes from |
+|---|---|---|
+| **R** — resident context | **exact** | `input + cache_read + cache_creation` of the newest assistant `usage` record — the same quantity `/context` reports |
+| **cache waterline** | **exact** | `cache_read_input_tokens`; a backward jump is a real prefix invalidation (thrash) |
+| **compaction attribution** | derived | `compact_boundary` set-difference, cross-checked against pre/post token counts |
+| **per-item allocations** | *estimated* | chars-per-token ratios (per-category calibrated), laid out in true prompt order and force-fit to sum exactly to R; the invisible server-side context (system prompt, tool schemas) is carried as an honest **overhead** segment with a displayed calibration factor `α` |
 
 ---
 
@@ -218,11 +216,24 @@ both sides are implemented against it alone, and cross-process contract tests sp
 the real engine and require every emitted line to parse.
 
 ```
-┌───────────────────────────┐   JSON lines over stdin/stdout   ┌───────────────────────────┐
-│  amtr  (Rust ratatui bin) │ ── Control (UI → Engine) ──▶      │  amtr_engine.py           │
-│  owns ONLY the terminal   │                                  │  (python3 ≥3.9, stdlib)   │
-└───────────────────────────┘ ◀── Update (Engine → UI) ──       │  owns ALL data            │
-                                                                └───────────────────────────┘
+        ~/.claude/projects/<project>/<session-id>.jsonl
+╔═══════════════════════════════════════════════════════════════╗
+║   session transcripts — already written by Claude Code itself ║
+╚═══════════════════════════════╤═══════════════════════════════╝
+                                │  tailed live (~250 ms); no
+                                ▼  instrumentation, ever
+┌───────────────────────────────────────────────────────────────┐
+│  amtr_engine.py   (python3 ≥ 3.9, stdlib only)                │
+│  owns ALL data — discovery · token accounting · checkpoints   ├────▶ report.pdf
+│  · replay · fleet scan · compaction forensics                 │      (press R)
+└───────────────┬───────────────────────────────┬───────────────┘
+                │                               ▲
+                │ Update  (JSON lines, fd 1)    │ Control  (JSON lines, stdin)
+                │ map · turn · files · fleet …  │ attach · seek · peek · kill …
+                ▼                               │
+┌───────────────────────────────────────────────┴───────────────┐
+│  amtr   (Rust + ratatui)   owns ONLY the terminal             │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ## Repository layout
