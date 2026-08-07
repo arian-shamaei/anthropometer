@@ -25,22 +25,9 @@ ground-truth PDF report of the whole session.
 ## AI usage
 
 ```text
-┌ AUTHORSHIP MAP — this repo, read the way amtr reads a context window ──────┐
-│                                                                            │
-│  ██████████████████████████████████████████████████████████████████▓▓▓▒░░  │
-│                                                                            │
-│  █ model-written (vibe-coded)                   every line of .rs and .py  │
-│  ▓ human-written                   the prompts — 1,945 turns of direction  │
-│  ▒ authorship disputed                   this figure, after three redraws  │
-│  ░ compacted away                 2.9M tokens of construction history, 3×  │
-│                                                                            │
-│  keystrokes/min   human  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀              flatline, 153 h  │
-│                   model  ⣤⣶⣿⣶⣤⣀⣀⣤⣶⣿⣤⣀⣀⣤⣶⣤⣿⣶⣤                 1.02B tokens  │
-│                                                                            │
-└────────────────────────────────────────────────────────────────────────────┘
+ hand-written ▕█████████████████████████████████████████████████████████ ▏  vibe coded  
+              └── none ──── copilot ──── pair-programmed ──── VIBE CODED ──┘
 ```
-
-<sub>↑ the disclosure, rendered as what it is: a context map where nearly every cell belongs to the model. Numbers from [the autopsy](docs/autopsy/).</sub>
 
 ---
 
