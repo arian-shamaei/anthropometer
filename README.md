@@ -79,6 +79,18 @@ session id to jump straight to it.
 
 ![sessions](docs/assets/tui-sessions.png)
 
+### SYSTEM-WIDE — every session on your machine, one wall
+
+Press **`f` then `tab`** for the wall: every *active* session as a live gradient
+tank (each session keeps its own deterministic palette), all draining in real
+time. On any tile: **`space`** quicklooks the session's actual conversation —
+who's working on what, read straight from its transcript — **`⏎`** attaches,
+and **`x`** ends the session (confirmed, then a polite SIGTERM).
+
+![system-wide wall](docs/assets/tui-wall.png)
+
+![quicklook preview](docs/assets/tui-wall-preview.png)
+
 Other tabs: **TURNS** (per-turn stacked cache/input columns with the 5m/1h billing
 split), **SHELL** (the command console Claude never shows you + the external-retrieval
 feed), and **EVENTS** (compactions, API errors, model fallbacks — with a compaction

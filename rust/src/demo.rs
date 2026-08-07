@@ -616,4 +616,33 @@ pub(crate) fn populate(app: &mut App, now: f64) {
                 last_prompt: Some("tune the gantt".into()),
             },
         ];
+        // a fuller live wall for SYSTEM-WIDE (projects sort AFTER ml-pipeline
+        // so the tile-selection order the tests pin stays put)
+        let wall: [(&str, &str, &str, u64, &str); 10] = [
+            ("cc01-a1b2", "mqtt-broker", "busy", 152_000, "add retained-message expiry"),
+            ("cc02-c3d4", "orbit-sim", "idle", 41_000, "plot the transfer window"),
+            ("cc03-e5f6", "parser-gen", "busy", 118_000, "left-recursion elimination pass"),
+            ("cc04-a7b8", "quant-lab", "stalled", 176_000, "backtest the pairs strategy"),
+            ("cc05-c9d0", "rust-book", "idle", 23_000, "chapter 15 smart pointers notes"),
+            ("cc06-e1f2", "seal-watch", "busy", 88_000, "debounce the dashboard alerts"),
+            ("cc07-a3b4", "synth-vst", "idle", 64_000, "wavetable interpolation clicks"),
+            ("cc08-c5d6", "term-paint", "busy", 132_000, "flood fill undo history"),
+            ("cc09-e7f8", "wiki-graph", "idle", 12_000, "backlink orphan report"),
+            ("cc10-a9b0", "zine-gen", "stalled", 190_000, "imposition for saddle stitch"),
+        ];
+        for (id, proj, status, res, prompt) in wall {
+            st.fleet.push(Sess {
+                id: id.into(),
+                path: format!("/tmp/{proj}.jsonl"),
+                pid: Some(1000),
+                name: Some(proj.into()),
+                project: format!("/Users/dev/code/{proj}"),
+                status: status.into(),
+                mtime: now - 60.0,
+                live: true,
+                resident: Some(res),
+                budget: Some(200_000),
+                last_prompt: Some(prompt.into()),
+            });
+        }
 }
