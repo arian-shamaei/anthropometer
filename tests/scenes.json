@@ -8,7 +8,7 @@
   "anim_threshold": 12,
   "chrome": {
     "rows": {
-      "0": ["amtr"],
+      "0": ["𝓪𝓶𝓽𝓻"],
       "1": ["OVERVIEW", "SHELL"]
     }
   },
@@ -22,11 +22,15 @@
     {"name": "files-history",    "keys": ["2"],                 "animated": false, "expect_contains": ["waste", "path"]},
     {"name": "files-now",        "keys": ["2", "v"],            "animated": true,  "expect_contains": ["AGE", "hot", "cold"]},
     {"name": "turns",            "keys": ["3"],                 "animated": false, "expect_contains": ["cr", "hit"]},
-    {"name": "agents",           "keys": ["4"],                 "animated": true,  "expect_contains": ["fan-out", "own-tok"]},
+    {"name": "agents",           "keys": ["4"],                 "animated": false, "expect_contains": ["fan-out", "workflow"]},
+    {"name": "agents-ledger",    "keys": ["4", "v"],            "animated": true,  "expect_contains": ["fan-out", "own-tok"]},
     {"name": "events",           "keys": ["5"],                 "animated": false, "expect_contains": ["compaction", "thrash"]},
     {"name": "shell-console",    "keys": ["6"],                 "animated": false, "expect_contains": ["cmds", "FOLLOW"]},
     {"name": "shell-retrieval",  "keys": ["6", "v"],            "animated": false, "expect_contains": ["pulls", "web"]},
     {"name": "fleet",            "keys": ["f"],                 "animated": false, "overlay": true, "expect_contains": ["brisk-otter", "notes-site"]},
+    {"name": "system-wide",      "keys": ["f", "Tab"],          "animated": false, "overlay": true, "expect_contains": ["SYSTEM-WIDE", "ml-pipeline", "brisk-otter"]},
+    {"name": "system-preview",   "keys": ["f", "Tab", "Space"], "animated": false, "overlay": true, "expect_contains": ["PREVIEW", "debug the training loop"]},
+    {"name": "system-kill",      "keys": ["f", "Tab", "x"],     "animated": false, "overlay": true, "expect_contains": ["END SESSION", "cancels"]},
     {"name": "help-keys",        "keys": ["?"],                 "animated": false, "overlay": true, "expect_contains": ["keys + legend"]},
     {"name": "help-numbers",     "keys": ["?", "?"],            "animated": false, "overlay": true, "expect_contains": ["hot/cold", "waste", "ku"]},
     {"name": "help-anatomy",     "keys": ["?", "?", "?"],       "animated": false, "overlay": true, "expect_contains": ["MAP modes", "cache"]},

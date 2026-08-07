@@ -167,9 +167,17 @@ struct App {
     ret_filter: ShellFilter,
     // SESSIONS picker
     fleet_sel: usize,
+    /// SYSTEM-WIDE screen (`tab` in the picker): all active sessions as
+    /// live gradient-tank tiles
+    system_wide: bool,
     /// live search query in the SESSIONS overlay: filters the roster by name /
     /// project, or is attached directly when it is a jsonl path
     fleet_query: String,
+    /// quicklook preview (`space` on a fleet tile/row): the engine's
+    /// fleet_peek reply, rendered as a conversation-tail overlay
+    fleet_peek: Option<ipc::FleetPeekMsg>,
+    /// end-session confirm modal: (session id, display name) pending `y`
+    fleet_kill: Option<(String, String)>,
     /// MAP pane (w, h) as last rendered — lets the +/- handler clamp the rung
     /// override at press time instead of banking presses past the ladder edge
     map_geom: std::cell::Cell<(u16, u16)>,
@@ -237,7 +245,10 @@ impl App {
             ret_expand: false,
             ret_filter: ShellFilter::All,
             fleet_sel: 0,
+            system_wide: false,
             fleet_query: String::new(),
+            fleet_peek: None,
+            fleet_kill: None,
             map_geom: std::cell::Cell::new((0, 0)),
             show_help: false,
             help_page: 0,
@@ -424,6 +435,15 @@ impl App {
             }
             return; // UI-modal state; never session state
         }
+        if let Update::FleetPeek(ref p) = u {
+            // quicklook reply: only meaningful while a fleet surface is
+            // still open — a reply landing after the picker closed is dropped
+            if self.show_fleet {
+                self.fleet_peek = Some(p.clone());
+                self.dirty = true;
+            }
+            return; // UI-modal state; never session state
+        }
         if let Update::Map(ref m) = u {
             // A map rebuild (rev change) may retire the walked seg ids. The
             // simplest honest rule (documented over remapping heuristics):
@@ -571,6 +591,42 @@ impl App {
         }
     }
 
+    /// Quicklook a fleet session (`space` on a tile): ask the engine for the
+    /// conversation tail. Demo: no engine, so synthesize the reply from the
+    /// roster entry so the overlay is fully exercised by the testbench.
+    fn request_fleet_peek(&mut self, sess: String) {
+        if !self.demo {
+            self.send(Control::FleetPeek { session: sess });
+            return;
+        }
+        let Some(s) = self.st.fleet.iter().find(|s| s.id == sess) else {
+            return;
+        };
+        let prompt = s
+            .last_prompt
+            .clone()
+            .unwrap_or_else(|| "…".to_string());
+        self.apply_update(Update::FleetPeek(ipc::FleetPeekMsg {
+            id: s.id.clone(),
+            found: true,
+            name: viz::sess_display_name(s),
+            project: s.project.clone(),
+            msgs: vec![
+                ipc::FleetMsg {
+                    role: "user".into(),
+                    text: prompt,
+                },
+                ipc::FleetMsg {
+                    role: "assistant".into(),
+                    text: "On it — the change is in and the tests pass. \
+                           (demo: a synthesized conversation tail; live \
+                           sessions show the real transcript here.)"
+                        .into(),
+                },
+            ],
+        }));
+    }
+
     /// Exit INSPECT (attach / meta switch / map rebuild). `new_rev` names
     /// the rebuild in the log; None = a plain reset (attach paths).
     fn reset_inspect(&mut self, new_rev: Option<u64>) {
@@ -701,12 +757,105 @@ impl App {
             }
             return;
         }
+        if let Some((sid, name)) = self.fleet_kill.clone() {
+            // end-session confirm modal: y/⏎ kills, anything else cancels
+            match code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.fleet_kill = None;
+                    if self.demo {
+                        self.set_notice(format!("demo — {name} is synthetic"));
+                    } else {
+                        self.send(Control::SessKill { session: sid });
+                        self.send(Control::FleetRefresh);
+                        self.set_notice(format!("⏻ ending {name}"));
+                    }
+                }
+                _ => self.fleet_kill = None,
+            }
+            return;
+        }
+        if self.fleet_peek.is_some() {
+            // quicklook overlay: space/esc close it; ⏎ promotes to attach
+            match code {
+                KeyCode::Esc | KeyCode::Char(' ') => self.fleet_peek = None,
+                KeyCode::Enter => {
+                    if let Some(p) = self.fleet_peek.take() {
+                        self.clear_replay_for_attach();
+                        self.attach_stack.clear(); // picks are roots
+                        self.send(Control::Attach { session: p.id });
+                        self.show_fleet = false;
+                        self.system_wide = false;
+                        self.fleet_query.clear();
+                        self.fleet_sel = 0;
+                    }
+                }
+                KeyCode::Char('q') => self.quit(),
+                _ => {}
+            }
+            return;
+        }
         if self.show_fleet {
+            if self.system_wide {
+                // SYSTEM-WIDE: full screen of active-session tanks; linear
+                // nav (◀/▲ prev, ▶/▼ next), ⏎ attaches, ␣ quicklook,
+                // x end-session, tab back to the list
+                match code {
+                    KeyCode::Esc => {
+                        self.show_fleet = false;
+                        self.system_wide = false;
+                    }
+                    KeyCode::Tab => self.system_wide = false,
+                    KeyCode::Left | KeyCode::Up => {
+                        self.fleet_sel = self.fleet_sel.saturating_sub(1);
+                    }
+                    KeyCode::Right | KeyCode::Down => {
+                        let n = viz::fleet_live_rows(&self.st).len();
+                        self.fleet_sel = (self.fleet_sel + 1).min(n.saturating_sub(1));
+                    }
+                    KeyCode::Char(' ') => {
+                        let target = viz::fleet_live_rows(&self.st)
+                            .get(self.fleet_sel)
+                            .map(|s| s.id.clone());
+                        if let Some(sess) = target {
+                            self.request_fleet_peek(sess);
+                        }
+                    }
+                    KeyCode::Char('x') => {
+                        let target = viz::fleet_live_rows(&self.st)
+                            .get(self.fleet_sel)
+                            .map(|s| (s.id.clone(), viz::sess_display_name(s)));
+                        if let Some((sid, name)) = target {
+                            self.fleet_kill = Some((sid, name));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let target = viz::fleet_live_rows(&self.st)
+                            .get(self.fleet_sel)
+                            .map(|s| s.id.clone());
+                        if let Some(sess) = target {
+                            self.clear_replay_for_attach();
+                            self.attach_stack.clear(); // picks are roots
+                            self.send(Control::Attach { session: sess });
+                            self.show_fleet = false;
+                            self.system_wide = false;
+                            self.fleet_sel = 0;
+                        }
+                    }
+                    KeyCode::Char('q') => self.quit(),
+                    _ => {}
+                }
+                return;
+            }
             // the SESSIONS overlay is a live search box: printable keys type
             // into the query (filtering the roster); ↑/↓ move; ⏎ attaches the
             // selected row — or, when the query is a .jsonl path, that path
-            // directly; Esc clears the query, then closes.
+            // directly; Esc clears the query, then closes. `tab` opens the
+            // SYSTEM-WIDE screen.
             match code {
+                KeyCode::Tab => {
+                    self.system_wide = true;
+                    self.fleet_sel = 0;
+                }
                 KeyCode::Esc => {
                     if self.fleet_query.is_empty() {
                         self.show_fleet = false;
@@ -1222,6 +1371,10 @@ impl App {
                 self.st.ack_alert();
                 self.go_live();
             }
+            KeyCode::Char(' ') => {
+                viz::reroll_palette();
+                self.st.push_log("tank palette rerolled".into());
+            }
             KeyCode::Char('m') => {
                 self.map_mode = self.map_mode.next();
                 self.st
@@ -1443,9 +1596,19 @@ fn render_all(f: &mut Frame<'_>, app: &App) {
         );
     }
 
-    // overlays: fleet < peek < post-mortem < help
+    // overlays: fleet < fleet-peek/kill-confirm < peek < post-mortem < help
     if app.show_fleet {
-        viz::render_fleet(&app.st, app.fleet_sel, &app.fleet_query, f, area);
+        if app.system_wide {
+            viz::render_system_wide(&app.st, app.fleet_sel, f, area);
+        } else {
+            viz::render_fleet(&app.st, app.fleet_sel, &app.fleet_query, f, area);
+        }
+    }
+    if let Some(p) = &app.fleet_peek {
+        viz::render_fleet_peek_overlay(p, f, area);
+    }
+    if let Some((_, name)) = &app.fleet_kill {
+        viz::render_kill_confirm(name, f, area);
     }
     if let Some(p) = &app.peek {
         viz::render_peek_overlay(&app.st, p, f, area);
@@ -2244,6 +2407,52 @@ mod screenshots {
         let live = s.find("brisk-otter").unwrap();
         let off = s.find("notes-site").unwrap();
         assert!(live < off, "live roster must sort first:\n{s}");
+    }
+
+    #[test]
+    fn system_wide_preview_and_kill() {
+        let mut app = demo_app();
+        app.demo = true; // space synthesizes the fleet_peek reply locally
+        app.show_fleet = true;
+        press(&mut app, KeyCode::Tab);
+        assert!(app.system_wide);
+        // space → quicklook PREVIEW of the selected tile (stable
+        // (project,id) order puts ml-pipeline first)
+        press(&mut app, KeyCode::Char(' '));
+        let s = draw(&mut app, 110, 30);
+        assert!(s.contains("PREVIEW"), "preview title missing:\n{s}");
+        assert!(s.contains("ml-pipeline"), "preview name missing:\n{s}");
+        assert!(s.contains("debug the training loop"), "user tail missing:\n{s}");
+        assert!(s.contains("»"), "user marker missing:\n{s}");
+        // space again closes it; the wall stays up
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.fleet_peek.is_none());
+        assert!(app.system_wide && app.show_fleet);
+        // ⏎ from an open preview promotes to attach (closes every surface)
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.fleet_peek.is_none() && !app.show_fleet && !app.system_wide);
+        // x → red confirm modal; a non-y key cancels, nothing is sent
+        app.show_fleet = true;
+        app.system_wide = true;
+        press(&mut app, KeyCode::Char('x'));
+        let s = draw(&mut app, 110, 30);
+        assert!(s.contains("END SESSION"), "confirm title missing:\n{s}");
+        assert!(s.contains("cancels"), "confirm footer missing:\n{s}");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.fleet_kill.is_none());
+        assert!(app.system_wide, "cancel must not close the wall");
+        // a reply landing after the picker closed is dropped
+        app.show_fleet = false;
+        app.system_wide = false;
+        app.apply_update(Update::FleetPeek(ipc::FleetPeekMsg {
+            id: "late".into(),
+            found: true,
+            name: "late".into(),
+            project: String::new(),
+            msgs: vec![],
+        }));
+        assert!(app.fleet_peek.is_none(), "stale fleet_peek must be dropped");
     }
 
     #[test]

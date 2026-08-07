@@ -163,6 +163,7 @@ strings on the wire ("HH:MM:SS") are UTC, including engine-synthesized events.
 | `snapshot` | `turn:int, resident:int, waterline:int, cc:int, map:Map, files:[File], cats:{cat:int}, agents:[Agent], tasks:Tasks` | reply to `seek` (latest-wins); `resident/waterline/cc` are that turn's values so replay renders (cache mode, MAP fill) never fall back to live numbers |
 | `report_done` | `ok:bool, path:str, msg:str` | reply to `report`: the report was written to `path` (the UI flashes it in the footer) |
 | `peek` | `seg:int, found:bool, cat:str, kind:str\|null, uuid:str\|null, born:int, est:int, tok:int, file:int\|null, excerpt:str(≤2000), truncated:bool` | reply to `peek`: the segment's underlying record content, sanitized (control chars stripped) and clipped — the ONE sanctioned exception to the no-content wire rule, bounded and on-demand. `kind` = the record type (user/assistant/attachment/…); the overhead segment answers `kind:"overhead"` with an explainer excerpt (system prompt + tool schemas + skills are server-side and unmeasurable per-item); a segment that no longer exists (evicted/unknown) answers `found:false` |
+| `fleet_peek` | `id:str, found:bool, name:str, project:str, msgs:[{role:"user"\|"assistant", text:str(≤700)}]` | reply to `fleet_peek`: the conversation TAIL of a roster session (attached or not) — the last user/assistant text messages from its transcript's final 256 KB, oldest first. Tool results, meta records and harness wrappers (command echoes, system reminders — filtered per block) are skipped; consecutive same-role records merge. Same bounded content-exception status as `peek`; an unreadable/absent transcript answers `found:false` |
 | `log` | `msg:str` | anything unexpected |
 
 Sub-objects:
@@ -199,6 +200,8 @@ Ordering per attach: `meta` → `map` → `backfill` → `ready` → incremental
 | `live` | — | leave replay; engine stops answering stale seeks |
 | `report` | — | write a ground-truth report (§f) of the ATTACHED session — the live engine already has it parsed, so it is instant — to `~/.claude/amtr-reports/<name>-<id8>.md`; replies `report_done`. Bound to `R` in the TUI (one-key, seamless) |
 | `set` | `key:str, value` | `chars_per_tok:float` (the global prior/fallback), `fit:0\|1` (per-category ratio fit on/off), `poll_ms:int`, `t_auto:float`; unknown keys silently ignored |
+| `fleet_peek` | `session:str` | quicklook a roster session (SESSIONS/SYSTEM-WIDE `space`): the engine reads the session's transcript tail and replies with one `fleet_peek`. Explicit-request-only, like `peek` |
+| `sess_kill` | `session:str` | end a fleet session: SIGTERM its roster pid (the polite signal — Claude Code shuts down cleanly; never -9). Roster-verified: a dead/absent pid answers with a `log` line instead. Confirmed UI-side before sending |
 | `fleet_refresh` | — | force roster rescan |
 | `quit` | — | cooperative shutdown; stdin EOF is the equivalent fallback |
 
@@ -581,6 +584,19 @@ degradation mirrors the console (Medium drops ts, Compact drops header).
 Table: live roster first (●busy ◐stalled ○idle), then recent by mtime (✖dead /
 offline). Columns: status glyph, name, project tail, resident 8-cell mini-bar
 (0–B when known), age, last prompt (truncated). `Enter` attaches. `r` refresh.
+
+`Tab` opens **SYSTEM-WIDE**: a full SCREEN (not a popup) of every ACTIVE
+session as a bordered gradient-tank tile (the big-number gauge in miniature,
+per-session deterministic palette), all draining live, in a stable
+(project, id) order. `←↑↓→` move, `⏎` attaches, `Tab` returns to the list,
+`Esc` closes. Two quick actions on the selected tile:
+
+- `space` — **quicklook PREVIEW** (which chat IS this?): sends `fleet_peek`;
+  the reply renders as a centered overlay of the session's conversation tail
+  (`»` user gold / `●` assistant green, newest at the bottom, clipped from
+  the top). `space`/`Esc` close it; `⏎` promotes straight to attach.
+- `x` — **end session**: a red confirm modal (`y`/`⏎` confirms, any other
+  key cancels) before `sess_kill` SIGTERMs the session's process.
 
 ### Help (`?`) — three pages, each fits 80×24
 

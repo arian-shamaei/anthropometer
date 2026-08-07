@@ -1,0 +1,14 @@
+{
+  "launch": "./rust/target/release/amtr --demo",
+  "cwd": "..",
+  "size": [24, 14],
+  "settle_ms": 1600,
+  "relaunch_per_scene": true,
+  "scenes": [
+    {
+      "name": "bignum-tall",
+      "keys": [],
+      "expect_contains": ["%", "brisk-otter"]
+    }
+  ]
+}

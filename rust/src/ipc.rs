@@ -597,6 +597,33 @@ pub struct PeekMsg {
     pub truncated: bool,
 }
 
+/// One conversation line inside a [`FleetPeekMsg`] preview.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FleetMsg {
+    /// "user" | "assistant"
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// Reply to `fleet_peek` (SESSIONS/SYSTEM-WIDE `space` quicklook): the tail
+/// of a session's conversation, read from its transcript on demand. Same
+/// bounded-exception status as `peek`; an absent `found` defaults FALSE —
+/// a missing answer must never render as a conversation that exists.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FleetPeekMsg {
+    pub id: String,
+    #[serde(default)]
+    pub found: bool,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub msgs: Vec<FleetMsg>,
+}
+
 // ---------------------------------------------------------------------------
 // wire messages
 // ---------------------------------------------------------------------------
@@ -655,6 +682,7 @@ pub enum Update {
     },
     Snapshot(Snapshot),
     Peek(PeekMsg),
+    FleetPeek(FleetPeekMsg),
     /// reply to `report`: the ground-truth report was written to `path`
     ReportDone {
         #[serde(default)]
@@ -678,6 +706,11 @@ pub enum Control {
     /// INSPECT-mode content request. Explicit-request-only (sent on Enter,
     /// never per-cursor-move), so no coalescing is needed (SPEC §c).
     Peek { seg: u64 },
+    /// SESSIONS/SYSTEM-WIDE quicklook: the tail of `session`'s conversation.
+    /// Explicit-request-only (sent on `space`), like `Peek`.
+    FleetPeek { session: String },
+    /// End a fleet session: the engine SIGTERMs its pid (live sessions only).
+    SessKill { session: String },
     Live,
     /// write a ground-truth report of the attached session (SPEC §f) — the
     /// engine already has it parsed, so this is instant
@@ -1096,6 +1129,7 @@ for line in sys.stdin:
                         Update::Fleet { .. } => "fleet",
                         Update::Snapshot(_) => "snapshot",
                         Update::Peek(_) => "peek",
+                        Update::FleetPeek(_) => "fleet_peek",
                         Update::ReportDone { .. } => "report_done",
                         Update::Log { .. } => "log",
                     });

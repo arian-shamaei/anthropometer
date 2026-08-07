@@ -15,11 +15,11 @@ os.dup2(2, 1)
 sys.stdout = sys.stderr
 _PROTO = os.fdopen(_PROTO_FD, "w", buffering=1, encoding="utf-8")
 
-import json, time, math, copy, glob, re, argparse, threading, zlib, subprocess
+import json, time, math, copy, glob, re, argparse, threading, zlib, subprocess, signal
 from collections import deque
 from datetime import datetime, timezone
 
-ENGINE_VERSION = "0.1.5"
+ENGINE_VERSION = "0.1.6"
 _PROTO_LOCK = threading.Lock()
 _STANDALONE = False   # --validate/--report: fd 1 is the report, log() -> stderr
 
@@ -1955,6 +1955,60 @@ def history_last_prompts(span=65536):
                 out[d["sessionId"]] = disp[:120]
     return out
 
+_PREVIEW_SKIP = ("<command-", "<local-command", "<system-reminder", "<task-notification")
+
+def transcript_tail_msgs(path, max_msgs=12, span=262144):
+    """The conversation tail of a transcript, for the fleet quicklook
+    (`fleet_peek`): the last user/assistant TEXT messages, oldest first,
+    [{"role","text"}]. Tool results, meta records and harness wrappers
+    (command echoes, system reminders) are skipped; consecutive same-role
+    records (streamed assistant chunks) merge into one message. None on an
+    unreadable file."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - span))
+            data = fh.read(span + 1)
+    except OSError:
+        return None
+    lines = data.split(b"\n")
+    if size > span and lines:
+        lines = lines[1:]                      # drop the partial first line
+    out = []
+    for line in lines:
+        if b'"type"' not in line:
+            continue
+        try:
+            d = json.loads(line.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("isMeta"):
+            continue
+        role = d.get("type")
+        if role not in ("user", "assistant"):
+            continue
+        m = d.get("message")
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        blocks = [c] if isinstance(c, str) else [
+            b.get("text", "") for b in c
+            if isinstance(b, dict) and b.get("type") == "text"
+        ] if isinstance(c, list) else []
+        # harness wrappers (command echoes, system reminders) are filtered
+        # per BLOCK — a real prompt often shares its record with a reminder
+        parts = [t for t in (clean_text(b).strip() for b in blocks)
+                 if t and not (role == "user" and t.startswith(_PREVIEW_SKIP))]
+        txt = "\n".join(parts).strip()
+        if not txt:
+            continue                           # tool-result / tool-use / wrapper only
+        if out and out[-1]["role"] == role:
+            out[-1]["text"] = (out[-1]["text"] + "\n" + txt)[:700]
+        else:
+            out.append({"role": role, "text": txt[:700]})
+    return out[-max_msgs:]
+
+
 def scan_roster():
     """~/.claude/sessions/<pid>.json entries, pid-verified."""
     entries = []
@@ -2494,6 +2548,51 @@ class Engine:
         self._resident_cache[path] = (mtime, r)
         return r
 
+    def fleet_peek_payload(self, sid):
+        """Fleet quicklook (`fleet_peek`): the conversation tail of ANY
+        roster session, attached or not — same bounded content exception
+        as `peek`."""
+        base = {"id": sid, "found": False, "name": memorable_name(sid),
+                "project": "", "msgs": []}
+        entry = None
+        if isinstance(self._last_fleet, list):
+            for e in self._last_fleet:
+                if e.get("id") == sid:
+                    entry = e
+                    break
+        if entry:
+            base["name"] = entry.get("name") or base["name"]
+            base["project"] = entry.get("project") or ""
+        tp = (entry or {}).get("path") or find_transcript(sid)
+        if not tp or not os.path.isfile(tp):
+            return base
+        msgs = transcript_tail_msgs(tp)
+        if msgs is None:
+            return base
+        base.update({"found": True, "msgs": msgs})
+        return base
+
+    def kill_session(self, sid):
+        """`sess_kill`: SIGTERM the session's pid (roster-verified). The
+        polite signal — Claude Code shuts down cleanly on it; never -9."""
+        entry = None
+        for e in self._roster_cache:
+            if e.get("sessionId") == sid:
+                entry = e
+                break
+        name = (entry or {}).get("name") or memorable_name(sid)
+        pid = (entry or {}).get("pid")
+        if not pid_alive(pid):
+            send({"type": "log", "msg": "end %s: no live process" % name})
+            return
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            send({"type": "log",
+                  "msg": "end %s: SIGTERM sent (pid %s)" % (name, pid)})
+        except OSError as e:
+            send({"type": "log", "msg": "end %s failed: %s" % (name, e)})
+        self._fleet_force.set()
+
     def _fleet_tick(self):
         sessions = self._sess_entries()
         if sessions != self._last_fleet:
@@ -2690,6 +2789,15 @@ class Engine:
                 # unknown keys silently ignored (forward compatibility)
             except (TypeError, ValueError):
                 log("set %s: bad value %r" % (key, val))
+        elif t == "fleet_peek":
+            sid = ctrl.get("session")
+            if isinstance(sid, str) and sid:
+                send(dict({"type": "fleet_peek"},
+                          **self.fleet_peek_payload(sid)))
+        elif t == "sess_kill":
+            sid = ctrl.get("session")
+            if isinstance(sid, str) and sid:
+                self.kill_session(sid)
         elif t == "fleet_refresh":
             self._fleet_force.set()
         elif t == "quit":

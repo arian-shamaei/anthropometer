@@ -663,10 +663,10 @@ impl State {
             Update::Event(e) => self.apply_event(e),
             Update::Fleet { sessions } => self.fleet = sessions,
             Update::Snapshot(s) => self.replay = Some(s),
-            // Peek is UI-modal state (the App stores/drops it against the
-            // INSPECT selection before State ever sees it) — never session
-            // state; the arm exists only for match exhaustiveness.
-            Update::Peek(_) | Update::ReportDone { .. } => {}
+            // Peek/FleetPeek are UI-modal state (the App stores/drops them
+            // before State ever sees them) — never session state; the arms
+            // exist only for match exhaustiveness.
+            Update::Peek(_) | Update::FleetPeek(_) | Update::ReportDone { .. } => {}
             Update::Log { msg } => self.push_log(msg),
         }
         true

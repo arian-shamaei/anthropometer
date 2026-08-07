@@ -16,8 +16,8 @@ use ratatui::widgets::canvas::{Canvas, Line as CanvasLine, Points};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::ipc::{
-    AgentRec, Cat, CAT_ORDER, CmdRec, FileRec, MapMsg, Op, PeekMsg, RetKind, RetRec, Seg, Severity,
-    Tasks,
+    AgentRec, Cat, CAT_ORDER, CmdRec, FileRec, FleetPeekMsg, MapMsg, Op, PeekMsg, RetKind, RetRec,
+    Seg, Severity, Tasks,
 };
 use crate::state::{fmt_age, fmt_dur, fmt_k0, fmt_k1, State, FILE_HUES};
 
@@ -83,51 +83,147 @@ pub fn heat_k(age_s: f64) -> f64 {
     0.30 + 0.70 * (-age_s.max(0.0) / 45.0).exp()
 }
 
-/// Big-number tank palettes: art-historical color sets, each a 4-stop
-/// gradient ordered dark → vivid (the drain law: deep at the far end,
-/// luminous at the surface). Curated, not computed — each is the palette
-/// of a movement/painter, in rough chronological order.
-pub const ART_PALETTES: [[(u8, u8, u8); 4]; 11] = [
-    // renaissance: sienna underpainting → vermilion → gilded highlight
-    [(30, 22, 18), (98, 52, 30), (172, 72, 40), (218, 170, 74)],
-    // ukiyo-e: prussian-blue wave → foam
-    [(16, 32, 56), (34, 76, 120), (86, 142, 160), (238, 226, 198)],
-    // turner: storm smoke → sun through haze
-    [(36, 34, 44), (110, 86, 70), (198, 140, 80), (248, 214, 140)],
-    // monet: water-lily pond at dusk → lily pads
-    [(24, 42, 74), (70, 110, 140), (130, 170, 160), (204, 216, 170)],
-    // van gogh: indigo sky → cypress swirl → star
-    [(16, 24, 70), (34, 72, 138), (92, 160, 190), (240, 196, 60)],
-    // mucha: olive shadow → brass → blush (poster girl halo)
-    [(52, 44, 28), (110, 104, 50), (188, 150, 80), (228, 172, 130)],
-    // matisse: plum → magenta → flame → chrome yellow
-    [(60, 16, 60), (170, 40, 90), (235, 90, 40), (250, 180, 50)],
-    // art deco: lacquer black → emerald → brushed gold
-    [(18, 22, 28), (16, 84, 78), (60, 140, 120), (214, 168, 80)],
-    // bauhaus: primaries with the red doing the work
-    [(30, 40, 90), (190, 50, 40), (230, 120, 40), (240, 190, 50)],
-    // rothko: maroon → cadmium orange color fields
-    [(44, 10, 24), (120, 24, 32), (198, 60, 36), (240, 130, 50)],
-    // vaporwave: midnight → neon violet → hot pink → cyan sun
-    [(24, 16, 64), (110, 40, 140), (220, 80, 170), (90, 225, 230)],
-];
+/// Big-number tank palettes: GENERATED, not stored — same design philosophy
+/// as the retired hand-curated art-movement set (4-stop gradient, dark →
+/// vivid: the drain law, deep at the far end, luminous at the surface), but
+/// algorithmic. Built in OkLCH so every ramp is perceptually even:
+///   L (lightness)  ~0.24 → ~0.84  shadow floor → luminous surface
+///   C (chroma)     V·C_max(L,h)   spent as a fraction of the sRGB gamut
+///     ceiling (V: ~0.65 → ~0.92) so every hue rides near its own wall —
+///     absolute-chroma targets read dusty at wide-gamut hues (magenta)
+///   h (hue)        h₀ + Δh·t      one signed sweep, three schemes:
+///     40% gilt — the surface pulls toward ≈95° (OkLCH gold): yellow is
+///       where sRGB has the most brightness headroom, which is why
+///       hand-curated art palettes so often end in gilt;
+///     30% free swing — Δh uniform in ±180° (the vaporwave outlier);
+///     30% long arc — Δh = ±(150°..260°), deliberately the FAR way around
+///       the wheel, so the mid stops cross hue families a shortest-arc
+///       sweep can never reach (teal → violet → ember).
+/// Out-of-gamut stops desaturate toward pastel (the foam / lily-pad endings).
+pub fn gen_palette(seed: u64) -> [(u8, u8, u8); 4] {
+    // splitmix64 stream: unlike raw xorshift, fully diffuses even small or
+    // structured seeds (first draw is the hue — it must be uniform)
+    let mut x = seed;
+    let mut unit = move || -> f64 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let h0 = unit() * 360.0;
+    let scheme = unit();
+    let dh = if scheme < 0.40 {
+        // gilt: signed shortest arc toward gold, strong but not total pull
+        let gold = 95.0 + (unit() - 0.5) * 30.0; // 80°..110°
+        signed_arc(h0, gold) * (0.55 + unit() * 0.45)
+    } else if scheme < 0.70 {
+        (unit() - 0.5) * 360.0 // free swing, ±180°
+    } else {
+        // long arc: the far way around the wheel — mid stops visit hue
+        // families no shortest-arc sweep can touch
+        let dir = if unit() < 0.5 { 1.0 } else { -1.0 };
+        dir * (150.0 + unit() * 110.0) // ±(150°..260°)
+    };
+    let l0 = 0.20 + unit() * 0.08;
+    let l3 = 0.80 + unit() * 0.08;
+    // chroma is spent as a FRACTION of the sRGB gamut ceiling at each
+    // stop's (L, h) — absolute chroma targets read dusty where the gamut
+    // is wide (magenta) and clip where it is narrow (low-L yellow);
+    // riding the wall at a fixed fraction is what reads as vivid at
+    // every hue
+    let v0 = 0.55 + unit() * 0.20; // depth: 55–75% of the wall
+    let v3 = 0.85 + unit() * 0.13; // surface: 85–98%
+    std::array::from_fn(|i| {
+        let t = i as f64 / 3.0;
+        let l = l0 + (l3 - l0) * t;
+        let h = h0 + dh * t;
+        // chroma arrives ahead of lightness (t^0.75): the mid stops carry
+        // the color, the way the curated sets did
+        let v = v0 + (v3 - v0) * t.powf(0.75);
+        oklch_to_srgb(l, v * gamut_cmax(l, h), h)
+    })
+}
 
-/// One palette rolled per process (the only randomness in the renderer —
-/// fixed after first call, so frames stay deterministic).
-pub fn art_palette() -> &'static [(u8, u8, u8); 4] {
-    static PICK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let i = *PICK.get_or_init(|| {
-        let mut x = std::time::SystemTime::now()
+/// Max in-gamut chroma at (L, h): binary search against the sRGB walls.
+fn gamut_cmax(l: f64, h_deg: f64) -> f64 {
+    let h = h_deg.to_radians();
+    let (mut lo, mut hi) = (0.0_f64, 0.5_f64);
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        if oklab_to_srgb(l, mid * h.cos(), mid * h.sin()).is_some() {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Signed shortest-arc delta a → b (degrees, in ±180°).
+fn signed_arc(a: f64, b: f64) -> f64 {
+    ((b - a).rem_euclid(360.0) + 540.0).rem_euclid(360.0) - 180.0
+}
+
+/// OkLCH → sRGB. Gamut mapping = chroma decay: shave saturation, keep the
+/// lightness ramp intact (the drain law lives in L, not C).
+fn oklch_to_srgb(l: f64, c: f64, h_deg: f64) -> (u8, u8, u8) {
+    let h = h_deg.to_radians();
+    let mut c = c;
+    for _ in 0..32 {
+        if let Some(rgb) = oklab_to_srgb(l, c * h.cos(), c * h.sin()) {
+            return rgb;
+        }
+        c *= 0.90;
+    }
+    oklab_to_srgb(l.clamp(0.0, 1.0), 0.0, 0.0).unwrap_or((0, 0, 0))
+}
+
+/// Oklab → sRGB (Björn Ottosson's reference matrices); None if out of gamut.
+fn oklab_to_srgb(l: f64, a: f64, b: f64) -> Option<(u8, u8, u8)> {
+    let l_ = l + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
+    let m_ = l - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
+    let s_ = l - 0.089_484_177_5 * a - 1.291_485_548_0 * b;
+    let (l3, m3, s3) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+    let r = 4.076_741_662_1 * l3 - 3.307_711_591_3 * m3 + 0.230_969_929_2 * s3;
+    let g = -1.268_438_004_6 * l3 + 2.609_757_401_1 * m3 - 0.341_319_396_5 * s3;
+    let b = -0.004_196_086_3 * l3 - 0.703_418_614_7 * m3 + 1.707_614_701_0 * s3;
+    let enc = |v: f64| -> Option<u8> {
+        if !(-0.001..=1.001).contains(&v) {
+            return None;
+        }
+        let v = v.clamp(0.0, 1.0);
+        let s = if v <= 0.003_130_8 {
+            12.92 * v
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        Some((s * 255.0).round() as u8)
+    };
+    Some((enc(r)?, enc(g)?, enc(b)?))
+}
+
+/// Reroll counter for the big-view tank palette (space steps it forward).
+static PAL_ROLL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Advance to the next generated tank palette.
+pub fn reroll_palette() {
+    PAL_ROLL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current tank palette: one time-based seed rolled per process (the
+/// only randomness in the renderer — deterministic between rerolls), offset
+/// by the reroll counter so space steps to a fresh palette.
+pub fn art_palette() -> [(u8, u8, u8); 4] {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E37_79B9_7F4A_7C15)
-            | 1;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        (x % ART_PALETTES.len() as u64) as usize
     });
-    &ART_PALETTES[i]
+    gen_palette(base.wrapping_add(PAL_ROLL.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
 /// Sample a 4-stop palette at t ∈ 0..=1 (piecewise-linear).
@@ -3994,7 +4090,7 @@ pub fn render_fleet(st: &State, sel: usize, query: &str, f: &mut Frame<'_>, area
         String::new()
     };
     lines.push(Line::styled(
-        format!(" ⏎ attach · ↑↓ move · type to filter · esc close{pos}"),
+        format!(" ⏎ attach · ↑↓ move · type to filter · tab system-wide · esc close{pos}"),
         fg(C_DIM),
     ));
 
@@ -4023,6 +4119,297 @@ pub fn fleet_rows(st: &State) -> Vec<&crate::ipc::Sess> {
     rest.sort_by(|a, b| b.mtime.partial_cmp(&a.mtime).unwrap_or(std::cmp::Ordering::Equal));
     live.extend(rest);
     live
+}
+
+/// Live sessions only, in a STABLE order (project, then id) — wall tiles
+/// must not jump around as mtimes tick.
+pub fn fleet_live_rows(st: &State) -> Vec<&crate::ipc::Sess> {
+    let mut v: Vec<&crate::ipc::Sess> = st.fleet.iter().filter(|s| s.live).collect();
+    v.sort_by(|a, b| a.project.cmp(&b.project).then(a.id.cmp(&b.id)));
+    v
+}
+
+/// A session's palette seed: FNV-1a over its id. Same algorithmic family as
+/// the per-process roll, but DETERMINISTIC per session — a session keeps its
+/// colors across launches, so the wall reads as identity, not confetti.
+fn sess_seed(id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in id.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// SYSTEM-WIDE (`tab` in the SESSIONS picker): a full SCREEN, not a popup —
+/// every ACTIVE session as a gradient-tank tile (the big-number gauge in
+/// miniature), all draining live. Tiles scale up to fill the terminal.
+/// ⏎ attaches the selected tile.
+pub fn render_system_wide(st: &State, sel: usize, f: &mut Frame<'_>, area: Rect) {
+    if area.width < 30 || area.height < 10 {
+        return;
+    }
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(rgb(scale(C_FREE, 0.3)))), area);
+
+    let rows = fleet_live_rows(st);
+    let n = rows.len();
+    let sel = if n == 0 { 0 } else { sel.min(n - 1) };
+
+    // header + footer chrome, grid in between
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" SYSTEM-WIDE ".to_string(), fg(C_WHITE).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("— {n} active session{}", if n == 1 { "" } else { "s" }),
+                fg(C_DIM),
+            ),
+        ])),
+        Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+    );
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            " ⏎ attach · ␣ preview · x end · ←↑↓→ move · tab sessions list · esc back".to_string(),
+            fg(C_DIM),
+        )),
+        Rect {
+            x: area.x,
+            y: area.y + area.height - 1,
+            width: area.width,
+            height: 1,
+        },
+    );
+    let grid = Rect {
+        x: area.x + 1,
+        y: area.y + 2,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(4),
+    };
+    if n == 0 {
+        f.render_widget(
+            Paragraph::new(Line::styled(" no active sessions", fg(C_DIM))),
+            Rect { x: grid.x, y: grid.y, width: grid.width, height: 1 },
+        );
+        return;
+    }
+
+    // tiles scale to fill: as many 26-wide columns as fit (capped at n),
+    // then split the grid evenly; height splits across the needed rows
+    let cols = ((grid.width / 26).max(1) as usize).min(n);
+    let grid_rows = n.div_ceil(cols);
+    let tw = grid.width / cols as u16;
+    let th = (grid.height / grid_rows as u16).clamp(5, 12);
+    let vis_rows = ((grid.height / th).max(1) as usize).min(grid_rows);
+    // scroll whole tile-rows so the selection stays visible
+    let row_off = (sel / cols).saturating_sub(vis_rows.saturating_sub(1));
+    let visible = vis_rows * cols;
+
+    for (gi, s) in rows.iter().enumerate().skip(row_off * cols).take(visible) {
+        let vi = gi - row_off * cols;
+        let tile = Rect {
+            x: grid.x + (vi % cols) as u16 * tw,
+            y: grid.y + (vi / cols) as u16 * th,
+            width: tw,
+            height: th,
+        };
+        draw_sess_tile(s, gi == sel, f, tile);
+    }
+    if n > visible {
+        let shown_from = row_off * cols;
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                format!("   {}\u{2013}{} of {n}", shown_from + 1, (shown_from + visible).min(n)),
+                fg(C_DIM),
+            )),
+            Rect {
+                x: area.x,
+                y: area.y + area.height - 2,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+/// One wall tile: bordered mini gradient tank (context left, per-session
+/// palette) with the R% readout on top and status · project at the foot.
+fn draw_sess_tile(s: &crate::ipc::Sess, selected: bool, f: &mut Frame<'_>, tile: Rect) {
+    let pal = gen_palette(sess_seed(&s.id));
+    let ratio = match (s.resident, s.budget) {
+        (Some(r), Some(b)) if b > 0 => Some((r as f64 / b as f64).clamp(0.0, 1.0)),
+        _ => None,
+    };
+    let name = sess_display_name(s);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if selected {
+            BorderType::Thick
+        } else {
+            BorderType::Plain
+        })
+        .border_style(if selected { fg(pal[3]) } else { fg(C_GRID) })
+        .title(Span::styled(
+            format!(" {} ", tail_trunc(&name, (tile.width as usize).saturating_sub(6))),
+            if selected {
+                fg(pal[3]).add_modifier(Modifier::BOLD)
+            } else {
+                fg(C_FG)
+            },
+        ));
+    let inner = block.inner(tile);
+    f.render_widget(block, tile);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if let Some(r) = ratio {
+        render_tank(f, inner, 1.0 - r, &pal);
+    }
+    // readouts draw fg-only, so the tank's background shows through
+    let pct = ratio.map(|r| format!("{:.0}%", r * 100.0)).unwrap_or("—".into());
+    let zone = ratio.map(zone_color).unwrap_or(C_DIM);
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            format!(" {pct}"),
+            fg(lerp(zone, C_WHITE, 0.20)).add_modifier(Modifier::BOLD),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+    let (glyph, gcol) = fleet_glyph(s);
+    let foot = Line::from(vec![
+        Span::styled(format!(" {glyph}"), fg(gcol)),
+        Span::styled(
+            format!(
+                "{} · {}",
+                s.status,
+                tail_trunc(&s.project, (inner.width as usize).saturating_sub(8))
+            ),
+            fg(C_FG),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(foot),
+        Rect {
+            x: inner.x,
+            y: inner.y + inner.height - 1,
+            width: inner.width,
+            height: 1,
+        },
+    );
+}
+
+/// A session's display handle: roster name, else the id's first 12 chars.
+pub fn sess_display_name(s: &crate::ipc::Sess) -> String {
+    s.name
+        .clone()
+        .unwrap_or_else(|| s.id.chars().take(12).collect())
+}
+
+/// Quicklook PREVIEW overlay (SESSIONS/SYSTEM-WIDE `space`): the tail of the
+/// session's conversation, served on demand by the engine. Newest exchange
+/// wins the space — the body clips from the TOP, marked with a dim `…`.
+pub fn render_fleet_peek_overlay(p: &FleetPeekMsg, f: &mut Frame<'_>, area: Rect) {
+    if area.width < 12 || area.height < 6 {
+        return;
+    }
+    let w = area.width.saturating_sub(4).clamp(30, 84);
+    let text_w = (w as usize).saturating_sub(5).max(1); // borders + marker gutter
+    let mut body: Vec<Line<'static>> = Vec::new();
+    if !p.found {
+        body.push(Line::styled(
+            " no transcript found for this session".to_string(),
+            fg(C_DIM),
+        ));
+    } else if p.msgs.is_empty() {
+        body.push(Line::styled(" (no conversation yet)".to_string(), fg(C_DIM)));
+    } else {
+        for m in &p.msgs {
+            let (glyph, gcol) = match m.role.as_str() {
+                "user" => ("»", C_USER),
+                _ => ("●", C_ASSIST),
+            };
+            let mut first = true;
+            for raw in m.text.split('\n') {
+                for chunk in wrap_line(raw, text_w) {
+                    if first {
+                        body.push(Line::from(vec![
+                            Span::styled(
+                                format!(" {glyph} "),
+                                fg(gcol).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(chunk, fg(C_FG)),
+                        ]));
+                        first = false;
+                    } else {
+                        body.push(Line::from(vec![
+                            Span::raw("   ".to_string()),
+                            Span::styled(chunk, fg(C_FG)),
+                        ]));
+                    }
+                }
+            }
+            if first {
+                // empty message text still shows the speaker changed hands
+                body.push(Line::styled(format!(" {glyph} …"), fg(C_DIM)));
+            }
+            body.push(Line::from(""));
+        }
+        body.pop(); // trailing spacer
+    }
+    // header (project) + footer + borders around the clipped body
+    let hmax = area.height.saturating_sub(2).min(30);
+    let max_body = (hmax as usize).saturating_sub(4).max(3);
+    if body.len() > max_body {
+        let cut = body.len() - (max_body - 1);
+        body.drain(..cut);
+        body.insert(0, Line::styled(" …".to_string(), fg(C_DIM)));
+    }
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::styled(
+            format!(" {}", tail_trunc(&p.project, (w as usize).saturating_sub(4))),
+            fg(C_DIM),
+        ),
+        Line::from(""),
+    ];
+    lines.extend(body);
+    lines.push(Line::styled(" ␣/esc close · ⏎ attach".to_string(), fg(C_DIM)));
+
+    let rect = centered(area, w, (lines.len() as u16 + 2).min(area.height));
+    f.render_widget(Clear, rect);
+    let block = overlay_block(format!(" PREVIEW — {} ", p.name));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// End-session confirm modal (SYSTEM-WIDE `x`): nothing is signalled until
+/// `y`/⏎ — every other key cancels.
+pub fn render_kill_confirm(name: &str, f: &mut Frame<'_>, area: Rect) {
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+    let body = format!(" end session {name}? (SIGTERM its process)");
+    let w = (body.chars().count() as u16 + 3).clamp(30, area.width.saturating_sub(2));
+    let lines = vec![
+        Line::styled(body, fg(C_FG)),
+        Line::from(""),
+        Line::styled(" y/⏎ end it · any other key cancels".to_string(), fg(C_DIM)),
+    ];
+    let rect = centered(area, w, 5);
+    f.render_widget(Clear, rect);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(fg(C_RED))
+        .title(" END SESSION ")
+        .title_style(fg(C_RED).add_modifier(Modifier::BOLD));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn fleet_glyph(s: &crate::ipc::Sess) -> (&'static str, (u8, u8, u8)) {
@@ -4109,10 +4496,10 @@ pub fn render_help(page: usize, f: &mut Frame<'_>, area: Rect) {
         _ => {
             let mut lines: Vec<Line<'static>> = vec![
         key("1–6", "tabs: OVERVIEW FILES TURNS AGENTS EVENTS SHELL"),
-        key("f / 0", "fleet picker · ? this help · q quit · p pause render"),
+        key("f / 0", "fleet · tab wall (␣ preview · x end) · ? help · q quit · p pause"),
         key("x", "amtr3d — stream this session to the Vision Pro memspace"),
         key("←/→  ⇧←/→", "turn cursor ±1 / ±10 · home first · end/esc LIVE"),
-        key("m  +/-", "MAP color mode · MAP cell-size rung override"),
+        key("m +/- space", "MAP color mode · cell-size rung · reroll tank palette"),
         key("c", "latest compaction post-mortem"),
         key("R", "write a ground-truth report (→ ~/.claude/amtr-reports/)"),
         key("j/k g/G", "select/scroll · ends (SHELL: G restores follow)"),
@@ -4583,9 +4970,48 @@ pub fn render_big(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
 
     // gradient tank: cells covered = context left, palette sweeps its
     // stops dark → vivid toward the surface edge
-    let pal = art_palette();
+    render_tank(f, area, (1.0 - ratio).clamp(0.0, 1.0), &art_palette());
+    // simple readout: percentage + session handle in the top-left corner,
+    // nothing else
+    let _ = ui;
+    let name = st
+        .meta
+        .as_ref()
+        .map(|m| {
+            if m.name.is_empty() {
+                m.session_id.chars().take(8).collect()
+            } else {
+                m.name.clone()
+            }
+        })
+        .unwrap_or_else(|| "—".to_string());
+    let spans = vec![
+        Span::styled(
+            format!(" {pct}%"),
+            fg(lerp(zone, C_WHITE, 0.20)).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {name} "), fg(C_FG)),
+    ];
+    let line = Line::from(spans);
+    let rect = Rect {
+        x: area.x,
+        y: area.y,
+        width: (line.width() as u16).min(area.width),
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(line), rect);
+}
+
+/// The gradient tank itself: paint `left` (context-left fraction) of `area`
+/// with `pal` swept dark → vivid toward the surface edge. Tall areas fill
+/// bottom-up; flat areas (w > 2h) fill left-to-right; fractional surface =
+/// eighth-blocks. Shared by big-number mode and the SESSIONS live wall.
+pub fn render_tank(f: &mut Frame<'_>, area: Rect, left: f64, pal: &[(u8, u8, u8); 4]) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let grad = |t: f64| palette_color(pal, t);
-    let left = (1.0 - ratio).clamp(0.0, 1.0);
+    let left = left.clamp(0.0, 1.0);
     let horiz = area.width > 2 * area.height;
     let span = if horiz { area.width } else { area.height };
     let cells = span as f64 * left;
@@ -4644,34 +5070,4 @@ pub fn render_big(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
             f.render_widget(Paragraph::new(Line::styled(surface, edge)), row);
         }
     }
-
-    // simple readout: percentage + session handle in the top-left corner,
-    // nothing else
-    let _ = ui;
-    let name = st
-        .meta
-        .as_ref()
-        .map(|m| {
-            if m.name.is_empty() {
-                m.session_id.chars().take(8).collect()
-            } else {
-                m.name.clone()
-            }
-        })
-        .unwrap_or_else(|| "—".to_string());
-    let spans = vec![
-        Span::styled(
-            format!(" {pct}%"),
-            fg(lerp(zone, C_WHITE, 0.20)).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!(" · {name} "), fg(C_FG)),
-    ];
-    let line = Line::from(spans);
-    let rect = Rect {
-        x: area.x,
-        y: area.y,
-        width: (line.width() as u16).min(area.width),
-        height: 1,
-    };
-    f.render_widget(Paragraph::new(line), rect);
 }

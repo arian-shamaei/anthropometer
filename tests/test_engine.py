@@ -1316,5 +1316,64 @@ class TestCategoryFit(unittest.TestCase):
         self.assertEqual(sum(x["tok"] for x in m["segs"]), s.resident())
 
 
+class TestFleetPeek(unittest.TestCase):
+    """transcript_tail_msgs — the fleet quicklook's conversation-tail read."""
+
+    def _write(self, records):
+        import tempfile
+        fh = tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False, encoding="utf-8")
+        for r in records:
+            fh.write(json.dumps(r) + "\n")
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        return fh.name
+
+    @staticmethod
+    def _u(text):
+        return {"type": "user", "message": {"role": "user", "content": text}}
+
+    @staticmethod
+    def _a(text):
+        return {"type": "assistant", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}]}}
+
+    def test_tail_roles_and_order(self):
+        p = self._write([self._u("fix the bug"), self._a("done — tests pass")])
+        msgs = ce.transcript_tail_msgs(p)
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant"])
+        self.assertEqual(msgs[0]["text"], "fix the bug")
+
+    def test_wrappers_and_tool_records_skipped(self):
+        p = self._write([
+            {"type": "user", "isMeta": True,
+             "message": {"role": "user", "content": "caveat"}},
+            self._u("<command-name>/help</command-name>"),
+            # a real prompt sharing its record with a system-reminder block
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "text", "text": "<system-reminder>noise</system-reminder>"},
+                {"type": "text", "text": "the actual prompt"}]}},
+            # tool-use-only assistant record: no text blocks
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Bash", "input": {}}]}},
+            self._a("reply"),
+        ])
+        msgs = ce.transcript_tail_msgs(p)
+        self.assertEqual([m["text"] for m in msgs], ["the actual prompt", "reply"])
+
+    def test_consecutive_same_role_merge(self):
+        p = self._write([self._u("go"), self._a("part one"), self._a("part two")])
+        msgs = ce.transcript_tail_msgs(p)
+        self.assertEqual(len(msgs), 2)
+        self.assertEqual(msgs[1]["text"], "part one\npart two")
+
+    def test_unreadable_is_none_and_cap(self):
+        self.assertIsNone(ce.transcript_tail_msgs("/nonexistent/x.jsonl"))
+        p = self._write([self._u("m%d" % i) if i % 2 else self._a("r%d" % i)
+                         for i in range(40)])
+        self.assertEqual(len(ce.transcript_tail_msgs(p, max_msgs=12)), 12)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
