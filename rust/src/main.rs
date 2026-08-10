@@ -23,7 +23,7 @@ use ipc::{Control, Update};
 use state::State;
 use viz::{AgentFilter, AgentSort, FileSort, FilesView, MapMode, ShellFilter, ShellView, Tier, Ui};
 
-const BG: Color = Color::Rgb(10, 11, 14);
+const BG: Color = Color::Rgb(viz::C_BG.0, viz::C_BG.1, viz::C_BG.2);
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -41,12 +41,13 @@ usage: amtr [--session FILE|ID] [--project PATH] [--budget N]
   --engine       path to amtr_engine.py (default: repo root, or $AMTR_ENGINE)
   --python       python interpreter (default: python3)
   --engine-args  everything after this flag goes to the engine argv verbatim
+  --theme        block theme: terminal (default) · ukiyo-e · bauhaus · mono
   --help         this text
 
   --demo         run a deterministic demo session (no engine) — the
                  reproducible scene source for visual/animation validation
 
-keys: 1-6 tabs · f sessions · ? help · ←/→ scrub · m map mode · q quit";
+keys: 1-6 tabs · f sessions · ? help · ←/→ scrub · m map mode · t theme · q quit";
 
 struct Cli {
     help: bool,
@@ -76,6 +77,13 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
         match argv[i].as_str() {
             "--help" | "-h" => cli.help = true,
             "--demo" => cli.demo = true,
+            "--theme" => {
+                let v = val(&mut i)?;
+                if !viz::set_theme(&v) {
+                    let names: Vec<&str> = viz::THEMES.iter().map(|t| t.name).collect();
+                    return Err(format!("unknown theme: {v} (have: {})", names.join(", ")));
+                }
+            }
             "--python" => cli.python = val(&mut i)?,
             "--engine" => cli.engine = std::path::PathBuf::from(val(&mut i)?),
             "--session" => {
@@ -190,6 +198,9 @@ struct App {
 
     map_mode: MapMode,
     rung_override: i8,
+    /// big-number mode (<50×15) theme (`tab` toggles): false = gradient tank
+    /// (default) · true = bare OVERVIEW block map, no background fill
+    big_blocks: bool,
 
     paused: bool,
     /// one draw is allowed through the pause gate (pause-toggle feedback)
@@ -256,6 +267,7 @@ impl App {
             postmortem: None,
             map_mode: MapMode::Class,
             rung_override: 0,
+            big_blocks: false,
             paused: false,
             force_draw: false,
             blink: true,
@@ -1375,10 +1387,23 @@ impl App {
                 viz::reroll_palette();
                 self.st.push_log("tank palette rerolled".into());
             }
+            KeyCode::Tab => {
+                // big-number mode theme (only visible <50×15; harmless else)
+                self.big_blocks = !self.big_blocks;
+                self.st.push_log(if self.big_blocks {
+                    "big gauge theme: block map".into()
+                } else {
+                    "big gauge theme: gradient tank".into()
+                });
+            }
             KeyCode::Char('m') => {
                 self.map_mode = self.map_mode.next();
                 self.st
                     .push_log(format!("map mode: {}", self.map_mode.label()));
+            }
+            KeyCode::Char('t') => {
+                let name = viz::cycle_theme();
+                self.st.push_log(format!("block theme: {name}"));
             }
             KeyCode::Char('c') => {
                 if !self.st.compactions.is_empty() {
@@ -1537,7 +1562,7 @@ fn render_all(f: &mut Frame<'_>, app: &App) {
     }
     let ui = app.ui(panes.tier);
     if panes.big {
-        viz::render_big(&app.st, &ui, f, panes.body.unwrap());
+        viz::render_big(&app.st, &ui, app.big_blocks, f, panes.body.unwrap());
         return;
     }
 
@@ -2016,6 +2041,94 @@ mod screenshots {
 
     const NOW: f64 = 1_800_000_000.0;
 
+    /// Accessibility gate: every shipped block theme must keep all
+    /// cross-family color pairs (9 categories + 8 file hues, wheel-vs-wheel
+    /// exempt) above its CIE76 dE floor under normal vision, protanopia and
+    /// deuteranopia (Machado 2009 severity-1.0). A theme edit that lands two
+    /// meanings on the same perceived color fails the build here.
+    #[test]
+    fn theme_cvd_floors() {
+        const PROTAN: [[f64; 3]; 3] = [
+            [0.152286, 1.052583, -0.204868],
+            [0.114503, 0.786281, 0.099216],
+            [-0.003882, -0.048116, 1.051998],
+        ];
+        const DEUTAN: [[f64; 3]; 3] = [
+            [0.367322, 0.860646, -0.227968],
+            [0.280085, 0.672501, 0.047413],
+            [-0.011820, 0.042940, 0.968881],
+        ];
+        fn lin(c: u8) -> f64 {
+            let c = c as f64 / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        }
+        fn lab(v: [f64; 3]) -> [f64; 3] {
+            let [r, g, b] = v;
+            let (x, y, z) = (
+                (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047,
+                0.2126 * r + 0.7152 * g + 0.0722 * b,
+                (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883,
+            );
+            let f = |t: f64| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+            let (fx, fy, fz) = (f(x), f(y), f(z));
+            [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+        }
+        fn sim(c: (u8, u8, u8), m: Option<&[[f64; 3]; 3]>) -> [f64; 3] {
+            let v = [lin(c.0), lin(c.1), lin(c.2)];
+            lab(match m {
+                None => v,
+                Some(m) => {
+                    let mut o = [0.0; 3];
+                    for (i, oi) in o.iter_mut().enumerate() {
+                        *oi = (0..3).map(|j| m[i][j] * v[j]).sum::<f64>().clamp(0.0, 1.0);
+                    }
+                    o
+                }
+            })
+        }
+        fn de(a: [f64; 3], b: [f64; 3]) -> f64 {
+            a.iter().zip(b).map(|(p, q)| (p - q) * (p - q)).sum::<f64>().sqrt()
+        }
+        // floors: measured minimum per theme, rounded down — a regression
+        // margin, not a target (mono's ladder is inherently tighter; its
+        // guarantee is uniformity across vision types, tested the same way)
+        for th in viz::THEMES.iter() {
+            let (fl_n, fl_p, fl_d) = match th.name {
+                "terminal" => (21.0, 13.0, 14.0),
+                "ukiyo-e" => (20.0, 14.0, 15.0),
+                "bauhaus" => (24.0, 16.0, 19.0),
+                "mono" => (9.0, 8.5, 9.0),
+                other => panic!("theme {other} has no CVD floor registered"),
+            };
+            let named = [
+                th.overhead, th.user, th.assist, th.think, th.reason,
+                th.bash, th.tool, th.attach, th.summary,
+            ];
+            for (cond, m, floor) in [
+                ("normal", None, fl_n),
+                ("protan", Some(&PROTAN), fl_p),
+                ("deutan", Some(&DEUTAN), fl_d),
+            ] {
+                let cats: Vec<[f64; 3]> = named.iter().map(|&c| sim(c, m)).collect();
+                let wheel: Vec<[f64; 3]> = th.wheel.iter().map(|&c| sim(c, m)).collect();
+                let mut min = f64::MAX;
+                for i in 0..cats.len() {
+                    for j in i + 1..cats.len() {
+                        min = min.min(de(cats[i], cats[j]));
+                    }
+                    for w in &wheel {
+                        min = min.min(de(cats[i], *w));
+                    }
+                }
+                assert!(
+                    min >= floor,
+                    "theme {} under {cond}: min cross-pair dE {min:.1} < floor {floor}",
+                    th.name
+                );
+            }
+        }
+    }
+
     fn cat(s: &str) -> ipc::Cat {
         serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap()
     }
@@ -2477,6 +2590,13 @@ mod screenshots {
         let mut app = demo_app();
         let s = draw(&mut app, 40, 12); // < 50×15 → big-number mode
         assert!(s.contains('%'), "big-number % missing:\n{s}");
+        // tab → blocks theme: map cells instead of the tank, % readout stays
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert!(app.big_blocks);
+        let s = draw(&mut app, 40, 12);
+        assert!(s.contains('%'), "blocks-theme % missing:\n{s}");
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // toggles back
+        assert!(!app.big_blocks);
         let s = draw(&mut app, 12, 5); // < 14×6 → centered floor message
         assert!(s.contains("amtr"), "floor message missing:\n{s}");
     }
@@ -3771,8 +3891,8 @@ mod screenshots {
         app.file_sel = 3; // selection renders FULL brightness — test unselected rows
         let buf = buffer_of(&mut app, 110, 30);
         // basename cell at x=31 (fixed 31-cell prefix); rows y=4 (A), y=5 (B)
-        let hue_a = app.st.hue_of(1);
-        let hue_b = app.st.hue_of(2);
+        let hue_a = viz::hue_of(&app.st, 1);
+        let hue_b = viz::hue_of(&app.st, 2);
         assert_eq!(
             buf[(31, 4)].style().fg,
             Some(viz::rgb(viz::scale(hue_a, viz::heat_k(3.0)))),
@@ -3789,7 +3909,7 @@ mod screenshots {
         let buf = buffer_of(&mut app, 110, 30);
         assert_eq!(
             buf[(31, 4)].style().fg,
-            Some(viz::rgb(app.st.hue_of(1))),
+            Some(viz::rgb(viz::hue_of(&app.st, 1))),
             "selected row must not be heat-dimmed"
         );
     }
@@ -3873,7 +3993,7 @@ mod screenshots {
         // the cross-link BRIGHTENS the selected file's cells toward white
         // (reverse-video on a solid "█" cell renders black — field-found; the
         // highlight is now a lerp to white, matching cell_px).
-        let want = viz::rgb(viz::lerp(app.st.hue_of(2), viz::C_WHITE, 0.6));
+        let want = viz::rgb(viz::lerp(viz::hue_of(&app.st, 2), viz::C_WHITE, 0.6));
         let buf = buffer_of(&mut app, 110, 30);
         let mut hit = false;
         for y in 6..18u16 {
@@ -5004,7 +5124,7 @@ mod screenshots {
         let fid = viz::eff_segs(&app.st)[app.inspect_idx]
             .file
             .expect("walked seg must be the file chunk");
-        let dim = viz::rgb(viz::scale(app.st.hue_of(fid), 0.40));
+        let dim = viz::rgb(viz::scale(viz::hue_of(&app.st, fid), 0.40));
         let count = |app: &mut App, want: ratatui::style::Color| -> usize {
             let buf = buffer_of(app, 110, 30);
             let mut n = 0usize;

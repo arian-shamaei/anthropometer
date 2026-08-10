@@ -344,8 +344,12 @@ rolled per process from a curated set of 4-stop art-historical gradients
 bauhaus, rothko, vaporwave), each ordered dark at the far end → vivid at the
 surface. Tall windows fill bottom-up, flat windows (w > 2h) left-to-right;
 eighth-block fractional surface slice. The only chrome: `R% · session-name`
-top-left — R% bold in a white-lifted zone tint, name in body text) · <14×6
-centered `amtr ≥14×6`.
+top-left — R% bold in a white-lifted zone tint, name in body text. `tab`
+toggles a second theme: the OVERVIEW MAP's colored content cells instead of
+the tank, bare — free space stays terminal background — filling in the tank's
+orientation (tall bottom-up, flat left-to-right), budget spanning the whole
+area so the painted fraction IS the fullness; the corner readout overlays on
+an app-bg scrim) · <14×6 centered `amtr ≥14×6`.
 
 ### Tab 1 OVERVIEW — MAP + EKG
 
@@ -367,12 +371,16 @@ a tall terminal render a 1M budget at 128 tok/cell instead of leaving the
 EKG a void). Cells
 beyond R render dim `·` (free space visible). Cell owner = plurality segment.
 **Color modes (`m` cycles, gutter-labeled):**
-1. `class` (default) — fixed palette: overhead slate (110,120,140) · user blue
-   (90,140,220) · assistant green (110,190,110) · thinking dim-green (80,130,90) ·
-   bash orange (230,140,80) · tool gray (150,150,150) · attach purple (160,110,
-   220) · summary white (235,235,235) · file → the file's accent hue: fixed 8-hue
-   wheel `[(230,90,90),(90,200,200),(230,200,80),(200,110,230),(120,220,120),
-   (240,150,60),(100,150,240),(220,120,170)]` assigned at first access, cycled.
+1. `class` (default) — identity colors from the active **block theme** (`t`
+   cycles: terminal (default, gruvbox-flavored) · ukiyo-e · bauhaus · mono;
+   `--theme <name>` pins at launch). A theme = the 9 category colors + the
+   8-hue per-file accent wheel (assigned at first access, cycled). Every
+   shipped theme is colorblind-gated by the `theme_cvd_floors` test: all
+   cross-family pairs must clear a per-theme CIE76 dE floor under normal
+   vision, protanopia and deuteranopia (Machado 2009 severity-1.0 matrices;
+   wheel-vs-wheel pairs exempt — files are one family by design). Semantic
+   colors (pressure zones, alerts, cache tiers) are never themed. Exact RGB
+   values live in `viz::THEMES` — the test, not this spec, is their contract.
 2. `heat` — uniform orange, brightness `0.30 + 0.70·e^(−Δt/45s)` from seg `ts`;
    500 ms animation clock while any heat > 0.05; else static.
 3. `age` — shade ramp `·░▒▓█` by log₄ buckets of `turns_now − born` ∈

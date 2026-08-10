@@ -24,21 +24,10 @@ pub const RETS_CAP: usize = 256;
 /// 1024 segs + the overhead segment (SPEC §e).
 pub const SEGS_CAP: usize = 1024 + 1;
 
-/// Fixed 8-hue file accent wheel (SPEC §e MAP mode 1), assigned at first
-/// access, cycled.
-// files carry individual hues from a cohesive COOL family (cyan→azure→teal),
-// bright for the dark terminal — so file cells read as one group, distinct
-// from gold user / magenta attach / violet reasoning / green assistant
-pub const FILE_HUES: [(u8, u8, u8); 8] = [
-    (64, 202, 226),
-    (84, 168, 248),
-    (46, 216, 208),
-    (128, 194, 252),
-    (40, 182, 222),
-    (150, 208, 240),
-    (72, 150, 240),
-    (36, 214, 234),
-];
+/// Length of the per-file accent wheel (SPEC §e MAP mode 1). State assigns
+/// each file a wheel INDEX at first access, cycled; the actual colors live
+/// in the active block theme (`viz::ClassTheme.wheel`).
+pub const FILE_WHEEL_LEN: usize = 8;
 
 /// The newest unacked alert (footer ribbon).
 #[derive(Debug, Clone)]
@@ -149,14 +138,15 @@ impl State {
         if let Some(&h) = self.file_hue.get(&id) {
             return h;
         }
-        let h = self.hue_next % FILE_HUES.len();
+        let h = self.hue_next % FILE_WHEEL_LEN;
         self.hue_next += 1;
         self.file_hue.insert(id, h);
         h
     }
 
-    pub fn hue_of(&self, id: u64) -> (u8, u8, u8) {
-        FILE_HUES[self.file_hue.get(&id).copied().unwrap_or(0) % FILE_HUES.len()]
+    /// The file's wheel index; `viz::hue_of` colors it via the active theme.
+    pub fn hue_idx(&self, id: u64) -> usize {
+        self.file_hue.get(&id).copied().unwrap_or(0) % FILE_WHEEL_LEN
     }
 
     /// Sum of the current map's segment tokens (== R by construction).

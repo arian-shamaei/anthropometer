@@ -19,7 +19,7 @@ use crate::ipc::{
     AgentRec, Cat, CAT_ORDER, CmdRec, FileRec, FleetPeekMsg, MapMsg, Op, PeekMsg, RetKind, RetRec,
     Seg, Severity, Tasks,
 };
-use crate::state::{fmt_age, fmt_dur, fmt_k0, fmt_k1, State, FILE_HUES};
+use crate::state::{fmt_age, fmt_dur, fmt_k0, fmt_k1, State};
 
 // ---------------------------------------------------------------------------
 // palette (SPEC §e MAP mode 1 — fixed)
@@ -42,6 +42,7 @@ pub const C_RED: (u8, u8, u8) = (230, 85, 85); // red zone / errors
 pub const C_GREEN: (u8, u8, u8) = (95, 200, 120); // green zone / done
 pub const C_MAGENTA: (u8, u8, u8) = (220, 90, 220); // compaction markers
 pub const C_DIM: (u8, u8, u8) = (95, 95, 108); // hints / labels
+pub const C_BG: (u8, u8, u8) = (10, 11, 14); // app background (main.rs BG derives from this)
 pub const C_FREE: (u8, u8, u8) = (34, 37, 46); // unused context space (box fill, not black)
 pub const C_GRID: (u8, u8, u8) = (58, 58, 66); // rules
 pub const C_FG: (u8, u8, u8) = (200, 205, 215); // body text
@@ -244,27 +245,160 @@ pub fn zone_color(ratio: f64) -> (u8, u8, u8) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// block themes — class-mode identity colors (categories + the file wheel)
+// ---------------------------------------------------------------------------
+
+/// A complete class-mode identity palette: the who-speaks colors for MAP
+/// blocks plus the 8-hue per-file accent wheel. Semantic colors (pressure
+/// zones, alerts, turn-stack cache tiers) are NOT themed — they carry
+/// meaning, not style. Every shipped theme must clear the colorblind floors
+/// enforced by the `theme_cvd_floors` test (min CIE76 dE between every
+/// cross-family pair under normal vision, protanopia and deuteranopia —
+/// Machado 2009 severity-1.0 matrices; wheel-vs-wheel pairs are exempt,
+/// files are one family by design).
+pub struct ClassTheme {
+    pub name: &'static str,
+    pub overhead: (u8, u8, u8),
+    pub user: (u8, u8, u8),
+    pub assist: (u8, u8, u8),
+    pub think: (u8, u8, u8),
+    pub reason: (u8, u8, u8),
+    pub bash: (u8, u8, u8),
+    pub tool: (u8, u8, u8),
+    pub attach: (u8, u8, u8),
+    pub summary: (u8, u8, u8),
+    pub wheel: [(u8, u8, u8); crate::state::FILE_WHEEL_LEN],
+}
+
+/// Shipped themes, `t` cycles in listed order; index 0 is the default.
+pub static THEMES: [ClassTheme; 4] = [
+    // gruvbox-flavored: blends into a gruvbox terminal. reason/attach are
+    // gruvbox-adjacent rather than canon — the canonical purples collapse
+    // into the teal wheel for dichromats, so they were re-tuned outward.
+    ClassTheme {
+        name: "terminal",
+        overhead: (102, 92, 84),
+        user: (250, 189, 47),
+        assist: (142, 192, 124),
+        think: (96, 130, 70),
+        reason: (236, 116, 230),
+        bash: (214, 93, 14),
+        tool: (168, 153, 132),
+        attach: (110, 24, 178),
+        summary: (235, 219, 178),
+        wheel: [
+            (69, 133, 136), (138, 176, 170), (88, 158, 180), (58, 110, 158),
+            (110, 186, 202), (150, 200, 214), (80, 140, 196), (46, 142, 150),
+        ],
+    },
+    // woodblock inks: gold-leaf human, spring-green voice, pine thought,
+    // murasaki hidden reasoning, vermillion shell, water-family files
+    ClassTheme {
+        name: "ukiyo-e",
+        overhead: (98, 110, 152),
+        user: (244, 198, 56),
+        assist: (108, 206, 118),
+        think: (24, 104, 88),
+        reason: (178, 150, 255),
+        bash: (198, 76, 44),
+        tool: (158, 158, 166),
+        attach: (150, 40, 230),
+        summary: (238, 233, 220),
+        wheel: [
+            (64, 202, 226), (168, 200, 254), (168, 208, 214), (8, 240, 246),
+            (120, 176, 206), (144, 240, 246), (152, 224, 254), (88, 216, 214),
+        ],
+    },
+    // primary-triad discipline: cadmium yellow, vermillion, cobalt wheel
+    ClassTheme {
+        name: "bauhaus",
+        overhead: (86, 92, 110),
+        user: (248, 198, 40),
+        assist: (118, 184, 92),
+        think: (62, 108, 80),
+        reason: (214, 190, 216),
+        bash: (204, 60, 38),
+        tool: (154, 150, 142),
+        attach: (90, 16, 216),
+        summary: (240, 236, 226),
+        wheel: [
+            (56, 110, 214), (28, 150, 220), (96, 164, 248), (20, 88, 180),
+            (84, 192, 238), (130, 182, 255), (44, 170, 208), (104, 140, 244),
+        ],
+    },
+    // luminance IS the encoding (hue only whispers: warm = human, cool =
+    // files) — never degrades for any color vision, works on e-ink; the
+    // ladder is inherently tighter than the color themes' floors
+    ClassTheme {
+        name: "mono",
+        overhead: (84, 86, 96),
+        user: (240, 226, 190),
+        assist: (212, 214, 222),
+        think: (108, 110, 120),
+        reason: (186, 188, 198),
+        bash: (134, 136, 146),
+        tool: (160, 162, 172),
+        attach: (52, 54, 62),
+        summary: (252, 252, 252),
+        wheel: [
+            (96, 110, 134), (122, 138, 164), (150, 168, 196), (180, 198, 226),
+            (96, 110, 134), (122, 138, 164), (150, 168, 196), (180, 198, 226),
+        ],
+    },
+];
+
+static THEME_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn theme() -> &'static ClassTheme {
+    &THEMES[THEME_IDX.load(std::sync::atomic::Ordering::Relaxed) % THEMES.len()]
+}
+
+/// `t`: advance to the next theme; returns the new theme's name for the log.
+pub fn cycle_theme() -> &'static str {
+    let i = THEME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+    THEME_IDX.store((i + 1) % THEMES.len(), std::sync::atomic::Ordering::Relaxed);
+    theme().name
+}
+
+/// `--theme <name>`: pin a theme at launch. False if the name is unknown.
+pub fn set_theme(name: &str) -> bool {
+    match THEMES.iter().position(|t| t.name == name) {
+        Some(i) => {
+            THEME_IDX.store(i, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The file's accent color: its stable wheel index, colored by the theme.
+pub fn hue_of(st: &State, id: u64) -> (u8, u8, u8) {
+    theme().wheel[st.hue_idx(id)]
+}
+
 pub fn cat_color(cat: Cat) -> (u8, u8, u8) {
+    let t = theme();
     match cat {
-        Cat::Overhead => C_OVERHEAD,
-        Cat::User => C_USER,
-        Cat::Assistant => C_ASSIST,
-        Cat::Thinking => C_THINK,
-        // hidden reasoning: the thinking violet, brightened — the visible
-        // trace of what the transcript cannot show
-        Cat::Reasoning => (176, 148, 255),
-        Cat::File => FILE_HUES[0],
-        Cat::Bash => C_BASH,
-        Cat::Tool => C_TOOL,
-        Cat::Attach => C_ATTACH,
-        Cat::Summary => C_SUMMARY,
+        Cat::Overhead => t.overhead,
+        Cat::User => t.user,
+        Cat::Assistant => t.assist,
+        Cat::Thinking => t.think,
+        // hidden reasoning: the visible trace of what the transcript
+        // cannot show — each theme gives it its own off-family accent
+        Cat::Reasoning => t.reason,
+        Cat::File => t.wheel[0],
+        Cat::Bash => t.bash,
+        Cat::Tool => t.tool,
+        Cat::Attach => t.attach,
+        Cat::Summary => t.summary,
         Cat::Unknown => C_DIM,
     }
 }
 
 fn seg_color(st: &State, sg: &Seg) -> (u8, u8, u8) {
     match sg.file {
-        Some(fid) if sg.cat == Cat::File => st.hue_of(fid),
+        Some(fid) if sg.cat == Cat::File => hue_of(st, fid),
         _ => cat_color(sg.cat),
     }
 }
@@ -834,13 +968,14 @@ fn render_map_cells<F>(
 
 /// Plain class-mode color for a per-agent mini-map cell: no waterline, no
 /// pulses, no cross-session selection (the agent's own `file` ids are local
-/// to its Session, so file segs use the LOCAL `FILE_HUES` wheel — never the
+/// to its Session, so file segs index the theme wheel LOCALLY — never the
 /// main UI's `hue_of`, which would map to an unrelated file).
 fn agent_cell_px(segs: &[Seg], owner: Option<usize>) -> CellPx {
     let color = owner.map(|oi| {
         let sg = &segs[oi];
+        let wheel = &theme().wheel;
         let base = match sg.file {
-            Some(fid) if sg.cat == Cat::File => FILE_HUES[(fid as usize) % FILE_HUES.len()],
+            Some(fid) if sg.cat == Cat::File => wheel[(fid as usize) % wheel.len()],
             _ => cat_color(sg.cat),
         };
         rgb(base)
@@ -1041,7 +1176,7 @@ pub fn render_inspect_line(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
             .map(|f| f.path.clone())
             .unwrap_or_else(|| format!("file#{fid}"));
         spans.push(Span::styled(" · ".to_string(), fg(C_DIM)));
-        spans.push(Span::styled(tail_trunc(&path, 36), fg(st.hue_of(fid))));
+        spans.push(Span::styled(tail_trunc(&path, 36), fg(hue_of(st, fid))));
     }
     spans.push(Span::styled(format!(" · born t{}", sg.born), fg(C_DIM)));
     if sg.cat == Cat::Overhead || alpha <= 0.0 {
@@ -1096,7 +1231,7 @@ pub fn render_peek_overlay(st: &State, p: &PeekMsg, f: &mut Frame<'_>, area: Rec
             .map(|f| f.path.clone())
             .unwrap_or_else(|| format!("file#{fid}"));
         head.push(Span::styled(" · ".to_string(), fg(C_DIM)));
-        head.push(Span::styled(tail_trunc(&path, 28), fg(st.hue_of(fid))));
+        head.push(Span::styled(tail_trunc(&path, 28), fg(hue_of(st, fid))));
     }
     lines.push(Line::from(head));
     lines.push(Line::from(""));
@@ -1356,7 +1491,7 @@ pub fn render_files_roll(
             lines.push(Line::from(""));
             continue;
         };
-        let hue = st.hue_of(fid);
+        let hue = hue_of(st, fid);
         let (path, resident) = files_by_id
             .get(&fid)
             .map(|f| (f.path.clone(), f.resident))
@@ -1480,7 +1615,7 @@ pub fn render_files_table(
         let Some(fr) = files_by_id.get(&fid) else {
             continue;
         };
-        let hue = st.hue_of(fid);
+        let hue = hue_of(st, fid);
         let pres = if fr.resident {
             format!("{:>4.0}%", (fr.tok as f64 * alpha) / total as f64 * 100.0)
         } else {
@@ -1693,7 +1828,7 @@ pub fn render_files_now(
             }
             Row::File(fid, idx) => {
                 let Some(fr) = files_by_id.get(&fid) else { continue };
-                let hue = st.hue_of(fid);
+                let hue = hue_of(st, fid);
                 let age = if fr.last_epoch > 0.0 {
                     Some((now - fr.last_epoch).max(0.0))
                 } else {
@@ -3600,16 +3735,17 @@ fn fill_bottom_up(
 // SHELL / RETRIEVAL — the agentic-retrieval perspective (`v` inside SHELL)
 // ---------------------------------------------------------------------------
 
-/// Per-server mcp accent: the FILE_HUES wheel keyed by a stable FNV-1a hash
-/// of the server name. Servers aren't files — the first-access file hue map
-/// is deliberately not involved (a server keeps its hue across sessions).
+/// Per-server mcp accent: the theme's file wheel keyed by a stable FNV-1a
+/// hash of the server name. Servers aren't files — the first-access file hue
+/// map is deliberately not involved (a server keeps its hue across sessions).
 pub fn server_hue(name: &str) -> (u8, u8, u8) {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in name.bytes() {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    FILE_HUES[(h % FILE_HUES.len() as u64) as usize]
+    let wheel = &theme().wheel;
+    wheel[(h % wheel.len() as u64) as usize]
 }
 
 /// Kind glyph + accent: `⌕` search cyan · `⇣` fetch blue · `◆` mcp
@@ -3938,7 +4074,7 @@ pub fn render_postmortem(st: &State, idx: usize, f: &mut Frame<'_>, area: Rect) 
                 .unwrap_or_else(|| format!("file#{}", df.file));
             lines.push(Line::from(vec![
                 Span::styled(" ✝ ".to_string(), fg(C_RED)),
-                Span::styled(tail_trunc(&path, 40), fg(st.hue_of(df.file))),
+                Span::styled(tail_trunc(&path, 40), fg(hue_of(st, df.file))),
                 Span::styled(format!(" −{}", fmt_k1(df.tok)), fg(C_DIM)),
             ]));
         }
@@ -4499,8 +4635,8 @@ pub fn render_help(page: usize, f: &mut Frame<'_>, area: Rect) {
         key("f / 0", "fleet · tab wall (␣ preview · x end) · ? help · q quit · p pause"),
         key("x", "amtr3d — stream this session to the Vision Pro memspace"),
         key("←/→  ⇧←/→", "turn cursor ±1 / ±10 · home first · end/esc LIVE"),
-        key("m +/- space", "MAP color mode · cell-size rung · reroll tank palette"),
-        key("c", "latest compaction post-mortem"),
+        key("m t +/- ␣", "MAP mode · block theme · cell rung · reroll tank palette"),
+        key("c · tab", "latest post-mortem · small-window theme tank⇄blocks"),
         key("R", "write a ground-truth report (→ ~/.claude/amtr-reports/)"),
         key("j/k g/G", "select/scroll · ends (SHELL: G restores follow)"),
         key("enter s o r", "drill/expand · sort · open in $EDITOR · fleet refresh"),
@@ -4960,7 +5096,14 @@ pub fn render_footer(
 /// windows fill bottom-up; flat windows (w > 2h, visually wider than tall)
 /// fill left-to-right. Fractional edge = eighth-blocks, brightest at the
 /// surface. The only chrome: R% in the top-left corner.
-pub fn render_big(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
+///
+/// `blocks` (tab toggles): the second theme — the OVERVIEW MAP's colored
+/// content cells fill the used fraction instead of the tank, bare (free
+/// space stays terminal background, no dim fill, no box), oriented the same
+/// way the tank drains: tall windows fill bottom-up, flat windows (w > 2h)
+/// left-to-right. Budget maps exactly to the screen, so painted area reads
+/// as fullness — just composed of the real content.
+pub fn render_big(st: &State, ui: &Ui, blocks: bool, f: &mut Frame<'_>, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -4968,12 +5111,17 @@ pub fn render_big(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
     let pct = (ratio * 100.0).round() as u64;
     let zone = zone_color(ratio);
 
-    // gradient tank: cells covered = context left, palette sweeps its
-    // stops dark → vivid toward the surface edge
-    render_tank(f, area, (1.0 - ratio).clamp(0.0, 1.0), &art_palette());
+    if blocks {
+        render_big_blocks(st, ui, f, area);
+    } else {
+        // gradient tank: cells covered = context left, palette sweeps its
+        // stops dark → vivid toward the surface edge
+        render_tank(f, area, (1.0 - ratio).clamp(0.0, 1.0), &art_palette());
+    }
     // simple readout: percentage + session handle in the top-left corner,
-    // nothing else
-    let _ = ui;
+    // nothing else. Over the tank it stays transparent (the tank's own bg
+    // shows through); over the block field it sits on an app-bg scrim so it
+    // reads as an overlay instead of dissolving into content cells.
     let name = st
         .meta
         .as_ref()
@@ -4985,12 +5133,15 @@ pub fn render_big(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
             }
         })
         .unwrap_or_else(|| "—".to_string());
+    let mut pct_style = fg(lerp(zone, C_WHITE, 0.20)).add_modifier(Modifier::BOLD);
+    let mut name_style = fg(C_FG);
+    if blocks {
+        pct_style = pct_style.bg(rgb(C_BG));
+        name_style = name_style.bg(rgb(C_BG));
+    }
     let spans = vec![
-        Span::styled(
-            format!(" {pct}%"),
-            fg(lerp(zone, C_WHITE, 0.20)).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!(" · {name} "), fg(C_FG)),
+        Span::styled(format!(" {pct}%"), pct_style),
+        Span::styled(format!(" · {name} "), name_style),
     ];
     let line = Line::from(spans);
     let rect = Rect {
@@ -5000,6 +5151,51 @@ pub fn render_big(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
         height: 1,
     };
     f.render_widget(Paragraph::new(line), rect);
+}
+
+/// The blocks big-gauge theme: the MAP's colored content cells (half-block
+/// grid, colors from the current map mode `m` — pulses, waterline and all,
+/// via `cell_px`), laid out in the tank's fill orientation: tall windows
+/// fill bottom-up (address 0 at the bottom edge, content sediments upward),
+/// flat windows (w > 2h) fill left-to-right (column-major). Bare: free and
+/// beyond-budget cells stay terminal background. The budget spans the whole
+/// area (no rung ladder — big mode has no scale labels), so the painted
+/// fraction IS the fullness fraction, exactly like the tank's fill line.
+fn render_big_blocks(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
+    let segs = eff_segs(st);
+    let (w, h) = (area.width as usize, area.height as usize);
+    let capacity = w * 2 * h; // half-block cells
+    let budget = st.budget.max(1);
+    let s_tok = (budget as f64 / capacity.max(1) as f64).ceil().max(1.0) as u64;
+    let n_cells = (budget.div_ceil(s_tok) as usize).min(capacity);
+    let owners = cell_owners(segs, s_tok, n_cells);
+    let total: u64 = segs.iter().map(|sg| sg.tok).sum();
+    let horiz = area.width > 2 * area.height;
+    // logical half-cell index → color (None = free / beyond budget: unpainted)
+    let color_at = |ci: usize| -> Option<Color> {
+        if ci >= n_cells {
+            return None;
+        }
+        cell_px(st, ui, segs, owners[ci], ci as u64 * s_tok, s_tok, total).color
+    };
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(h);
+    for row in 0..h {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(w);
+        for col in 0..w {
+            let (ci_t, ci_b) = if horiz {
+                // column-major from the left edge, top-down within a column
+                (col * 2 * h + 2 * row, col * 2 * h + 2 * row + 1)
+            } else {
+                // row-major from the BOTTOM edge up; a char row's lower half
+                // is the earlier address
+                let from_bot = h - 1 - row;
+                ((2 * from_bot + 1) * w + col, (2 * from_bot) * w + col)
+            };
+            spans.push(compose(color_at(ci_t), color_at(ci_b)));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// The gradient tank itself: paint `left` (context-left fraction) of `area`
