@@ -16,7 +16,9 @@ ground-truth PDF report of the whole session.
 > so we pointed it at its own transcripts. 1,945 turns, 1.02 billion cache-read tokens,
 > 3 compactions, $1,472 at API list price. The instrument dissects its own birth.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/amtr.svg)](https://crates.io/crates/amtr)
+&nbsp;·&nbsp; [![Crates.io downloads](https://img.shields.io/crates/d/amtr.svg)](https://crates.io/crates/amtr)
+&nbsp;·&nbsp; [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 &nbsp;·&nbsp; [![vibe coded](https://img.shields.io/badge/AI%20usage-vibe%20coded-ff2d78)](#-ai-usage)
 &nbsp;·&nbsp; Rust + ratatui TUI · Python engine · terminal-only
 
