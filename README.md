@@ -58,6 +58,16 @@ are and what's filling you up. `m` cycles four lenses (category · access-heat �
 turn-age · cache billing); `i` walks the segments like a memory debugger and reads
 back the **actual text** occupying any region.
 
+### Block themes — colorblind-verified
+
+![t cycles the block themes: terminal, ukiyo-e, bauhaus, mono](docs/assets/themes.gif)
+
+`t` cycles four identity palettes for the map (`--theme` pins one): **terminal**
+(gruvbox-flavored default) · **ukiyo-e** · **bauhaus** · **mono** (luminance-only).
+Every theme is accessibility-gated in the test suite: the build fails unless all
+category/file color pairs stay distinguishable under normal vision, protanopia,
+and deuteranopia (simulated with Machado 2009 matrices, CIE76 floors).
+
 ### Files & subagents
 
 | Live file traffic (`2`) | Subagent fan-out (`4`) |

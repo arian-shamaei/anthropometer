@@ -1,6 +1,6 @@
 [package]
 name = "amtr"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2024"
 description = "btop-style live monitor for Claude Code sessions: context-window memory map, cache economics, compaction forensics"
 license = "MIT"
