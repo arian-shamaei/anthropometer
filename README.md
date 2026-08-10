@@ -148,6 +148,16 @@ Override the install prefix with `AMTR_PREFIX` or pin a version with `AMTR_VERSI
 The live TUI needs only `python3` (≥3.9, stdlib); the **report** extras (`R`) still
 need `pip install matplotlib pillow` plus `brew install tectonic`.
 
+### Cargo
+
+```sh
+cargo install amtr
+```
+
+The [crate](https://crates.io/crates/amtr) is self-contained — the Python
+engine is embedded at compile time, so the binary works standalone (runtime
+needs only `python3` ≥3.9, stdlib).
+
 ### Homebrew (recommended)
 
 ```sh
