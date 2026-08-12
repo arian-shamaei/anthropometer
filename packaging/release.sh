@@ -32,8 +32,8 @@ git add rust/Cargo.toml rust/Cargo.lock
 git commit -m "v$V: $TITLE, version bump"
 git tag "v$V"
 git push origin main "v$V"
-
-(cd rust && cargo publish)
+# the tag push fires BOTH workflows: release.yml (binaries) and publish.yml
+# (crates.io via Trusted Publishing / OIDC — no local token, no local step)
 
 # wait for the binary build so the release page is complete before we link it
 RUN=$(gh run list --workflow=release --limit 1 --json databaseId --jq '.[0].databaseId')
