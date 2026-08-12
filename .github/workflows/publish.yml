@@ -1,0 +1,40 @@
+name: publish
+
+# Publishes the `amtr` crate to crates.io via Trusted Publishing (OIDC) —
+# no long-lived token exists anywhere. Fires on every version tag alongside
+# release.yml (which builds the binaries); workflow_dispatch covers a tag
+# that predates this workflow (run it with `gh workflow run publish.yml
+# --ref vX.Y.Z`). crates.io rejects duplicate versions, so re-runs are safe.
+#
+# The crates.io side of the handshake: the crate's Settings → Trusted
+# Publishing must list repository arian-shamaei/anthropometer with workflow
+# file `publish.yml` (no environment).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  id-token: write # the OIDC exchange
+  contents: read
+
+jobs:
+  crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Authenticate with crates.io (OIDC)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish
+        working-directory: rust
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
