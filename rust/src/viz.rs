@@ -1202,7 +1202,13 @@ pub fn render_inspect_line(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
 /// soft-wraps; a dim `…` line marks a view clip and `…truncated` marks the
 /// engine's 2000-char cap. `found:false` renders the eviction notice; the
 /// overhead segment's answer is the engine's explainer excerpt.
-pub fn render_peek_overlay(st: &State, p: &PeekMsg, f: &mut Frame<'_>, area: Rect) {
+pub fn render_peek_overlay(
+    st: &State,
+    p: &PeekMsg,
+    scroll: &std::cell::Cell<usize>,
+    f: &mut Frame<'_>,
+    area: Rect,
+) {
     if area.width < 8 || area.height < 5 {
         return;
     }
@@ -1235,28 +1241,34 @@ pub fn render_peek_overlay(st: &State, p: &PeekMsg, f: &mut Frame<'_>, area: Rec
     }
     lines.push(Line::from(head));
     lines.push(Line::from(""));
+    let mut body: Vec<Line<'static>> = Vec::new();
     if !p.found {
-        lines.push(Line::styled(
+        body.push(Line::styled(
             " evicted — no longer in the transcript window".to_string(),
             fg(C_DIM),
         ));
     } else if p.excerpt.is_empty() {
-        lines.push(Line::styled(" (empty record)".to_string(), fg(C_DIM)));
+        body.push(Line::styled(" (empty record)".to_string(), fg(C_DIM)));
     } else {
         for raw in p.excerpt.split('\n') {
             for chunk in wrap_line(raw, text_w) {
-                lines.push(Line::styled(format!(" {chunk}"), fg(C_FG)));
+                body.push(Line::styled(format!(" {chunk}"), fg(C_FG)));
             }
         }
     }
-    // clip the body to the pane, marking the cut with a dim `…`
+    // scrollable body window (j/k · wheel); the footer names the visible
+    // range so a clipped record is obvious — no silent `…` cut any more
     let hmax = area.height.saturating_sub(2).min(26);
     let max_lines = (hmax as usize).saturating_sub(3).max(3); // borders + footer
-    if lines.len() > max_lines {
-        lines.truncate(max_lines.saturating_sub(1));
-        lines.push(Line::styled(" …".to_string(), fg(C_DIM)));
-    }
+    let cap = max_lines.saturating_sub(lines.len()).max(1);
+    let s = scroll.get().min(body.len().saturating_sub(cap));
+    scroll.set(s); // clamp so presses never bank past the bottom
+    let end = (s + cap).min(body.len());
+    lines.extend(body[s..end].iter().cloned());
     let mut foot = String::from(" esc close");
+    if body.len() > cap {
+        foot.push_str(&format!(" · j/k scroll {}–{} of {}", s + 1, end, body.len()));
+    }
     if p.truncated {
         foot.push_str(" · …truncated at 2000 chars");
     }
@@ -4558,143 +4570,425 @@ fn fleet_glyph(s: &crate::ipc::Sess) -> (&'static str, (u8, u8, u8)) {
     }
 }
 
-/// Help overlay: keymap, palette, thresholds, glyph dictionary. Fits 80×24.
-/// Help pages: 0 = keys + legend · 1 = the numbers · 2 = modes & anatomy.
-pub const HELP_PAGES: usize = 3;
+/// Help overlay — ONE searchable, scrollable browser (yazi/lazygit idiom;
+/// no pages). Sections: the current tab pinned on top, then GLOBAL, the
+/// other tabs, FLEET, GLYPHS, THE NUMBERS, MAP & TURN ANATOMY. `/` filters
+/// every entry live; sections with no match disappear.
+#[derive(Default)]
+pub struct HelpState {
+    pub filter: String,
+    pub typing: bool,
+    pub scroll: usize,
+}
 
-pub fn render_help(page: usize, f: &mut Frame<'_>, area: Rect) {
-    if area.width < 4 || area.height < 4 {
-        return;
+/// One searchable unit: a key (or term) plus its description. `lines` is the
+/// styled render; `search` is the plain text the filter matches against.
+struct HelpItem {
+    search: String,
+    lines: Vec<Line<'static>>,
+}
+
+struct HelpSection {
+    title: &'static str,
+    items: Vec<HelpItem>,
+}
+
+/// key/term item: first desc line carries the colored key column, the rest
+/// hang indented under it. `w` is the key-column width (14 keys · 11 terms
+/// · 7 glyph rows); a hard space always separates column from description.
+fn hitem(w: usize, k: &str, desc: &[&str]) -> HelpItem {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(desc.len());
+    for (i, d) in desc.iter().enumerate() {
+        let col = if i == 0 { k } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {col:<w$} "), fg(C_AMBER)),
+            Span::styled((*d).to_string(), fg(C_FG)),
+        ]));
     }
-    let key = |k: &str, d: &str| -> Line<'static> {
-        Line::from(vec![
-            Span::styled(format!(" {k:<14}"), fg(C_AMBER)),
-            Span::styled(d.to_string(), fg(C_FG)),
-        ])
-    };
-    let dim = |t: &str| Line::styled(format!(" {t}"), fg(C_DIM));
-    let term = |k: &str, d: &str| -> Line<'static> {
-        Line::from(vec![
-            Span::styled(format!(" {k:<9}"), fg(C_AMBER)),
-            Span::styled(d.to_string(), fg(C_FG)),
-        ])
-    };
-    match page % HELP_PAGES {
-        1 => {
-            let lines: Vec<Line<'static>> = vec![
-                term("R", "resident context: exactly what the model was sent last"),
-                term("", "turn (input + cache-read + cache-written) vs the budget"),
-                term("hot/cold", "recency of LAST touch, nothing else: hot = accessed"),
-                term("", "within ~2 min (the glow's fade window); cold = still in"),
-                term("", "context, just idle. A re-read jumps a file back to hot."),
-                term("AGE O", "time since last access (ticking) · its op: r read ·"),
-                term("LAST", "w write · e edit (NOT execute — Bash lives in SHELL)"),
-                term("", "· LAST = that access's token size"),
-                term("spark", "the file's last 8 accesses, height = size (0–16k)"),
-                term("%res", "the file's share of resident context R"),
-                term("waste", "tokens ever loaded for the file MINUS its live copy:"),
-                term("", "the cumulative price of re-reads and re-writes"),
-                term("ku", "kilo cost-units, honest relative cost per turn:"),
-                term("", "in×1.0 + cache-read×0.1 + 5m-write×1.25 + 1h-write×2.0"),
-                term("", "+ out×5.0 · ribbon shows the session total"),
-                term("out/t ku/t", "output tokens per turn · cost per turn"),
-                term("ag N●", "subagents currently running · amp = tokens an agent"),
-                term("", "burned in its own window per token returned to yours"),
-                term("post-mortem", "(EVENTS ⏎ / c) a compaction's autopsy: size"),
-                term("", "before/after, dropped tokens by category and by file"),
-            ];
-            help_frame("amtr — the numbers  (?: next page)", lines, f, area);
-        }
-        2 => {
-            let lines: Vec<Line<'static>> = vec![
-                dim("MAP modes (m) — one geometry, four measures:"),
-                term("class", "colored by WHAT each block is (user/file/bash/…)"),
-                term("heat", "brightness = how recently touched (45s decay law)"),
-                term("age", "shade = how many turns ago it entered — sediment"),
-                term("cache", "last turn's billing: steel = served from cache ·"),
-                term("", "cyan = newly cached · amber = uncached (full price);"),
-                term("", "the bright cell is the waterline (cache prefix end)"),
-                Line::from(""),
-                dim("TURNS columns, bottom→top (stack top = R by identity):"),
-                term("█cr", "tokens read from cache (0.1× — the cheap bulk)"),
-                term("█5m █1h", "cache WRITES at the 5-min / 1-hour tier (1.25×/2×)"),
-                term("█in", "uncached input (1×) — near-invisible when healthy"),
-                term("▀wl", "prev turn's waterline: below steel top = newly"),
-                term("", "cached · floating above = invalidation depth"),
-                term("▼cmp", "compaction · ▲thr thrash (cache prefix invalidated"),
-                term("", "and re-billed) · ◆mdl model switched this turn"),
-                Line::from(""),
-                dim("lanes: out red on truncation · dur brighter with more tools"),
-                dim("· ku red when the cache missed (hit < 50%)"),
-            ];
-            help_frame("amtr — modes & anatomy  (?: first page)", lines, f, area);
-        }
-        _ => {
-            let mut lines: Vec<Line<'static>> = vec![
-        key("1–6", "tabs: OVERVIEW FILES TURNS AGENTS EVENTS SHELL"),
-        key("f / 0", "fleet · tab wall (␣ preview · x end) · ? help · q quit · p pause"),
-        key("x", "amtr3d — stream this session to the Vision Pro memspace"),
-        key("←/→  ⇧←/→", "turn cursor ±1 / ±10 · home first · end/esc LIVE"),
-        key("m t +/- ␣", "MAP mode · block theme · cell rung · reroll tank palette"),
-        key("c · tab", "latest post-mortem · small-window theme tank⇄blocks"),
-        key("R", "write a ground-truth report (→ ~/.claude/amtr-reports/)"),
-        key("j/k g/G", "select/scroll · ends (SHELL: G restores follow)"),
-        key("enter s o r", "drill/expand · sort · open in $EDITOR · fleet refresh"),
-        key("v", "FILES history↔now · SHELL console↔retrieval"),
-        key("a", "AGENTS run/fail filter · SHELL err filter"),
-        Line::from(""),
-    ];
-    // palette swatches (labels shortened so all 9 fit the 72-col overlay)
-    let mut sw: Vec<Span<'static>> = vec![Span::styled(" cats  ".to_string(), fg(C_DIM))];
-    for cat in CAT_ORDER {
-        let label: String = cat.label().chars().take(4).collect();
-        sw.push(Span::styled(format!("█{label} "), fg(cat_color(cat))));
-    }
-    lines.push(Line::from(sw));
-    lines.push(Line::from(vec![
-        Span::styled(" cache ".to_string(), fg(C_DIM)),
-        Span::styled("█cr(read) ".to_string(), fg(C_STEEL)),
-        Span::styled("█cc(create) ".to_string(), fg(C_CYAN)),
-        Span::styled("█in(uncached) ".to_string(), fg(C_AMBER)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" turns ".to_string(), fg(C_DIM)),
-        Span::styled("█cr ".to_string(), fg(C_STEEL)),
-        Span::styled("█5m ".to_string(), fg(C_CYAN)),
-        Span::styled("█1h ".to_string(), fg(C_ATTACH)),
-        Span::styled("█in ".to_string(), fg(C_RED)),
-        Span::styled("▀wl ".to_string(), fg(C_WLINE)),
-        Span::styled("▼cmp ".to_string(), fg(C_MAGENTA)),
-        Span::styled("▲thr ".to_string(), fg(C_RED)),
-        Span::styled("◆mdl".to_string(), fg(C_WHITE)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" zones ".to_string(), fg(C_DIM)),
-        Span::styled("<60% ".to_string(), fg(C_GREEN)),
-        Span::styled("<85% ".to_string(), fg(C_AMBER)),
-        Span::styled("≥85% ".to_string(), fg(C_RED)),
-        Span::styled("· T_auto rule = auto-compact threshold".to_string(), fg(C_DIM)),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(dim("waterline: end of the cache-served prefix (billed 0.1×) —"));
-    lines.push(dim("the MAP blinks that boundary cell RED; traces stay cyan."));
-    lines.push(dim("thrash (red flash): the waterline FELL — prefix re-billed full"));
-    lines.push(dim("glyphs  ▀ read · ▄ write/edit · █ both · ▼ cliff · ·░▒▓█ shade"));
-    lines.push(dim("        ✝ evicted · ◆ compaction · ▲ thrash · « replay · ┃ playhead"));
-    lines.push(dim("shell   $ prompt · ○ ok · ✖ fail · ^ interrupt · & bg · ▎ stderr"));
-    lines.push(dim("retr    ⌕ search · ⇣ fetch · ◆ mcp · # toolsearch · ✖ failed"));
-            help_frame("amtr — keys + legend  (?: the numbers)", lines, f, area);
-        }
+    HelpItem {
+        search: format!("{k} {}", desc.join(" ")),
+        lines,
     }
 }
 
-fn help_frame(title: &str, lines: Vec<Line<'static>>, f: &mut Frame<'_>, area: Rect) {
-    let rect = centered(area, 72, (lines.len() as u16 + 2).min(area.height));
+/// pre-styled line (palette swatches etc.) with explicit search text
+fn hrich(search: &str, line: Line<'static>) -> HelpItem {
+    HelpItem {
+        search: search.to_string(),
+        lines: vec![line],
+    }
+}
+
+fn help_sections(tab: usize) -> Vec<HelpSection> {
+    let k = |key: &str, desc: &[&str]| hitem(12, key, desc);
+    let t = |term: &str, desc: &[&str]| hitem(11, term, desc);
+    let g = |term: &str, desc: &[&str]| hitem(7, term, desc);
+
+    let global = HelpSection {
+        title: "GLOBAL",
+        items: vec![
+            k("1–6", &["tabs: OVERVIEW FILES TURNS AGENTS EVENTS SHELL"]),
+            k("f / 0", &["fleet — every session on the machine"]),
+            k("?", &["this help · q quit · p pause render"]),
+            k("x", &["amtr3d — stream this session to the Vision Pro memspace"]),
+            k("←/→  ⇧←/→", &["turn cursor ±1 / ±10 · home first · end LIVE"]),
+            k("esc", &["ack the visible alert, then snap to LIVE"]),
+            k("bksp", &["drill OUT of an agent, back to its parent session"]),
+            k("m", &["MAP mode: class → heat → age → cache"]),
+            k("t · tab", &["block theme · small-window theme tank⇄blocks"]),
+            k("␣ · +/-", &["reroll tank palette · cell rung up/down"]),
+            k("c", &["latest compaction post-mortem (←/→ walk history)"]),
+            k("R", &["write a ground-truth report (→ ~/.claude/amtr-reports/)"]),
+        ],
+    };
+    let overview = HelpSection {
+        title: "OVERVIEW",
+        items: vec![
+            k("i", &["INSPECT — walk the actual context-window segments"]),
+            k("←/→ j/k", &["(inspect) prev / next segment"]),
+            k("⏎", &["(inspect) file seg → $EDITOR · else peek the content"]),
+            k("p", &["(inspect) peek the in-context copy (can differ on disk)"]),
+            k("esc", &["(inspect) exit"]),
+        ],
+    };
+    let files = HelpSection {
+        title: "FILES",
+        items: vec![
+            k("j/k g/G", &["select · jump to ends"]),
+            k("⏎", &["expand the selected file's detail"]),
+            k("v", &["HISTORY ⇄ NOW (recency-ordered live view)"]),
+            k("s", &["cycle sort (HISTORY only — NOW is recency by definition)"]),
+            k("o", &["open the selected file in $EDITOR"]),
+        ],
+    };
+    let turns = HelpSection {
+        title: "TURNS",
+        items: vec![
+            k("←/→  ⇧←/→", &["scrub the turn cursor across the columns"]),
+            k("c", &["compaction post-mortem for the latest ▼"]),
+            k("", &["column anatomy: see MAP & TURN ANATOMY below"]),
+        ],
+    };
+    let agents = HelpSection {
+        title: "AGENTS",
+        items: vec![
+            k("j/k g/G", &["select · jump to ends"]),
+            k("⏎", &["expand workflow · drill INTO an agent (bksp returns)"]),
+            k("s · a", &["cycle sort · run/fail filter"]),
+            k("v", &["grid of context mini-maps ⇄ numeric ledger"]),
+        ],
+    };
+    let events = HelpSection {
+        title: "EVENTS",
+        items: vec![
+            k("j/k g/G", &["select · jump to ends (ledger is newest-first)"]),
+            k("⏎", &["compaction → post-mortem · other event → jump cursor"]),
+        ],
+    };
+    let shell = HelpSection {
+        title: "SHELL",
+        items: vec![
+            k("v", &["CONSOLE ⇄ RETRIEVAL"]),
+            k("j/k", &["browse (breaks follow) · g oldest · G newest + follow"]),
+            k("⏎", &["expand the selected entry"]),
+            k("a", &["errors only (console) · failures only (retrieval)"]),
+            k("end", &["restore follow"]),
+        ],
+    };
+    let fleet = HelpSection {
+        title: "FLEET",
+        items: vec![
+            k("f / 0", &["open SESSIONS (esc clears the query, then closes)"]),
+            k("type", &["live search box — printable keys filter the roster,"]),
+            k("", &["or paste a .jsonl path / session id and ⏎ attaches it"]),
+            k("↑/↓ ⏎", &["move · attach the selected session"]),
+            k("tab", &["list ⇄ SYSTEM-WIDE tab wall (full-screen tanks)"]),
+            k("␣ · x", &["quicklook preview · end session (y confirms)"]),
+        ],
+    };
+
+    // GLYPHS — the palette swatches keep their live colors (rich items)
+    let mut sw: Vec<Span<'static>> = vec![Span::styled(" cats  ".to_string(), fg(C_DIM))];
+    let mut sw_search = String::from("cats palette swatches");
+    for cat in CAT_ORDER {
+        let label: String = cat.label().chars().take(4).collect();
+        sw_search.push(' ');
+        sw_search.push_str(&label);
+        sw.push(Span::styled(format!("█{label} "), fg(cat_color(cat))));
+    }
+    let glyphs = HelpSection {
+        title: "GLYPHS",
+        items: vec![
+            hrich(&sw_search, Line::from(sw)),
+            hrich(
+                "cache palette cr read cc create in uncached",
+                Line::from(vec![
+                    Span::styled(" cache ".to_string(), fg(C_DIM)),
+                    Span::styled("█cr(read) ".to_string(), fg(C_STEEL)),
+                    Span::styled("█cc(create) ".to_string(), fg(C_CYAN)),
+                    Span::styled("█in(uncached) ".to_string(), fg(C_AMBER)),
+                ]),
+            ),
+            hrich(
+                "turns palette cr 5m 1h in wl cmp thr mdl",
+                Line::from(vec![
+                    Span::styled(" turns ".to_string(), fg(C_DIM)),
+                    Span::styled("█cr ".to_string(), fg(C_STEEL)),
+                    Span::styled("█5m ".to_string(), fg(C_CYAN)),
+                    Span::styled("█1h ".to_string(), fg(C_ATTACH)),
+                    Span::styled("█in ".to_string(), fg(C_RED)),
+                    Span::styled("▀wl ".to_string(), fg(C_WLINE)),
+                    Span::styled("▼cmp ".to_string(), fg(C_MAGENTA)),
+                    Span::styled("▲thr ".to_string(), fg(C_RED)),
+                    Span::styled("◆mdl".to_string(), fg(C_WHITE)),
+                ]),
+            ),
+            hrich(
+                "zones thresholds 60% 85% T_auto auto-compact threshold",
+                Line::from(vec![
+                    Span::styled(" zones ".to_string(), fg(C_DIM)),
+                    Span::styled("<60% ".to_string(), fg(C_GREEN)),
+                    Span::styled("<85% ".to_string(), fg(C_AMBER)),
+                    Span::styled("≥85% ".to_string(), fg(C_RED)),
+                    Span::styled("· T_auto rule = auto-compact threshold".to_string(), fg(C_DIM)),
+                ]),
+            ),
+            g("map", &["▀ read · ▄ write/edit · █ both · ▼ cliff · ·░▒▓█ shade"]),
+            g("", &["✝ evicted · ◆ compaction · ▲ thrash · « replay · ┃ playhead"]),
+            g("shell", &["$ prompt · ○ ok · ✖ fail · ^ interrupt · & bg · ▎ stderr"]),
+            g("retr", &["⌕ search · ⇣ fetch · ◆ mcp · # toolsearch · ✖ failed"]),
+        ],
+    };
+
+    let numbers = HelpSection {
+        title: "THE NUMBERS",
+        items: vec![
+            t("R", &[
+                "resident context: exactly what the model was sent last",
+                "turn (input + cache-read + cache-written) vs the budget",
+            ]),
+            t("hot/cold", &[
+                "recency of LAST touch, nothing else: hot = accessed",
+                "within ~2 min (the glow's fade window); cold = still in",
+                "context, just idle. A re-read jumps a file back to hot.",
+            ]),
+            t("AGE O", &[
+                "time since last access (ticking) · its op: r read ·",
+            ]),
+            t("LAST", &[
+                "w write · e edit (NOT execute — Bash lives in SHELL)",
+                "· LAST = that access's token size",
+            ]),
+            t("spark", &["the file's last 8 accesses, height = size (0–16k)"]),
+            t("%res", &["the file's share of resident context R"]),
+            t("waste", &[
+                "tokens ever loaded for the file MINUS its live copy:",
+                "the cumulative price of re-reads and re-writes",
+            ]),
+            t("ku", &[
+                "kilo cost-units, honest relative cost per turn:",
+                "in×1.0 + cache-read×0.1 + 5m-write×1.25 + 1h-write×2.0",
+                "+ out×5.0 · ribbon shows the session total",
+            ]),
+            t("out/t ku/t", &["output tokens per turn · cost per turn"]),
+            t("ag N●", &[
+                "subagents currently running · amp = tokens an agent",
+                "burned in its own window per token returned to yours",
+            ]),
+            t("waterline", &[
+                "end of the cache-served prefix (billed 0.1×) — the MAP",
+                "blinks that boundary cell RED; traces stay cyan",
+            ]),
+            t("thrash", &[
+                "red flash: the waterline FELL — the prefix was",
+                "invalidated and re-billed at full price",
+            ]),
+            t("post-mortem", &[
+                "(EVENTS ⏎ / c) a compaction's autopsy: size",
+                "before/after, dropped tokens by category and by file",
+            ]),
+        ],
+    };
+
+    let anatomy = HelpSection {
+        title: "MAP & TURN ANATOMY",
+        items: vec![
+            t("MAP modes", &["(m) — one geometry, four measures:"]),
+            t("class", &["colored by WHAT each block is (user/file/bash/…)"]),
+            t("heat", &["brightness = how recently touched (45s decay law)"]),
+            t("age", &["shade = how many turns ago it entered — sediment"]),
+            t("cache", &[
+                "last turn's billing: steel = served from cache ·",
+                "cyan = newly cached · amber = uncached (full price);",
+                "the bright cell is the waterline (cache prefix end)",
+            ]),
+            t("TURNS", &["columns, bottom→top (stack top = R by identity):"]),
+            t("█cr", &["tokens read from cache (0.1× — the cheap bulk)"]),
+            t("█5m █1h", &["cache WRITES at the 5-min / 1-hour tier (1.25×/2×)"]),
+            t("█in", &["uncached input (1×) — near-invisible when healthy"]),
+            t("▀wl", &[
+                "prev turn's waterline: below steel top = newly",
+                "cached · floating above = invalidation depth",
+            ]),
+            t("▼cmp", &[
+                "compaction · ▲thr thrash (cache prefix invalidated",
+                "and re-billed) · ◆mdl model switched this turn",
+            ]),
+            t("lanes", &[
+                "out red on truncation · dur brighter with more tools",
+                "· ku red when the cache missed (hit < 50%)",
+            ]),
+        ],
+    };
+
+    // current tab pinned first, then GLOBAL, then everything else in order
+    let tabbed = [overview, files, turns, agents, events, shell];
+    let mut out: Vec<HelpSection> = Vec::with_capacity(11);
+    let mut rest: Vec<HelpSection> = Vec::new();
+    for (i, s) in tabbed.into_iter().enumerate() {
+        if i == tab.min(5) {
+            out.push(s);
+        } else {
+            rest.push(s);
+        }
+    }
+    out.push(global);
+    out.extend(rest);
+    out.push(fleet);
+    out.push(glyphs);
+    out.push(numbers);
+    out.push(anatomy);
+    // section title joins each item's search text, so "/files" finds the tab
+    for s in &mut out {
+        for it in &mut s.items {
+            it.search = format!("{} {}", s.title, it.search).to_lowercase();
+        }
+    }
+    out
+}
+
+pub fn render_help(hs: &mut HelpState, tab: usize, f: &mut Frame<'_>, area: Rect) {
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+    let q = hs.filter.to_lowercase();
+    let mut body: Vec<Line<'static>> = Vec::new();
+    let (mut nsec, mut nhit) = (0usize, 0usize);
+    for (si, sec) in help_sections(tab).into_iter().enumerate() {
+        let items: Vec<HelpItem> = sec
+            .items
+            .into_iter()
+            .filter(|it| q.is_empty() || it.search.contains(&q))
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        nsec += 1;
+        nhit += items.len();
+        if !body.is_empty() {
+            body.push(Line::from(""));
+        }
+        let mut head = vec![Span::styled(
+            format!(" ▸ {}", sec.title),
+            fg(C_STEEL).add_modifier(Modifier::BOLD),
+        )];
+        if si == 0 && q.is_empty() {
+            head.push(Span::styled("  (current tab)".to_string(), fg(C_DIM)));
+        }
+        body.push(Line::from(head));
+        for it in items {
+            body.extend(it.lines);
+        }
+    }
+    if body.is_empty() {
+        body.push(Line::styled(
+            " no matches — esc clears the filter".to_string(),
+            fg(C_DIM),
+        ));
+    }
+
+    // frame: search row + body viewport + footer row inside the border
+    let h = (body.len() as u16 + 4).min(area.height.saturating_sub(2)).max(5);
+    let rect = centered(area, 72, h);
     f.render_widget(Clear, rect);
-    let block = overlay_block(title.to_string());
+    let block = overlay_block("amtr — help".to_string());
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    f.render_widget(Paragraph::new(lines), inner);
+    if inner.height < 3 || inner.width < 4 {
+        return;
+    }
+    let viewh = inner.height as usize - 2;
+    let max_scroll = body.len().saturating_sub(viewh);
+    hs.scroll = hs.scroll.min(max_scroll);
+
+    // row 0 — the filter box (⌕), live like the fleet search
+    let search_line = if hs.typing {
+        Line::from(vec![
+            Span::styled(" ⌕ ".to_string(), fg(C_AMBER)),
+            Span::styled(hs.filter.clone(), fg(C_FG).add_modifier(Modifier::BOLD)),
+            Span::styled("▏".to_string(), fg(C_AMBER)),
+        ])
+    } else if hs.filter.is_empty() {
+        Line::styled(
+            " ⌕ / filter · j/k scroll · g/G ends · esc close".to_string(),
+            fg(C_DIM),
+        )
+    } else {
+        Line::from(vec![
+            Span::styled(" ⌕ ".to_string(), fg(C_AMBER)),
+            Span::styled(hs.filter.clone(), fg(C_FG).add_modifier(Modifier::BOLD)),
+            Span::styled("   / edit · esc clear".to_string(), fg(C_DIM)),
+        ])
+    };
+    f.render_widget(
+        Paragraph::new(search_line),
+        Rect { height: 1, ..inner },
+    );
+
+    // body viewport
+    let visible: Vec<Line<'static>> = body
+        .iter()
+        .skip(hs.scroll)
+        .take(viewh)
+        .cloned()
+        .collect();
+    f.render_widget(
+        Paragraph::new(visible),
+        Rect {
+            y: inner.y + 1,
+            height: viewh as u16,
+            ..inner
+        },
+    );
+
+    // footer — counts left, an 8-cell window bar right when scrollable
+    let left = if q.is_empty() {
+        format!(" {nsec} sections · {nhit} entries")
+    } else {
+        format!(" {nsec} sections · {nhit} matches")
+    };
+    let mut foot: Vec<Span<'static>> = vec![Span::styled(left.clone(), fg(C_DIM))];
+    if max_scroll > 0 {
+        const CELLS: usize = 8;
+        let total = body.len().max(1);
+        let a = hs.scroll * CELLS / total;
+        let b = ((hs.scroll + viewh) * CELLS).div_ceil(total).min(CELLS);
+        let bar: String = (0..CELLS)
+            .map(|i| if i >= a && i < b { '█' } else { '▂' })
+            .collect();
+        let pad = (inner.width as usize)
+            .saturating_sub(left.chars().count() + CELLS + 1);
+        foot.push(Span::raw(" ".repeat(pad)));
+        foot.push(Span::styled(bar, fg(C_STEEL)));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(foot)),
+        Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -14,7 +14,9 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Paragraph};
@@ -135,6 +137,9 @@ struct App {
     /// the open peek overlay (Some ⟺ open). Stored only when the reply
     /// matches the currently selected seg id — stale replies are dropped.
     peek: Option<ipc::PeekMsg>,
+    /// peek body scroll (j/k · wheel); Cell for the map_geom reason —
+    /// render clamps it to the wrapped record's real height
+    peek_scroll: std::cell::Cell<usize>,
 
     // FILES
     file_sel: usize,
@@ -192,7 +197,9 @@ struct App {
 
     // overlays (dispatch priority: help > post-mortem > fleet > tabs)
     show_help: bool,
-    help_page: usize,
+    /// RefCell for the map_geom reason: render clamps the scroll to the
+    /// filtered body's real height, so presses never bank past the bottom
+    help: std::cell::RefCell<viz::HelpState>,
     show_fleet: bool,
     postmortem: Option<usize>,
 
@@ -236,6 +243,7 @@ impl App {
             inspect: false,
             inspect_idx: 0,
             peek: None,
+            peek_scroll: std::cell::Cell::new(0),
             file_sel: 0,
             file_sort: FileSort::Size,
             file_detail: false,
@@ -262,7 +270,7 @@ impl App {
             fleet_kill: None,
             map_geom: std::cell::Cell::new((0, 0)),
             show_help: false,
-            help_page: 0,
+            help: std::cell::RefCell::new(viz::HelpState::default()),
             show_fleet: false,
             postmortem: None,
             map_mode: MapMode::Class,
@@ -443,6 +451,7 @@ impl App {
             // arrived) must never open an overlay for the wrong segment.
             if self.inspect && self.selected_seg_id() == Some(p.seg) {
                 self.peek = Some(p.clone());
+                self.peek_scroll.set(0); // a fresh record starts at the top
                 self.dirty = true;
             }
             return; // UI-modal state; never session state
@@ -732,15 +741,51 @@ impl App {
         self.dirty = true;
 
         if self.show_help {
+            // searchable browser: `/` types into the filter (fleet idiom),
+            // j/k scroll (render clamps), esc clears the filter then closes
+            let hs = self.help.get_mut();
+            if hs.typing {
+                match code {
+                    KeyCode::Esc => {
+                        hs.typing = false;
+                        hs.filter.clear();
+                        hs.scroll = 0;
+                    }
+                    KeyCode::Enter => hs.typing = false,
+                    KeyCode::Backspace => {
+                        hs.filter.pop();
+                        hs.scroll = 0;
+                    }
+                    KeyCode::Char(c) => {
+                        hs.filter.push(c);
+                        hs.scroll = 0;
+                    }
+                    _ => {}
+                }
+                return;
+            }
             match code {
                 KeyCode::Char('q') => self.quit(),
-                // ?/→/j page forward, ←/k back — the glossary lives here
-                KeyCode::Char('?') | KeyCode::Right | KeyCode::Char('j') => {
-                    self.help_page = (self.help_page + 1) % viz::HELP_PAGES;
+                KeyCode::Char('/') => hs.typing = true,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    hs.scroll = hs.scroll.saturating_add(1);
                 }
-                KeyCode::Left | KeyCode::Char('k') => {
-                    self.help_page =
-                        (self.help_page + viz::HELP_PAGES - 1) % viz::HELP_PAGES;
+                KeyCode::Char('k') | KeyCode::Up => {
+                    hs.scroll = hs.scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => hs.scroll = hs.scroll.saturating_add(10),
+                KeyCode::PageUp => hs.scroll = hs.scroll.saturating_sub(10),
+                KeyCode::Char('g') | KeyCode::Home => hs.scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => {
+                    hs.scroll = usize::MAX; // render clamps to the bottom
+                }
+                KeyCode::Esc => {
+                    if hs.filter.is_empty() {
+                        self.show_help = false;
+                    } else {
+                        hs.filter.clear();
+                        hs.scroll = 0;
+                    }
                 }
                 _ => self.show_help = false,
             }
@@ -765,6 +810,15 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => self.peek = None,
                 KeyCode::Char('q') => self.quit(),
+                // j/k scroll the record (arrows stay parked for the walk)
+                KeyCode::Char('j') => {
+                    self.peek_scroll.set(self.peek_scroll.get().saturating_add(1));
+                }
+                KeyCode::Char('k') => {
+                    self.peek_scroll.set(self.peek_scroll.get().saturating_sub(1));
+                }
+                KeyCode::Char('g') => self.peek_scroll.set(0),
+                KeyCode::Char('G') => self.peek_scroll.set(usize::MAX), // render clamps
                 _ => {}
             }
             return;
@@ -1334,12 +1388,63 @@ impl App {
         }
     }
 
+    /// Mouse wheel — routed to the active overlay with the SAME priority as
+    /// key dispatch (help > post-mortem > peek > fleet), each getting its
+    /// natural semantic: content overlays scroll (3 lines per notch, the
+    /// terminal-emulator convention), navigation overlays move the
+    /// selection. With nothing open the wheel is inert — no redraw.
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let up = matches!(m.kind, MouseEventKind::ScrollUp);
+        if !up && !matches!(m.kind, MouseEventKind::ScrollDown) {
+            return;
+        }
+        if self.show_help {
+            let hs = self.help.get_mut();
+            hs.scroll = if up {
+                hs.scroll.saturating_sub(3)
+            } else {
+                hs.scroll.saturating_add(3)
+            };
+        } else if let Some(i) = self.postmortem {
+            // walk the compaction history: up = older, down = newer (←/→)
+            self.postmortem = Some(if up {
+                i.saturating_sub(1)
+            } else {
+                (i + 1).min(self.st.compactions.len().saturating_sub(1))
+            });
+        } else if self.peek.is_some() {
+            let s = self.peek_scroll.get();
+            self.peek_scroll.set(if up {
+                s.saturating_sub(3)
+            } else {
+                s.saturating_add(3) // render clamps to the record's end
+            });
+        } else if self.fleet_peek.is_some() || self.fleet_kill.is_some() {
+            return; // modal confirms/quicklooks: the wheel is parked
+        } else if self.show_fleet {
+            // list AND tab wall share linear selection semantics
+            self.fleet_sel = if up {
+                self.fleet_sel.saturating_sub(1)
+            } else {
+                let n = if self.system_wide {
+                    viz::fleet_live_rows(&self.st).len()
+                } else {
+                    viz::fleet_rows_filtered(&self.st, &self.fleet_query).len()
+                };
+                (self.fleet_sel + 1).min(n.saturating_sub(1))
+            };
+        } else {
+            return;
+        }
+        self.dirty = true;
+    }
+
     fn on_key_global(&mut self, code: KeyCode, shift: bool) {
         match code {
             KeyCode::Char('q') => self.quit(),
             KeyCode::Char('?') => {
                 self.show_help = true;
-                self.help_page = 0;
+                *self.help.get_mut() = viz::HelpState::default();
             }
             KeyCode::Char(c @ '1'..='6') => {
                 self.tab = (c as usize) - ('1' as usize);
@@ -1636,13 +1741,13 @@ fn render_all(f: &mut Frame<'_>, app: &App) {
         viz::render_kill_confirm(name, f, area);
     }
     if let Some(p) = &app.peek {
-        viz::render_peek_overlay(&app.st, p, f, area);
+        viz::render_peek_overlay(&app.st, p, &app.peek_scroll, f, area);
     }
     if let Some(i) = app.postmortem {
         viz::render_postmortem(&app.st, i, f, area);
     }
     if app.show_help {
-        viz::render_help(app.help_page, f, area);
+        viz::render_help(&mut app.help.borrow_mut(), app.tab, f, area);
     }
 }
 
@@ -1924,6 +2029,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
         while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
+                Event::Mouse(m) => app.on_mouse(m),
                 Event::Resize(_, _) => app.dirty = true,
                 _ => {}
             }
@@ -2014,7 +2120,18 @@ fn main() -> std::io::Result<()> {
 
     let mut app = App::new(tx, rx);
     let mut terminal = ratatui::init(); // installs a restoring panic hook
+    // mouse capture (wheel scroll): ratatui's init/restore does not manage
+    // it, so enable here, release on every exit path — including panic,
+    // where the chained hook releases it BEFORE ratatui's restoring hook
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), event::EnableMouseCapture);
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ =
+            ratatui::crossterm::execute!(std::io::stdout(), event::DisableMouseCapture);
+        prev_hook(info);
+    }));
     let res = run(&mut terminal, &mut app);
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), event::DisableMouseCapture);
     ratatui::restore(); // restore-first shutdown
 
     app.stop_amtr3d("amtr3d bridge stopped"); // never orphan the bridge
@@ -2463,38 +2580,125 @@ mod screenshots {
     }
 
     #[test]
-    fn help_glossary_pages() {
+    fn help_filter_and_scroll() {
         let mut app = demo_app();
         app.show_help = true;
-        // page 2: the numbers
-        press(&mut app, KeyCode::Char('?'));
-        let s = draw(&mut app, 80, 24);
-        for needed in ["hot/cold", "waste", "ku", "spark", "%res", "post-mortem"] {
-            assert!(s.contains(needed), "numbers page missing {needed}:
-{s}");
+        // `/waterline` filters every section live; unrelated entries vanish
+        press(&mut app, KeyCode::Char('/'));
+        for c in "waterline".chars() {
+            press(&mut app, KeyCode::Char(c));
         }
-        // page 3: modes & anatomy
-        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Enter); // confirm, keep the filter
         let s = draw(&mut app, 80, 24);
-        for needed in ["MAP modes", "cache", "▀wl", "▲thr", "◆mdl"] {
-            assert!(s.contains(needed), "anatomy page missing {needed}:
-{s}");
-        }
-        // wraps back to keys; ←/k go back; any other key closes
-        press(&mut app, KeyCode::Char('?'));
-        assert_eq!(app.help_page, 0);
-        press(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.help_page, 2);
+        assert!(s.contains("waterline"), "filtered term missing:\n{s}");
+        assert!(s.contains("matches"), "match count footer missing:\n{s}");
+        assert!(!s.contains("amtr3d"), "non-matching entry leaked through:\n{s}");
+        // esc clears the filter (help stays open), second esc closes
+        press(&mut app, KeyCode::Esc);
+        assert!(app.show_help, "first esc must only clear the filter");
+        assert!(app.help.get_mut().filter.is_empty());
         press(&mut app, KeyCode::Esc);
         assert!(!app.show_help);
+
+        // scroll: G lands on the bottom (clamped), g returns to the top;
+        // deep content (MAP & TURN ANATOMY) is reachable without paging
+        let mut app = demo_app();
+        app.show_help = true;
+        press(&mut app, KeyCode::Char('G'));
+        let s = draw(&mut app, 80, 24);
+        assert!(s.contains("◆mdl"), "bottom of the browser unreachable:\n{s}");
+        assert!(
+            app.help.get_mut().scroll < usize::MAX,
+            "render must clamp the scroll"
+        );
+        press(&mut app, KeyCode::Char('g'));
+        let s = draw(&mut app, 80, 24);
+        assert!(s.contains("current tab"), "top pin missing after g:\n{s}");
+    }
+
+    #[test]
+    fn help_mouse_wheel_scroll() {
+        let wheel = |app: &mut App, kind: MouseEventKind| {
+            app.on_mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        let mut app = demo_app();
+        app.show_help = true;
+        // one notch = 3 lines down; render clamps just like j/k
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.help.get_mut().scroll, 3);
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(app.help.get_mut().scroll, 0);
+        wheel(&mut app, MouseEventKind::ScrollUp); // at top: clamps, no panic
+        assert_eq!(app.help.get_mut().scroll, 0);
+        // wheel is inert when help is closed
+        app.show_help = false;
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.help.get_mut().scroll, 0);
+    }
+
+    #[test]
+    fn overlay_wheel_dispatch() {
+        let wheel = |app: &mut App, kind: MouseEventKind| {
+            app.on_mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        // post-mortem: wheel walks the compaction history, clamped
+        let mut app = demo_app();
+        let n = app.st.compactions.len();
+        app.postmortem = Some(0);
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(app.postmortem, Some(0), "older-than-first must clamp");
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.postmortem, Some(1.min(n - 1)));
+        // peek: wheel scrolls the record; render clamps to its real height
+        let mut app = demo_app();
+        app.peek = Some(ipc::PeekMsg {
+            excerpt: (0..40).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+            ..pk(3, true, "assistant", Some("assistant"), None, "", false)
+        });
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.peek_scroll.get(), 3);
+        let s = draw(&mut app, 110, 30);
+        assert!(s.contains("j/k scroll"), "scroll range footer missing:\n{s}");
+        app.peek_scroll.set(usize::MAX);
+        let _ = draw(&mut app, 110, 30);
+        assert!(app.peek_scroll.get() < usize::MAX, "render must clamp peek scroll");
+        let s = draw(&mut app, 110, 30);
+        assert!(s.contains("line 39"), "bottom of the record unreachable:\n{s}");
+        // fleet list: wheel moves the selection
+        let mut app = demo_app();
+        app.show_fleet = true;
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.fleet_sel, 1);
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(app.fleet_sel, 0);
+        // kill-confirm parks the wheel entirely
+        app.fleet_kill = Some(("s".into(), "n".into()));
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.fleet_sel, 0, "wheel must be parked under a modal");
     }
 
     #[test]
     fn help_overlay_semantics() {
         let mut app = demo_app();
         app.show_help = true;
-        let s = draw(&mut app, 80, 24);
-        assert!(s.contains("keys + legend"), "help title missing:\n{s}");
+        // tall terminal: the whole browser fits, nothing hides below the fold
+        let s = draw(&mut app, 80, 160);
+        assert!(s.contains("amtr — help"), "help title missing:\n{s}");
+        assert!(s.contains("⌕"), "filter box missing:\n{s}");
+        assert!(s.contains("OVERVIEW"), "current-tab section missing:\n{s}");
+        assert!(s.contains("current tab"), "current-tab pin missing:\n{s}");
+        assert!(s.contains("GLOBAL"), "global section missing:\n{s}");
+        assert!(s.contains("FLEET"), "fleet section missing:\n{s}");
         assert!(s.contains("waterline"), "waterline explanation missing:\n{s}");
         assert!(s.contains("thrash"), "thrash explanation missing:\n{s}");
         assert!(s.contains("▲ thrash"), "glyph dictionary missing:\n{s}");
@@ -2502,6 +2706,16 @@ mod screenshots {
         assert!(s.contains("█over"), "palette swatches missing:\n{s}");
         assert!(s.contains("█reas"), "reasoning swatch missing:\n{s}");
         assert!(s.contains("█summ"), "palette swatches clipped:\n{s}");
+        assert!(s.contains("sections"), "footer counts missing:\n{s}");
+        // the pinned section follows the active tab
+        let mut app = demo_app();
+        app.tab = 5;
+        app.show_help = true;
+        let s = draw(&mut app, 80, 24);
+        assert!(
+            s.contains("SHELL") && s.contains("current tab"),
+            "SHELL not pinned on top for tab 6:\n{s}"
+        );
     }
 
     #[test]
