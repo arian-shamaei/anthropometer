@@ -420,6 +420,9 @@ impl App {
                 .map(|old| old.session_id != m.session_id)
                 .unwrap_or(true);
             if switched {
+                // palette export follows the attach (SPEC e): companion
+                // front ends match their gradient to this session's tank
+                viz::export_palette(&m.session_id);
                 // amtr3d follows the instrument: restart the bridge on the
                 // new session once its meta has been applied (run-loop poll).
                 if self.amtr3d_bridge.is_some() {
@@ -1513,6 +1516,9 @@ impl App {
             }
             KeyCode::Char(' ') => {
                 viz::reroll_palette();
+                if let Some(m) = &self.st.meta {
+                    viz::export_palette(&m.session_id);
+                }
                 self.st.push_log("tank palette rerolled".into());
             }
             KeyCode::Tab => {

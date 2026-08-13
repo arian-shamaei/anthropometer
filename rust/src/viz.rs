@@ -227,6 +227,36 @@ pub fn art_palette() -> [(u8, u8, u8); 4] {
     gen_palette(base.wrapping_add(PAL_ROLL.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
+/// The palette-export payload (SPEC e): pure, testable.
+pub fn palette_export_json(session_id: &str, pal: &[(u8, u8, u8); 4]) -> String {
+    let stops: Vec<String> = pal
+        .iter()
+        .map(|(r, g, b)| format!("[{r},{g},{b}]"))
+        .collect();
+    format!(
+        r#"{{"pid":{},"session":"{}","palette":[{}]}}"#,
+        std::process::id(),
+        session_id,
+        stops.join(",")
+    )
+}
+
+/// SPEC e (palette export): companion front ends (the amtrino menu bar app)
+/// match their single-session gradient to the TUI's big-gauge tank. Written
+/// on attach and on reroll, atomic tmp+rename, last-writer-wins across
+/// instances; consumers honor it only while `pid` is alive and `session`
+/// matches theirs.
+pub fn export_palette(session_id: &str) {
+    let json = palette_export_json(session_id, &art_palette());
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let dir = std::path::Path::new(&home).join(".claude").join("amtr");
+    let _ = std::fs::create_dir_all(&dir);
+    let tmp = dir.join(".palette.json.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join("palette.json"));
+    }
+}
+
 /// Sample a 4-stop palette at t ∈ 0..=1 (piecewise-linear).
 pub fn palette_color(stops: &[(u8, u8, u8); 4], t: f64) -> (u8, u8, u8) {
     let t = t.clamp(0.0, 1.0) * 3.0;
