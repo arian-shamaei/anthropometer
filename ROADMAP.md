@@ -4,8 +4,10 @@
 and issues/PRs are welcome.
 
 ## Near term
-- **amtrino release channel** — zip + cask for the new menu bar companion
-  (`menubar/`, built by `packaging/build-menubar.sh`); CI build on tag.
+- **amtrino** — the menu bar companion now lives in its own repo
+  ([arian-shamaei/amtrino](https://github.com/arian-shamaei/amtrino));
+  a Mac App Store edition would need a sandboxed Swift-native scanner
+  fork (no tmux jump, folder-grant access) — parked unless demand shows.
 - **Prebuilt binaries + one-line installer** — `curl … | sh` and release archives for
   macOS/Linux, so trying it needs no `cargo` or tap.
 - **Broader terminal coverage** — verify glyph rendering (blocks/braille) across common

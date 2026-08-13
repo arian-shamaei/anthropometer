@@ -9,5 +9,3 @@ __pycache__/
 /*.gif
 /scratch/
 
-# swift build products (menubar companion)
-menubar/.build/

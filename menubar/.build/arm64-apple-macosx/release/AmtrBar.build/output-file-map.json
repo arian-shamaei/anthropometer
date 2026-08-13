@@ -1,0 +1,121 @@
+{
+  "": {
+    "dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AmtrBar.d",
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AmtrBar.o",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/primary.swiftdeps"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/AmtrPalette.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AmtrPalette.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AmtrPalette~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AmtrPalette.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AmtrPalette.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/AppDelegate.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AppDelegate.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AppDelegate~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AppDelegate.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AppDelegate.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/AppIcon.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AppIcon.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AppIcon~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AppIcon.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/AppIcon.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/BugReport.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/BugReport.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/BugReport~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/BugReport.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/BugReport.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/FleetClient.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/FleetClient.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/FleetClient~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/FleetClient.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/FleetClient.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/FleetStore.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/FleetStore.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/FleetStore~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/FleetStore.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/FleetStore.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/HelpPanel.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/HelpPanel.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/HelpPanel~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/HelpPanel.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/HelpPanel.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/IconRenderer.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/IconRenderer.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/IconRenderer~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/IconRenderer.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/IconRenderer.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/Legend.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Legend.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Legend~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Legend.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Legend.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/MenuAssign.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/MenuAssign.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/MenuAssign~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/MenuAssign.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/MenuAssign.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/Model.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Model.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Model~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Model.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Model.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/NotifyTest.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/NotifyTest.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/NotifyTest~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/NotifyTest.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/NotifyTest.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/Palette.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Palette.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Palette~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Palette.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Palette.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/Selfcheck.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Selfcheck.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Selfcheck~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Selfcheck.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Selfcheck.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/SessionFocus.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/SessionFocus.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/SessionFocus~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/SessionFocus.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/SessionFocus.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/Settings.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Settings.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Settings~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Settings.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/Settings.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/ThemeManager.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/ThemeManager.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/ThemeManager~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/ThemeManager.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/ThemeManager.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Sources/AmtrBar/main.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/main.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/main~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/main.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/main.dia"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/DerivedSources/resource_bundle_accessor.swift": {
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/resource_bundle_accessor.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/resource_bundle_accessor~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/resource_bundle_accessor.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/release/AmtrBar.build/resource_bundle_accessor.dia"
+  }
+}

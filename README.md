@@ -257,24 +257,13 @@ the real engine and require every emitted line to parse.
 
 ## amtrino — menu bar companion (macOS)
 
-The system-wide wall, shrunk to the menu bar: every live Claude Code session
-as a dot in a 3×3 grid — identity-colored with the same per-session palette
-as the TUI's tiles, pulsing while a session responds, flashing when a
-response finishes, amber-ringed when stalled. Or single-session mode: one
-session as a draining gradient tank, or a plain `NN%` context readout.
-Click the icon to pick sessions, switch modes, or enable a macOS
-notification on every finished response.
-
-It is a separate, optional app — it bundles its own copy of the engine
-(fleet feed only) and does not need the TUI installed:
-
-```
-sh packaging/build-menubar.sh        # → menubar/.build/amtrino.app
-open menubar/.build/amtrino.app
-```
-
-Requires macOS 13+ and `python3` on PATH. A Homebrew cask (`amtrino`) ships
-in the tap once release zips are published.
+**[amtrino](https://github.com/arian-shamaei/amtrino)** is amtr's menu bar
+sibling, now its own repo: every live agent session (Claude Code + Codex
+CLI) as an identity-colored dot in a 3×3 grid — pulsing while responding,
+flashing when finished, click a notification to jump to the session's
+tmux pane. It consumes the engine's headless fleet feed (SPEC §f2) and is
+fully standalone — notarized releases at
+[amtrino/releases](https://github.com/arian-shamaei/amtrino/releases).
 
 ## Repository layout
 
@@ -283,9 +272,8 @@ SPEC.md            the normative protocol + view contract
 amtr_engine.py     the engine: discovery, tailing, accounting, checkpoints, replay
 amtr_paper.py      the PDF report builder (amtr_figures/_turns/_phases support it)
 rust/              the TUI (cargo test runs a headless screenshot suite)
-menubar/           amtrino, the macOS menu bar companion (Swift, SPM)
 tests/             engine test suite + synthetic fixtures
-packaging/homebrew the Homebrew formula + tap runbook + amtrino cask
+packaging/homebrew the Homebrew formula + tap runbook
 docs/assets/       screenshots and figures for this README
 ```
 

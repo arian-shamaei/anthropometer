@@ -1,0 +1,19 @@
+{
+  "fill" : {
+    "solid" : "srgb:0.094,0.102,0.129,1.0"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "dots.png",
+          "name" : "dots"
+        }
+      ]
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [ "watchOS" ],
+    "squares" : "shared"
+  }
+}

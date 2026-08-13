@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/debug/AmtrBarTests.build/primary.swiftdeps"
+  },
+  "/Users/arianshamaei/Developer/anthropometer/menubar/Tests/AmtrBarTests/PaletteTests.swift": {
+    "dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/debug/AmtrBarTests.build/PaletteTests.d",
+    "object": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/debug/AmtrBarTests.build/PaletteTests.swift.o",
+    "swiftmodule": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/debug/AmtrBarTests.build/PaletteTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/debug/AmtrBarTests.build/PaletteTests.swiftdeps",
+    "diagnostics": "/Users/arianshamaei/Developer/anthropometer/menubar/.build/arm64-apple-macosx/debug/AmtrBarTests.build/PaletteTests.dia"
+  }
+}
