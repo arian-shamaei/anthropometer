@@ -16,8 +16,10 @@ final class HelpView: NSView {
     private var sceneStart = Date()
 
     // scene lengths (seconds); each scene loops its own animation and
-    // auto-advances, arrows jump directly
-    private let lens: [Double] = [5.0, 4.5, 4.0, 3.5, 5.0]
+    // auto-advances, arrows jump directly. Scene 0 is the WELCOME page —
+    // shown first on every open, and the app opens this window on its
+    // very first launch.
+    private let lens: [Double] = [4.5, 5.0, 4.5, 4.0, 3.5, 5.0]
 
     func start() {
         sceneIx = 0
@@ -176,6 +178,32 @@ final class HelpView: NSView {
 
         switch scene {
         case 0:
+            // WELCOME: the nine dots fly into formation, staggered
+            let center = NSPoint(x: bounds.width / 2,
+                                 y: bounds.height * 0.58)
+            for i in 0..<9 {
+                let target = nodeCenter(i, c: center, d: 34, gap: 8)
+                let angle = Double(i) * 0.7 + 0.4
+                let from = NSPoint(
+                    x: center.x + CGFloat(cos(angle)) * bounds.width * 0.7,
+                    y: center.y + CGFloat(sin(angle)) * bounds.height * 0.7)
+                let k = ease((t - 0.12 * Double(i)) / 1.1)
+                let p = NSPoint(x: from.x + (target.x - from.x) * CGFloat(k),
+                                y: from.y + (target.y - from.y) * CGFloat(k))
+                IconRenderer.statusDotImage(
+                    mk(demoIds[i], k >= 1 ? "busy" : "idle"),
+                    r: 9, canvas: 24, now: now)
+                    .draw(in: NSRect(x: p.x - 12, y: p.y - 12,
+                                     width: 24, height: 24))
+            }
+            ("every agent session on your Mac, at a glance"
+                as NSString).draw(
+                at: NSPoint(x: 24, y: 40),
+                withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 12),
+                    .foregroundColor: NSColor.secondaryLabelColor])
+            caption("welcome to amtrino")
+        case 1:
             // nodes ⇄ bar: light matching positions in step
             let hi = Int(t / 0.55) % 9
             for i in 0..<9 {
@@ -185,7 +213,7 @@ final class HelpView: NSView {
             }
             drawBarIcon(center: barC, highlight: hi, now: now)
             caption("nodes represent sessions")
-        case 1:
+        case 2:
             // drag = pin: a dot flies from below onto node 2
             for i in 0..<9 where i != 1 {
                 drawNode(i, at: nodeCenter(i, c: gridC, d: d, gap: gap), d: d,
@@ -208,7 +236,7 @@ final class HelpView: NSView {
                 pointer(at: NSPoint(x: p.x + 6, y: p.y - 4), pressed: true)
             }
             caption("drag session to pin")
-        case 2:
+        case 3:
             // click = gap: node 4 empties, the bar shows the gap
             let clickT = 1.2
             let clicked = t > clickT
@@ -223,7 +251,7 @@ final class HelpView: NSView {
             pointer(at: NSPoint(x: np.x + 6, y: np.y - 4),
                     pressed: abs(t - clickT) < 0.35)
             caption("click node to remove session pin")
-        case 3:
+        case 4:
             // click again = refill
             let clickT = 1.0
             let refilled = t > clickT

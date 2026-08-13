@@ -92,10 +92,38 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force --sign - "$APP/Contents/MacOS/amtrino"
-codesign --force --sign - "$APP"
+# signing: Developer ID + hardened runtime when the cert exists
+# (notarizable); ad-hoc otherwise (local dev). $AMTRINO_SIGN_ID overrides.
+SIGN_ID="${AMTRINO_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
+  | awk -F'"' '/Developer ID Application/{print $2; exit}')}"
+if [ -n "$SIGN_ID" ]; then
+  echo "signing: $SIGN_ID (hardened runtime)"
+  codesign --force --options runtime --timestamp --sign "$SIGN_ID" \
+    "$APP/Contents/MacOS/amtrino"
+  codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$APP"
+else
+  echo "signing: ad-hoc (no Developer ID Application cert found)"
+  codesign --force --sign - "$APP/Contents/MacOS/amtrino"
+  codesign --force --sign - "$APP"
+fi
 
 # the build gate: golden palette parity + wire model + engine resolution
 "$APP/Contents/MacOS/amtrino" --selfcheck
+
+# notarization: runs when signed with Developer ID AND credentials are
+# stored (one-time: xcrun notarytool store-credentials amtrino
+#   --apple-id <you> --team-id <TEAM> --password <app-specific-password>)
+if [ -n "$SIGN_ID" ] && DEVELOPER_DIR=/Applications/Xcode.app \
+     xcrun notarytool history --keychain-profile amtrino >/dev/null 2>&1; then
+  echo "notarizing (keychain profile: amtrino)…"
+  ditto -c -k --keepParent "$APP" .build/amtrino-notarize.zip
+  DEVELOPER_DIR=/Applications/Xcode.app xcrun notarytool submit \
+    .build/amtrino-notarize.zip --keychain-profile amtrino --wait
+  DEVELOPER_DIR=/Applications/Xcode.app xcrun stapler staple "$APP"
+  echo "notarized + stapled"
+elif [ -n "$SIGN_ID" ]; then
+  echo "notarization skipped: no 'amtrino' keychain profile" \
+       "(xcrun notarytool store-credentials amtrino …)"
+fi
 
 echo "built $APP (v${VERSION})"

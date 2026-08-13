@@ -32,6 +32,11 @@ Dev affordances: `AMTRINO_ENGINE=/path/to/amtr_engine.py` overrides the
 bundled engine; `AMTRINO_DUMP=/tmp/frame.png` writes every rendered icon
 frame for visual validation.
 
+Release signing: `build-menubar.sh` auto-signs with a Developer ID
+Application cert (hardened runtime) when one is in the keychain, then
+notarizes + staples when `xcrun notarytool store-credentials amtrino`
+has been run once; otherwise it falls back to ad-hoc (local dev).
+
 The golden palette values in `Selfcheck.swift` are pinned against
 `rust/src/main.rs::palette_golden_cross_language` — update both only on a
 deliberate palette change.

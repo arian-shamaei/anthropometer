@@ -81,6 +81,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         client.start()
         redraw()
+
+        // very first launch: greet with the welcome/help tour (once)
+        if !Settings.hasSeenWelcome {
+            Settings.hasSeenWelcome = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                HelpPanel.shared.show()
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

@@ -125,6 +125,12 @@ struct Settings {
         set { d.set(newValue, forKey: "notifyOnFinish") }
     }
 
+    /// First-launch flag: the app opens the welcome/help tour once.
+    static var hasSeenWelcome: Bool {
+        get { d.bool(forKey: "hasSeenWelcome") }
+        set { d.set(newValue, forKey: "hasSeenWelcome") }
+    }
+
     /// Active theme, raw: a builtin's rawValue, or "custom:<name>".
     static var themeRaw: String {
         get { d.string(forKey: "theme") ?? Theme.identity.rawValue }
