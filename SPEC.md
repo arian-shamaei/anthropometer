@@ -169,7 +169,10 @@ strings on the wire ("HH:MM:SS") are UTC, including engine-synthesized events.
 Sub-objects:
 
 - `Sess = {id:str, path:str, pid:int|null, name:str|null, project:str, status:str,
-  mtime:float, live:bool, resident:int|null, budget:int|null, last_prompt:str|null}`
+  mtime:float, live:bool, resident:int|null, budget:int|null, last_prompt:str|null,
+  tmux:str|null}` — `tmux` (additive) is the roster's `session:@window.%pane`
+  locator when the session is tmux-hosted; front ends may use it to focus the
+  session (amtrino's notification click)
 - `Seg  = {id:int, cat:str, tok:int, file:int|null, born:int (turn), ts:float (epoch
   of last access)}`
 - `Fit  = {active:bool, mode:"cats"|"scale"|"prior", reason:str, turns:int,
@@ -626,6 +629,16 @@ Global: `q` quit · `?` help · `1–5` tabs · `f`/`0` fleet · `p` pause rende
 `End`/`Esc` LIVE · `m` MAP mode · `c` latest post-mortem · `R` write report ·
 `+/-` MAP rung override.
 
+**Palette export.** On attach (meta with a NEW session id) and on tank
+reroll the UI writes `~/.claude/amtr/palette.json` — one JSON object
+`{pid:int, session:str, palette:[[r,g,b]×4]}`, atomic tmp+rename,
+last-writer-wins across instances — so companion front ends (the amtrino
+menu bar app) can match their gradient view to the big-gauge tank.
+Consumers MUST honor it only while `pid` is alive and `session` equals the
+session they are rendering; absent, stale, or foreign files fall back to
+the deterministic per-session palette (`sess_seed`). The export is an
+optional courtesy: neither side may depend on the other being installed.
+
 `x` (amtr3d mode) toggles the memspace bridge: a child process (env
 `AMTR3D_BRIDGE`, default `~/Projects/amtr3d/bridge/amtr-bridge.py`) serving
 this session's Update stream on `0.0.0.0:4517` (Bonjour-advertised) so the
@@ -700,6 +713,50 @@ The report is markdown, ground truth first, sections in this order:
 as arrays) for automation. Authoritative vs estimated labeling is preserved
 in both formats. All numbers must reconcile with the live instrument's
 (same Session accounting — the report is a RENDERING, never a re-derivation).
+
+## (f2) FLEET feed — headless roster stream
+
+`python3 amtr_engine.py --fleet [--poll-secs N] [--live-only]` — no TUI, no
+Control channel: emit the `fleet` Update message (§b, identical payload) as
+JSON lines on fd 1, change-detected on an N-second roster scan (default 2 s,
+floor 0.5), first emission immediate; every quiet tick emits `{"type":"hb"}`
+instead (liveness + closed-pipe detection — the process exits 0 within one
+poll of its consumer closing the pipe). `--live-only` drops the
+recent-transcript tail (a menu bar has no use for 500 offline rows). The
+stream obeys the §b wire rules — `log` lines share it and unknown types MUST
+be ignored by consumers. This is the data feed for external front ends (the
+menu bar companion, scripts); like the amtr3d bridge, a consumer spawns its
+OWN engine instance — nothing subscribes to a running amtr.
+
+Two fleet-row refinements ship with this mode and apply everywhere fleet rows
+are built (TUI picker included):
+
+- **Per-row budget** — a row's `budget` is the engine budget auto-bumped to
+  the next rung that fits the row's OWN `resident` (§a auto-bump applied per
+  row; `--budget` still pins). Without this a 1M session in a mixed fleet
+  renders against the 200k global window.
+- **Fleet-wide stall** — roster `busy` with transcript mtime older than 120 s
+  ⇒ `stalled` (§a health rule; mtime is the only growth signal available for
+  unattached sessions; an unknown transcript never stalls). The picker's
+  `◐stalled` glyph is thereby reachable for non-attached rows.
+- **One row per sessionId** — a resumed session can leave a stale roster
+  file whose old pid was since reused (`kill -0` passes), duplicating the
+  session; among duplicates the alive entry with the newest `updatedAt`
+  wins. Consumers still MUST tolerate duplicates (version-drift law).
+- **Providers (additive)** — the feed MAY append rows for OTHER local agent
+  CLIs, tagged `provider:str` (absent ⇒ claude). v1 ships a Codex adapter.
+  Codex append-closes its rollout files (open-file discovery is impossible)
+  and a session that has not taken a prompt has no rollout at all, so the
+  pairing law is: each live `codex` process (process scan) claims the
+  newest unclaimed non-subagent rollout (`~/.codex/sessions/**.jsonl`,
+  last two day-dirs) whose `session_meta.cwd` matches the process cwd and
+  whose mtime is not older than the process start. Status from the
+  rollout's `task_started`/`task_complete` events (event-precise),
+  `resident` = last `token_count` `last_token_usage.input_tokens`,
+  `budget` = `model_context_window`, `last_prompt` from `user_message`,
+  tmux locator by pane-tty match. Provider rows appear ONLY in this feed —
+  the TUI cannot attach a non-Claude transcript, so they never enter its
+  picker.
 
 ## (g) Demo / visual-testbench mode
 

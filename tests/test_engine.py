@@ -1375,5 +1375,83 @@ class TestFleetPeek(unittest.TestCase):
         self.assertEqual(len(ce.transcript_tail_msgs(p, max_msgs=12)), 12)
 
 
+class TestFleetRows(unittest.TestCase):
+    """SPEC f2: fleet-row status ladder and per-row budget."""
+
+    def test_status_ladder(self):
+        now = 1000.0
+        # dead pid wins over everything
+        self.assertEqual(ce.fleet_row_status("busy", False, now, now), "dead")
+        # roster value verbatim while fresh
+        self.assertEqual(ce.fleet_row_status("busy", True, now - 10, now),
+                         "busy")
+        self.assertEqual(ce.fleet_row_status("idle", True, now - 999, now),
+                         "idle")
+        self.assertEqual(ce.fleet_row_status("shell", True, now - 999, now),
+                         "shell")
+        # busy + transcript quiet > 120 s => stalled
+        self.assertEqual(ce.fleet_row_status("busy", True, now - 121, now),
+                         "stalled")
+        # unknown transcript (mtime 0) never stalls
+        self.assertEqual(ce.fleet_row_status("busy", True, 0.0, now), "busy")
+        # absent roster status defaults idle
+        self.assertEqual(ce.fleet_row_status(None, True, now, now), "idle")
+
+    def test_row_budget_bumps_to_fit_resident(self):
+        b200, b1m = ce.BUDGET_RUNGS
+        self.assertEqual(ce.fleet_budget(b200, None), b200)
+        self.assertEqual(ce.fleet_budget(b200, 150_000), b200)
+        self.assertEqual(ce.fleet_budget(b200, 600_000), b1m)   # the fix
+        self.assertEqual(ce.fleet_budget(b200, 2_000_000), b1m)  # clamp
+        self.assertEqual(ce.fleet_budget(b1m, 100_000), b1m)     # never down
+
+    def test_codex_tail_parse(self):
+        # SPEC f2 providers: event-precise status + usage from rollout tails
+        def ev(ts, ptype, **kw):
+            return json.dumps({"timestamp": ts, "type": "event_msg",
+                               "payload": dict({"type": ptype}, **kw)})
+        busy = [ev("T1", "task_started"),
+                ev("T2", "token_count", info={
+                    "last_token_usage": {"input_tokens": 19070},
+                    "model_context_window": 258400}),
+                ev("T3", "user_message", message="fix the bug")]
+        got = ce.codex_tail_parse(busy)
+        self.assertEqual(got["status"], "busy")
+        self.assertEqual(got["resident"], 19070)
+        self.assertEqual(got["budget"], 258400)
+        self.assertEqual(got["last_prompt"], "fix the bug")
+        # task_complete after the start => idle
+        idle = busy + [ev("T4", "task_complete")]
+        self.assertEqual(ce.codex_tail_parse(idle)["status"], "idle")
+        # malformed lines and unknown events are skipped, not fatal
+        noisy = ["not json", ev("T5", "web_search_end")] + busy
+        self.assertEqual(ce.codex_tail_parse(noisy)["status"], "busy")
+
+    def test_fleet_mode_streams_json(self):
+        # smoke: --fleet emits at least one parseable fleet line, then dies
+        # cleanly within one poll of its consumer closing the pipe (SPEC f2:
+        # quiet ticks heartbeat, so the closed pipe is always noticed).
+        proc = subprocess.Popen(
+            [PY, os.path.join(ROOT, "amtr_engine.py"),
+             "--fleet", "--poll-secs", "0.5", "--live-only"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            line = proc.stdout.readline()
+            msg = json.loads(line)
+            self.assertEqual(msg["type"], "fleet")
+            self.assertIsInstance(msg["sessions"], list)
+            for s in msg["sessions"][:5]:
+                self.assertIn("status", s)
+                self.assertIn("budget", s)
+                self.assertTrue(s["live"])
+        finally:
+            proc.stdout.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                self.fail("--fleet did not exit on closed pipe")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

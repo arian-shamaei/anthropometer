@@ -2024,6 +2024,70 @@ def scan_roster():
         entries.append(d)
     return entries
 
+def codex_tail_parse(lines):
+    """Status/usage from the tail lines of a Codex CLI rollout (SPEC f2
+    providers). Codex writes explicit task_started/task_complete events, so
+    busy/idle is event-precise; token_count carries the last request's
+    input size (the resident analog) and the model context window."""
+    status = "idle"
+    res = bud = prompt = None
+    last_start = last_done = ""
+    for raw in lines:
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if d.get("type") != "event_msg":
+            continue
+        p = d.get("payload") or {}
+        pt = p.get("type")
+        ts = d.get("timestamp") or ""
+        if pt == "task_started":
+            last_start = ts
+        elif pt in ("task_complete", "turn_aborted", "error"):
+            last_done = ts
+        elif pt == "token_count":
+            info = p.get("info") or {}
+            last = info.get("last_token_usage") or {}
+            if isinstance(last.get("input_tokens"), int):
+                res = last["input_tokens"]
+            if isinstance(info.get("model_context_window"), int):
+                bud = info["model_context_window"]
+        elif pt == "user_message":
+            m = p.get("message")
+            if isinstance(m, str):
+                prompt = m[:200]
+    if last_start and last_start > last_done:
+        status = "busy"
+    return {"status": status, "resident": res, "budget": bud,
+            "last_prompt": prompt}
+
+
+def fleet_row_status(raw, alive, mtime, now):
+    """Status of one fleet row. Roster value verbatim, except: a dead pid is
+    `dead`, and `busy` with no transcript growth for >120 s is `stalled`
+    (SPEC a health rule applied fleet-wide — for unattached sessions mtime is
+    the only growth signal we have). mtime 0 (transcript unknown) never
+    stalls: absence of evidence is not staleness."""
+    if not alive:
+        return "dead"
+    st = raw or "idle"
+    if st == "busy" and mtime and now - mtime > 120:
+        return "stalled"
+    return st
+
+def fleet_budget(base, resident):
+    """Per-session budget for a fleet row: the engine's base budget, bumped to
+    the next rung that fits the session's OWN resident (the SPEC a auto-bump
+    applied per row). Without this a 1M session in a mixed fleet renders
+    against the 200k global window."""
+    if not resident or resident <= base:
+        return base
+    for r in BUDGET_RUNGS:
+        if r >= resident:
+            return max(base, r)
+    return max(base, BUDGET_RUNGS[-1])
+
 # ---------------------------------------------------------------- engine
 class Engine:
     def __init__(self, args):
@@ -2055,6 +2119,11 @@ class Engine:
         self._seek_pending = None
         self._seek_gen = 0
         self._fleet_force = threading.Event()
+        # codex provider caches (SPEC f2 providers; fleet feed only)
+        self._codex_files = {}       # pid -> rollout path | None
+        self._codex_meta = {}        # path -> meta dict | None
+        self._codex_tail = {}        # path -> (mtime, parsed)
+        self._codex_tmux = (0.0, {})  # (ts, tty -> locator)
 
     # ---- reading -------------------------------------------------------------
     def _pump(self, path, off, buf, cb, reset_on_shrink=True):
@@ -2487,9 +2556,18 @@ class Engine:
         roster = scan_roster()
         self._roster_cache = roster
         prompts = history_last_prompts()
+        now = time.time()
         out, seen = [], set()
+        # one row per sessionId: a resumed session can leave a stale roster
+        # file whose old pid was reused (kill -0 passes) — without this the
+        # fleet shows the same session twice. Alive + newest update wins.
+        roster = sorted(roster, key=lambda e: (e["_alive"],
+                                               e.get("updatedAt") or 0),
+                        reverse=True)
         for e in roster:
             sid = e["sessionId"]
+            if sid in seen:
+                continue
             tp = find_transcript(sid)
             mt = 0.0
             res = None
@@ -2499,15 +2577,17 @@ class Engine:
                 except OSError:
                     pass
                 res = self._resident_of(tp, mt)
-            status = e.get("status") or "idle"
-            if not e["_alive"]:
-                status = "dead"
+            status = fleet_row_status(e.get("status"), e["_alive"], mt, now)
             out.append({"id": sid, "path": tp or "", "pid": e.get("pid"),
                         "name": e.get("name") or memorable_name(sid),
                         "project": e.get("cwd") or "",
                         "status": status, "mtime": mt, "live": e["_alive"],
-                        "resident": res, "budget": self.budget,
-                        "last_prompt": prompts.get(sid)})
+                        "resident": res, "budget": self._row_budget(res),
+                        "last_prompt": prompts.get(sid),
+                        # additive (SPEC b version-drift law): the session's
+                        # tmux home "session:@window.%pane" when hosted there
+                        # — lets front ends jump the user to the session
+                        "tmux": e.get("tmux")})
             seen.add(sid)
         # recent non-live sessions: EVERY transcript (not just the newest per
         # project), newest first — the picker's search + scroll handle the
@@ -2533,12 +2613,176 @@ class Engine:
         recents.sort(reverse=True)
         for mt, p, d in recents[:500]:
             sid = os.path.basename(p)[:-6]
+            res = self._resident_of(p, mt)
             out.append({"id": sid, "path": p, "pid": None,
                         "name": memorable_name(sid),
                         "project": d, "status": "offline", "mtime": mt,
-                        "live": False, "resident": self._resident_of(p, mt),
-                        "budget": self.budget, "last_prompt": prompts.get(sid)})
+                        "live": False, "resident": res,
+                        "budget": self._row_budget(res),
+                        "last_prompt": prompts.get(sid)})
         return out
+
+    def _row_budget(self, resident):
+        """A fleet row's budget: pinned --budget verbatim, else the base
+        budget auto-bumped to fit the row's own resident (`fleet_budget`)."""
+        if self.budget_pinned:
+            return self.budget
+        return fleet_budget(self.budget, resident)
+
+    # ---- codex provider (SPEC f2 providers; fleet feed only) ----------------
+    def _codex_pids(self):
+        """Live codex CLI processes as (pid, tty, start_epoch)."""
+        try:
+            out = subprocess.run(["ps", "-axo", "pid=,tty=,lstart=,comm="],
+                                 capture_output=True, text=True,
+                                 timeout=5).stdout
+        except Exception:
+            return []
+        rows = []
+        for ln in out.splitlines():
+            parts = ln.split(None, 7)
+            if len(parts) == 8 and os.path.basename(parts[7]) == "codex":
+                try:
+                    start = time.mktime(time.strptime(
+                        " ".join(parts[2:7]), "%a %b %d %H:%M:%S %Y"))
+                    rows.append((int(parts[0]), parts[1], start))
+                except (ValueError, OverflowError):
+                    pass
+        return rows
+
+    def _codex_cwd(self, pid):
+        """The process's working directory (cheap single-descriptor lsof)."""
+        if pid in self._codex_files:
+            return self._codex_files[pid]
+        cwd = None
+        try:
+            out = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=5).stdout
+            for ln in out.splitlines():
+                if ln.startswith("n"):
+                    cwd = ln[1:]
+                    break
+        except Exception:
+            cwd = None
+        self._codex_files[pid] = cwd
+        return cwd
+
+    def _codex_recent_rollouts(self):
+        """Newest-first non-subagent rollouts from the last two day-dirs
+        (codex append-closes files, so open-file discovery is impossible —
+        rows pair to processes by cwd + start time instead)."""
+        base = os.path.expanduser("~/.codex/sessions")
+        day_dirs = sorted(glob.glob(os.path.join(base, "*", "*", "*")))[-2:]
+        out = []
+        for d in day_dirs:
+            for p in glob.glob(os.path.join(d, "rollout-*.jsonl")):
+                meta = self._codex_meta_for(p)
+                if not meta or meta.get("subagent") or not meta.get("id"):
+                    continue
+                try:
+                    out.append((os.path.getmtime(p), p, meta))
+                except OSError:
+                    continue
+        out.sort(reverse=True)
+        return out
+
+    def _codex_meta_for(self, path):
+        if path in self._codex_meta:
+            return self._codex_meta[path]
+        meta = None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                d = json.loads(fh.readline())
+            if d.get("type") == "session_meta":
+                p = d.get("payload") or {}
+                src = p.get("source")
+                sub = (p.get("thread_source") == "subagent" or
+                       (isinstance(src, dict) and "subagent" in src))
+                meta = {"id": p.get("id") or "", "cwd": p.get("cwd") or "",
+                        "subagent": sub}
+        except Exception:
+            meta = None
+        self._codex_meta[path] = meta
+        return meta
+
+    def _codex_tmux_map(self):
+        """tty -> tmux locator, refreshed at fleet cadence. Codex has no
+        roster tmux field; pane ttys identify the pane generically."""
+        ts, cached = self._codex_tmux
+        now = time.time()
+        if now - ts < 2.0:
+            return cached
+        m = {}
+        try:
+            out = subprocess.run(
+                ["tmux", "list-panes", "-a", "-F",
+                 "#{pane_tty}|#{session_name}:#{window_id}.#{pane_id}"],
+                capture_output=True, text=True, timeout=5).stdout
+            for ln in out.splitlines():
+                if "|" in ln:
+                    tty, loc = ln.split("|", 1)
+                    m[tty] = loc
+        except Exception:
+            pass
+        self._codex_tmux = (now, m)
+        return m
+
+    def _codex_rows(self):
+        """Fleet rows for live Codex CLI sessions (provider:"codex").
+        Pairing law: each live codex process claims the newest unclaimed
+        rollout whose cwd matches and whose mtime is not older than the
+        process start (a session that has not taken a prompt yet has no
+        rollout and simply does not appear until it does)."""
+        rows = []
+        pids = self._codex_pids()
+        live = {p for p, _, _ in pids}
+        for k in list(self._codex_files):
+            if k not in live:
+                self._codex_files.pop(k, None)
+        if not pids:
+            return rows
+        rollouts = self._codex_recent_rollouts()
+        tmuxmap = self._codex_tmux_map()
+        claimed = set()
+        for pid, tty, start in pids:
+            cwd = self._codex_cwd(pid)
+            match = None
+            for mt, path, meta in rollouts:
+                if path in claimed or mt < start - 60:
+                    continue
+                if cwd and meta["cwd"] and meta["cwd"] != cwd:
+                    continue
+                match = (mt, path, meta)
+                break
+            if not match:
+                continue
+            mt, path, meta = match
+            claimed.add(path)
+            cached = self._codex_tail.get(path)
+            if not cached or cached[0] != mt:
+                lines = []
+                try:
+                    with open(path, "rb") as fh:
+                        fh.seek(max(0, os.path.getsize(path) - 65536))
+                        lines = fh.read().decode(
+                            "utf-8", "replace").splitlines()
+                except OSError:
+                    pass
+                cached = (mt, codex_tail_parse(lines))
+                self._codex_tail[path] = cached
+            info = cached[1]
+            base = os.path.basename((meta["cwd"] or "").rstrip("/")) or "codex"
+            rows.append({
+                "id": meta["id"], "path": path, "pid": pid,
+                "name": "%s-cx" % base, "project": meta["cwd"],
+                "status": info["status"], "mtime": mt, "live": True,
+                "resident": info["resident"],
+                "budget": info["budget"] or self.budget,
+                "last_prompt": info["last_prompt"],
+                "tmux": tmuxmap.get("/dev/" + tty),
+                "provider": "codex"})
+        return rows
 
     def _resident_of(self, path, mtime):
         c = self._resident_cache.get(path)
@@ -3441,6 +3685,44 @@ def run_report(args):
         print(render_report_md(rep), end="")
     return 130 if interrupted else 0
 
+def run_fleet(args):
+    """--fleet: headless roster stream (SPEC f2). Emits the `fleet` Update
+    message as JSON lines on the protocol fd, change-detected on a --poll-secs
+    roster scan, first emission immediate. For external front ends (the menu
+    bar companion). Exits when the consumer closes the pipe — send() swallows
+    BrokenPipeError by design, so this loop writes the protocol fd directly
+    and lets the failure end the process."""
+    eng = Engine(args)
+    poll = max(0.5, args.poll_secs)
+    last = None
+    while True:
+        try:
+            sessions = eng._sess_entries()
+            if args.live_only:
+                sessions = [s for s in sessions if s.get("live")]
+            # provider rows (SPEC f2): fleet feed only — the TUI cannot
+            # attach a non-Claude transcript, so they never join its picker
+            sessions = sessions + eng._codex_rows()
+        except Exception as e:
+            log("fleet scan error: %s" % e)
+            sessions = last
+        if sessions is not None and sessions != last:
+            last = sessions
+            line = json.dumps({"type": "fleet", "sessions": sessions},
+                              separators=(",", ":"), ensure_ascii=False)
+        else:
+            # quiet tick: heartbeat, so a closed pipe is noticed within one
+            # poll and the consumer can distinguish "no change" from "dead"
+            line = '{"type":"hb"}'
+        try:
+            with _PROTO_LOCK:
+                _PROTO.write(line + "\n")
+                _PROTO.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            return 0
+        time.sleep(poll)
+
+
 def main():
     ap = argparse.ArgumentParser(description="amtr v2 data engine")
     ap.add_argument("--session", help="transcript path or session id")
@@ -3457,6 +3739,16 @@ def main():
     ap.add_argument("--idle-secs", type=float, default=60, dest="idle_secs",
                     help="with --watch: transcript-quiet seconds that end a "
                          "run with no live roster pid (default 60)")
+    ap.add_argument("--fleet", action="store_true",
+                    help="headless roster stream: emit the `fleet` Update "
+                         "message as JSON lines on stdout, change-detected "
+                         "(for external front ends, e.g. the menu bar)")
+    ap.add_argument("--poll-secs", type=float, default=2.0, dest="poll_secs",
+                    help="with --fleet: seconds between roster scans "
+                         "(default 2, floor 0.5)")
+    ap.add_argument("--live-only", action="store_true", dest="live_only",
+                    help="with --fleet: emit only live roster sessions "
+                         "(drop the recent-transcript tail)")
     ap.add_argument("--cal", type=float,
                     help="chars per token: the global prior the per-category "
                          "fit regularizes toward and the constant used when "
@@ -3478,6 +3770,8 @@ def main():
         sys.exit(run_validate(args))
     if args.report:
         sys.exit(run_report(args))
+    if args.fleet:
+        sys.exit(run_fleet(args))
     Engine(args).run()
 
 if __name__ == "__main__":
