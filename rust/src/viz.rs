@@ -1256,30 +1256,23 @@ pub fn render_peek_overlay(
             }
         }
     }
-    // scrollable body window (j/k · wheel); the footer names the visible
-    // range so a clipped record is obvious — no silent `…` cut any more
-    let hmax = area.height.saturating_sub(2).min(26);
-    let max_lines = (hmax as usize).saturating_sub(3).max(3); // borders + footer
-    let cap = max_lines.saturating_sub(lines.len()).max(1);
-    let s = scroll.get().min(body.len().saturating_sub(cap));
-    scroll.set(s); // clamp so presses never bank past the bottom
-    let end = (s + cap).min(body.len());
-    lines.extend(body[s..end].iter().cloned());
+    // shared pane: scroll clamp, footer range, position bar all uniform
     let mut foot = String::from(" esc close");
-    if body.len() > cap {
-        foot.push_str(&format!(" · j/k scroll {}–{} of {}", s + 1, end, body.len()));
-    }
     if p.truncated {
         foot.push_str(" · …truncated at 2000 chars");
     }
-    lines.push(Line::styled(foot, fg(C_DIM)));
-
-    let rect = centered(area, w, (lines.len() as u16 + 2).min(area.height));
-    f.render_widget(Clear, rect);
-    let block = overlay_block(format!("PEEK — seg #{}", p.seg));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    f.render_widget(Paragraph::new(lines), inner);
+    render_pane(
+        &PaneFrame {
+            title: format!("PEEK — seg #{}", p.seg),
+            width: w,
+            header: lines,
+            body,
+            footer: foot,
+            scroll,
+        },
+        f,
+        area,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3383,12 +3376,40 @@ fn last_line(s: &str) -> Option<&str> {
 
 /// Hard-wrap one tail line into `w`-cell chunks (expanded view: wrapped,
 /// never truncated).
+/// Word-aware wrap: each line breaks at the LAST space that fits the
+/// window; mid-word splits happen only when a single token exceeds the
+/// width (long paths/URLs). Interior spacing and indentation are preserved
+/// byte-for-byte — only the one break space is swallowed. Every popup and
+/// lane view wraps through here; the old char-chunking split words across
+/// lines ("th/e", "s/ame").
 fn wrap_line(s: &str, w: usize) -> Vec<String> {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.is_empty() || w == 0 {
+    if s.is_empty() || w == 0 {
         return vec![String::new()];
     }
-    chars.chunks(w).map(|c| c.iter().collect()).collect()
+    let chars: Vec<char> = s.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars.len() - i <= w {
+            out.push(chars[i..].iter().collect());
+            break;
+        }
+        let win = &chars[i..i + w];
+        match win.iter().rposition(|&c| c == ' ') {
+            Some(p) if p > 0 => {
+                out.push(chars[i..i + p].iter().collect());
+                i += p + 1; // swallow the break space
+            }
+            _ => {
+                out.push(win.iter().collect());
+                i += w;
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 /// Clip an entry from its TOP (tails win), marking the first shown line with
@@ -4030,6 +4051,93 @@ fn overlay_block(title: String) -> Block<'static> {
         .title_style(fg(C_AMBER).add_modifier(Modifier::BOLD))
 }
 
+/// The ONE scrollable content-popup core. Every text overlay (help · PEEK
+/// · fleet PREVIEW) renders through this, so the frame, scroll clamping,
+/// wheel/j-k semantics, footer range, and the 8-cell position bar are
+/// uniform BY CONSTRUCTION — an improvement here propagates to every
+/// popup, which is the whole point (the 2026-08 help revamp initially
+/// didn't reach PREVIEW because each overlay hand-rolled this).
+pub struct PaneFrame<'a> {
+    pub title: String,
+    pub width: u16,
+    /// pinned rows above the scroll window (search box, identity line…)
+    pub header: Vec<Line<'static>>,
+    /// the scrollable content
+    pub body: Vec<Line<'static>>,
+    /// left-side footer hints; scroll range + bar appended when scrollable
+    pub footer: String,
+    /// lines hidden above the window; render clamps it so key/wheel
+    /// presses never bank past the ends (usize::MAX = jump to bottom)
+    pub scroll: &'a std::cell::Cell<usize>,
+}
+
+pub fn render_pane(pf: &PaneFrame<'_>, f: &mut Frame<'_>, area: Rect) {
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+    let chrome = pf.header.len() as u16 + 3; // borders + footer row
+    let h = (pf.body.len() as u16).saturating_add(chrome);
+    let rect = centered(
+        area,
+        pf.width,
+        h.min(area.height.saturating_sub(2)).max(5).min(area.height),
+    );
+    f.render_widget(Clear, rect);
+    let block = overlay_block(pf.title.clone());
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 2 || inner.width < 4 {
+        return;
+    }
+    let headh = pf.header.len().min(inner.height as usize - 1);
+    let viewh = (inner.height as usize).saturating_sub(headh + 1).max(1);
+    let max_scroll = pf.body.len().saturating_sub(viewh);
+    let s = pf.scroll.get().min(max_scroll);
+    pf.scroll.set(s);
+    if headh > 0 {
+        f.render_widget(
+            Paragraph::new(pf.header[..headh].to_vec()),
+            Rect {
+                height: headh as u16,
+                ..inner
+            },
+        );
+    }
+    let end = (s + viewh).min(pf.body.len());
+    f.render_widget(
+        Paragraph::new(pf.body[s..end].to_vec()),
+        Rect {
+            y: inner.y + headh as u16,
+            height: viewh as u16,
+            ..inner
+        },
+    );
+    let mut foot: Vec<Span<'static>> = vec![Span::styled(pf.footer.clone(), fg(C_DIM))];
+    if max_scroll > 0 {
+        const CELLS: usize = 8;
+        let total = pf.body.len().max(1);
+        let range = format!("j/k scroll {}–{} of {} ", s + 1, end, total);
+        let a = s * CELLS / total;
+        let b = ((s + viewh) * CELLS).div_ceil(total).min(CELLS);
+        let bar: String = (0..CELLS)
+            .map(|i| if i >= a && i < b { '█' } else { '▂' })
+            .collect();
+        let pad = (inner.width as usize)
+            .saturating_sub(pf.footer.chars().count() + range.chars().count() + CELLS + 1);
+        foot.push(Span::raw(" ".repeat(pad)));
+        foot.push(Span::styled(range, fg(C_DIM)));
+        foot.push(Span::styled(bar, fg(C_STEEL)));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(foot)),
+        Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        },
+    );
+}
+
 /// Compaction post-mortem overlay (EVENTS `Enter`, global `c`).
 pub fn render_postmortem(st: &State, idx: usize, f: &mut Frame<'_>, area: Rect) {
     let Some(c) = st.compactions.get(idx) else {
@@ -4458,9 +4566,15 @@ pub fn sess_display_name(s: &crate::ipc::Sess) -> String {
 }
 
 /// Quicklook PREVIEW overlay (SESSIONS/SYSTEM-WIDE `space`): the tail of the
-/// session's conversation, served on demand by the engine. Newest exchange
-/// wins the space — the body clips from the TOP, marked with a dim `…`.
-pub fn render_fleet_peek_overlay(p: &FleetPeekMsg, f: &mut Frame<'_>, area: Rect) {
+/// session's conversation, served on demand by the engine. Opens anchored
+/// to the NEWEST exchange (scroll starts at the bottom — the opener sets
+/// the cell to usize::MAX and the pane clamps); j/k · wheel scroll back.
+pub fn render_fleet_peek_overlay(
+    p: &FleetPeekMsg,
+    scroll: &std::cell::Cell<usize>,
+    f: &mut Frame<'_>,
+    area: Rect,
+) {
     if area.width < 12 || area.height < 6 {
         return;
     }
@@ -4508,30 +4622,24 @@ pub fn render_fleet_peek_overlay(p: &FleetPeekMsg, f: &mut Frame<'_>, area: Rect
         }
         body.pop(); // trailing spacer
     }
-    // header (project) + footer + borders around the clipped body
-    let hmax = area.height.saturating_sub(2).min(30);
-    let max_body = (hmax as usize).saturating_sub(4).max(3);
-    if body.len() > max_body {
-        let cut = body.len() - (max_body - 1);
-        body.drain(..cut);
-        body.insert(0, Line::styled(" …".to_string(), fg(C_DIM)));
-    }
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::styled(
-            format!(" {}", tail_trunc(&p.project, (w as usize).saturating_sub(4))),
-            fg(C_DIM),
-        ),
-        Line::from(""),
-    ];
-    lines.extend(body);
-    lines.push(Line::styled(" ␣/esc close · ⏎ attach".to_string(), fg(C_DIM)));
-
-    let rect = centered(area, w, (lines.len() as u16 + 2).min(area.height));
-    f.render_widget(Clear, rect);
-    let block = overlay_block(format!(" PREVIEW — {} ", p.name));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    f.render_widget(Paragraph::new(lines), inner);
+    render_pane(
+        &PaneFrame {
+            title: format!(" PREVIEW — {} ", p.name),
+            width: w,
+            header: vec![
+                Line::styled(
+                    format!(" {}", tail_trunc(&p.project, (w as usize).saturating_sub(4))),
+                    fg(C_DIM),
+                ),
+                Line::from(""),
+            ],
+            body,
+            footer: " ␣/esc close · ⏎ attach".to_string(),
+            scroll,
+        },
+        f,
+        area,
+    );
 }
 
 /// End-session confirm modal (SYSTEM-WIDE `x`): nothing is signalled until
@@ -4907,20 +5015,6 @@ pub fn render_help(hs: &mut HelpState, tab: usize, f: &mut Frame<'_>, area: Rect
         ));
     }
 
-    // frame: search row + body viewport + footer row inside the border
-    let h = (body.len() as u16 + 4).min(area.height.saturating_sub(2)).max(5);
-    let rect = centered(area, 72, h);
-    f.render_widget(Clear, rect);
-    let block = overlay_block("amtr — help".to_string());
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    if inner.height < 3 || inner.width < 4 {
-        return;
-    }
-    let viewh = inner.height as usize - 2;
-    let max_scroll = body.len().saturating_sub(viewh);
-    hs.scroll = hs.scroll.min(max_scroll);
-
     // row 0 — the filter box (⌕), live like the fleet search
     let search_line = if hs.typing {
         Line::from(vec![
@@ -4940,55 +5034,26 @@ pub fn render_help(hs: &mut HelpState, tab: usize, f: &mut Frame<'_>, area: Rect
             Span::styled("   / edit · esc clear".to_string(), fg(C_DIM)),
         ])
     };
-    f.render_widget(
-        Paragraph::new(search_line),
-        Rect { height: 1, ..inner },
-    );
-
-    // body viewport
-    let visible: Vec<Line<'static>> = body
-        .iter()
-        .skip(hs.scroll)
-        .take(viewh)
-        .cloned()
-        .collect();
-    f.render_widget(
-        Paragraph::new(visible),
-        Rect {
-            y: inner.y + 1,
-            height: viewh as u16,
-            ..inner
-        },
-    );
-
-    // footer — counts left, an 8-cell window bar right when scrollable
     let left = if q.is_empty() {
         format!(" {nsec} sections · {nhit} entries")
     } else {
         format!(" {nsec} sections · {nhit} matches")
     };
-    let mut foot: Vec<Span<'static>> = vec![Span::styled(left.clone(), fg(C_DIM))];
-    if max_scroll > 0 {
-        const CELLS: usize = 8;
-        let total = body.len().max(1);
-        let a = hs.scroll * CELLS / total;
-        let b = ((hs.scroll + viewh) * CELLS).div_ceil(total).min(CELLS);
-        let bar: String = (0..CELLS)
-            .map(|i| if i >= a && i < b { '█' } else { '▂' })
-            .collect();
-        let pad = (inner.width as usize)
-            .saturating_sub(left.chars().count() + CELLS + 1);
-        foot.push(Span::raw(" ".repeat(pad)));
-        foot.push(Span::styled(bar, fg(C_STEEL)));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(foot)),
-        Rect {
-            y: inner.y + inner.height - 1,
-            height: 1,
-            ..inner
+    // bridge HelpState's plain scroll field into the shared pane's Cell
+    let cell = std::cell::Cell::new(hs.scroll);
+    render_pane(
+        &PaneFrame {
+            title: "amtr — help".to_string(),
+            width: 72,
+            header: vec![search_line],
+            body,
+            footer: left,
+            scroll: &cell,
         },
+        f,
+        area,
     );
+    hs.scroll = cell.get();
 }
 
 // ---------------------------------------------------------------------------

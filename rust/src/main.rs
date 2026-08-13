@@ -189,6 +189,9 @@ struct App {
     /// quicklook preview (`space` on a fleet tile/row): the engine's
     /// fleet_peek reply, rendered as a conversation-tail overlay
     fleet_peek: Option<ipc::FleetPeekMsg>,
+    /// PREVIEW scroll (j/k · wheel); Cell for the map_geom reason. Opens
+    /// at usize::MAX so the pane clamps to the newest exchange (tail).
+    fleet_peek_scroll: std::cell::Cell<usize>,
     /// end-session confirm modal: (session id, display name) pending `y`
     fleet_kill: Option<(String, String)>,
     /// MAP pane (w, h) as last rendered — lets the +/- handler clamp the rung
@@ -267,6 +270,7 @@ impl App {
             system_wide: false,
             fleet_query: String::new(),
             fleet_peek: None,
+            fleet_peek_scroll: std::cell::Cell::new(usize::MAX),
             fleet_kill: None,
             map_geom: std::cell::Cell::new((0, 0)),
             show_help: false,
@@ -461,6 +465,7 @@ impl App {
             // still open — a reply landing after the picker closed is dropped
             if self.show_fleet {
                 self.fleet_peek = Some(p.clone());
+                self.fleet_peek_scroll.set(usize::MAX); // open at the tail
                 self.dirty = true;
             }
             return; // UI-modal state; never session state
@@ -841,9 +846,20 @@ impl App {
             return;
         }
         if self.fleet_peek.is_some() {
-            // quicklook overlay: space/esc close it; ⏎ promotes to attach
+            // quicklook overlay: space/esc close it; ⏎ promotes to attach;
+            // j/k · g/G scroll the conversation tail (render clamps)
             match code {
                 KeyCode::Esc | KeyCode::Char(' ') => self.fleet_peek = None,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.fleet_peek_scroll
+                        .set(self.fleet_peek_scroll.get().saturating_add(1));
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.fleet_peek_scroll
+                        .set(self.fleet_peek_scroll.get().saturating_sub(1));
+                }
+                KeyCode::Char('g') => self.fleet_peek_scroll.set(0),
+                KeyCode::Char('G') => self.fleet_peek_scroll.set(usize::MAX),
                 KeyCode::Enter => {
                     if let Some(p) = self.fleet_peek.take() {
                         self.clear_replay_for_attach();
@@ -1419,8 +1435,15 @@ impl App {
             } else {
                 s.saturating_add(3) // render clamps to the record's end
             });
-        } else if self.fleet_peek.is_some() || self.fleet_kill.is_some() {
-            return; // modal confirms/quicklooks: the wheel is parked
+        } else if self.fleet_peek.is_some() {
+            let s = self.fleet_peek_scroll.get();
+            self.fleet_peek_scroll.set(if up {
+                s.saturating_sub(3)
+            } else {
+                s.saturating_add(3) // render clamps to the tail
+            });
+        } else if self.fleet_kill.is_some() {
+            return; // confirm modal: the wheel is parked
         } else if self.show_fleet {
             // list AND tab wall share linear selection semantics
             self.fleet_sel = if up {
@@ -1735,7 +1758,7 @@ fn render_all(f: &mut Frame<'_>, app: &App) {
         }
     }
     if let Some(p) = &app.fleet_peek {
-        viz::render_fleet_peek_overlay(p, f, area);
+        viz::render_fleet_peek_overlay(p, &app.fleet_peek_scroll, f, area);
     }
     if let Some((_, name)) = &app.fleet_kill {
         viz::render_kill_confirm(name, f, area);
@@ -2157,6 +2180,42 @@ mod screenshots {
     use std::collections::HashMap;
 
     const NOW: f64 = 1_800_000_000.0;
+
+    /// Cross-language palette parity: pins gen_palette's exact output for
+    /// fixed seeds. The Swift port (menubar/, `amtr-bar --selfcheck`) asserts
+    /// the SAME golden values — a session's menu bar tank and its TUI tile
+    /// must be the same colors, and this pair of tests is that contract.
+    /// The FNV seed is computed inline (viz::sess_seed is private): the
+    /// id → seed step is part of what parity covers.
+    #[test]
+    fn palette_golden_cross_language() {
+        fn fnv(id: &str) -> u64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in id.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            h
+        }
+        let cases: [(u64, [(u8, u8, u8); 4]); 4] = [
+            (1, GOLD_1),
+            (42, GOLD_42),
+            (0xDEAD_BEEF, GOLD_DB),
+            (fnv("golden-fixture"), GOLD_FIX),
+        ];
+        for (seed, want) in cases {
+            let got = viz::gen_palette(seed);
+            assert_eq!(got, want, "gen_palette({seed:#x}) drifted — update BOTH goldens (here and menubar --selfcheck) only on a deliberate palette change");
+        }
+    }
+    const GOLD_1: [(u8, u8, u8); 4] =
+        [(9, 35, 37), (50, 97, 29), (190, 130, 45), (252, 190, 203)];
+    const GOLD_42: [(u8, u8, u8); 4] =
+        [(6, 17, 61), (35, 85, 104), (53, 162, 148), (76, 253, 41)];
+    const GOLD_DB: [(u8, u8, u8); 4] =
+        [(28, 27, 8), (36, 91, 76), (51, 150, 207), (220, 193, 252)];
+    const GOLD_FIX: [(u8, u8, u8); 4] =
+        [(66, 14, 15), (130, 59, 29), (189, 116, 49), (244, 180, 66)];
 
     /// Accessibility gate: every shipped block theme must keep all
     /// cross-family color pairs (9 categories + 8 file hues, wheel-vs-wheel
@@ -2685,6 +2744,35 @@ mod screenshots {
         app.fleet_kill = Some(("s".into(), "n".into()));
         wheel(&mut app, MouseEventKind::ScrollDown);
         assert_eq!(app.fleet_sel, 0, "wheel must be parked under a modal");
+        // fleet PREVIEW: opens tail-anchored, wheel scrolls back, clamped
+        let mut app = demo_app();
+        app.demo = true; // space synthesizes the fleet_peek reply locally
+        app.show_fleet = true;
+        press(&mut app, KeyCode::Tab); // list → SYSTEM-WIDE wall
+        press(&mut app, KeyCode::Char(' ')); // demo answers the quicklook
+        assert!(app.fleet_peek.is_some());
+        assert_eq!(app.fleet_peek_scroll.get(), usize::MAX, "must open at tail");
+        let _ = draw(&mut app, 110, 30); // render clamps MAX to real bottom
+        let bottom = app.fleet_peek_scroll.get();
+        assert!(bottom < usize::MAX, "render must clamp preview scroll");
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(app.fleet_peek_scroll.get(), bottom.saturating_sub(3));
+    }
+
+    #[test]
+    fn wrap_line_breaks_at_words() {
+        let mut app = demo_app();
+        app.demo = true;
+        app.show_fleet = true;
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char(' '));
+        let s = draw(&mut app, 110, 30);
+        // no mid-word split: every preview line ends on a word boundary,
+        // which we spot-check by asserting the old failure shape is gone
+        assert!(app.fleet_peek.is_some());
+        for bad in ["identi\n", "th │\n", "s │\n ame"] {
+            assert!(!s.contains(bad), "mid-word wrap resurfaced near {bad:?}:\n{s}");
+        }
     }
 
     #[test]
