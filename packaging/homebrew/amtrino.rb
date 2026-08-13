@@ -7,7 +7,7 @@
 # attach the zip to the GitHub release, and fill sha256 below.
 cask "amtrino" do
   version "0.1.0"
-  sha256 :no_check # TODO: pin per release once the first zip is published
+  sha256 "2618ff1df25fa8d1c213ad2980bc93ba0cd85a366af7e9450a21fda59240a89a"
 
   url "https://github.com/arian-shamaei/anthropometer/releases/download/bar-v#{version}/amtrino-#{version}.zip"
   name "amtrino"
