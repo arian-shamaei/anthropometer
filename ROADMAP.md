@@ -4,6 +4,8 @@
 and issues/PRs are welcome.
 
 ## Near term
+- **amtrino release channel** — zip + cask for the new menu bar companion
+  (`menubar/`, built by `packaging/build-menubar.sh`); CI build on tag.
 - **Prebuilt binaries + one-line installer** — `curl … | sh` and release archives for
   macOS/Linux, so trying it needs no `cargo` or tap.
 - **Broader terminal coverage** — verify glyph rendering (blocks/braille) across common
