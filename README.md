@@ -22,6 +22,10 @@ ground-truth PDF report of the whole session.
 &nbsp;·&nbsp; [![vibe coded](https://img.shields.io/badge/AI%20usage-vibe%20coded-ff2d78)](#-ai-usage)
 &nbsp;·&nbsp; Rust + ratatui TUI · Python engine · terminal-only
 
+> **On a Mac?** [**amtrino**](https://github.com/arian-shamaei/amtrino) puts this in your
+> menu bar — every live session a breathing dot, no terminal needed. &nbsp;
+> ![the amtrino grid, live](https://raw.githubusercontent.com/arian-shamaei/amtrino/main/docs/assets/hero-icon.gif)
+
 ---
 
 ## AI usage
