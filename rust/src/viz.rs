@@ -246,10 +246,16 @@ pub fn palette_export_json(session_id: &str, pal: &[(u8, u8, u8); 4]) -> String 
 /// on attach and on reroll, atomic tmp+rename, last-writer-wins across
 /// instances; consumers honor it only while `pid` is alive and `session`
 /// matches theirs.
+/// amtr's per-user state directory (`~/.claude/amtr`): the palette export
+/// and the first-launch marker live here. None when HOME is unset.
+pub fn state_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::Path::new(&home).join(".claude").join("amtr"))
+}
+
 pub fn export_palette(session_id: &str) {
     let json = palette_export_json(session_id, &art_palette());
-    let Some(home) = std::env::var_os("HOME") else { return };
-    let dir = std::path::Path::new(&home).join(".claude").join("amtr");
+    let Some(dir) = state_dir() else { return };
     let _ = std::fs::create_dir_all(&dir);
     let tmp = dir.join(".palette.json.tmp");
     if std::fs::write(&tmp, json).is_ok() {
@@ -4768,6 +4774,7 @@ fn help_sections(tab: usize) -> Vec<HelpSection> {
             k("1–6", &["tabs: OVERVIEW FILES TURNS AGENTS EVENTS SHELL"]),
             k("f / 0", &["fleet — every session on the machine"]),
             k("?", &["this help · q quit · p pause render"]),
+            k("w", &["welcome tour — the guided walkthrough (opens once by itself)"]),
             k("x", &["amtr3d — stream this session to the Vision Pro memspace"]),
             k("←/→  ⇧←/→", &["turn cursor ±1 / ±10 · home first · end LIVE"]),
             k("esc", &["ack the visible alert, then snap to LIVE"]),
@@ -5084,6 +5091,244 @@ pub fn render_help(hs: &mut HelpState, tab: usize, f: &mut Frame<'_>, area: Rect
         area,
     );
     hs.scroll = cell.get();
+}
+
+// ---------------------------------------------------------------------------
+// welcome tour — the guided first-launch walkthrough
+// ---------------------------------------------------------------------------
+
+/// One stop of the welcome tour, ready to draw. The APP owns the stop list
+/// and drives (and animates) the instrument; viz only knows how to place
+/// and paint the strip: the cat, its speech, the keys, progress + nav.
+pub struct TourCard {
+    /// what the cat says (revealed typewriter-style; see `TourTalk`)
+    pub speech: String,
+    /// the keys that do it (amber) — may be empty
+    pub keys: String,
+    pub idx: usize,
+    pub n: usize,
+}
+
+/// The talking state: how many chars of the speech are revealed so far
+/// (the mouth moves while `pos < speech.len()`), and a frame counter that
+/// keeps ticking after — the idle blink and the mouth cycle both key off it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TourTalk {
+    pub pos: usize,
+    pub frame: u32,
+    /// the char most recently revealed — the mouth is shaped by it (a
+    /// vowel opens it, a consonant half-opens it, a space or punctuation
+    /// closes it), so the face reads as speaking the words rather than
+    /// flapping at random
+    pub last: Option<char>,
+}
+
+/// Mouth shape for the char just spoken: the dialogue-box convention.
+pub fn mouth_for(c: Option<char>) -> &'static str {
+    match c {
+        Some(c) if "aeiouAEIOU".contains(c) => "o",
+        Some('!' | '?') => "▽",
+        Some(c) if c.is_alphanumeric() => "‿",
+        _ => "ﻌ",
+    }
+}
+
+/// The guide: a three-row cat, monochrome, built from the established
+/// tiny-cat idioms — `=( )=` whiskers, the `ﻌ` cat mouth, `⁼` smug
+/// half-lidded eyes, drawn as the superscript `⁼` so they sit above the
+/// mouth line — over a pair of shoulders. While `talking` the mouth follows
+/// the char being spoken (`mouth_for`); idle blinks `˘˘` every so often;
+/// `happy` (the last stop) is `^^`. Width-1 glyphs only (the viz rule) — 7 columns, 3 rows.
+pub const CAT_W: u16 = 7;
+pub const CAT_H: u16 = 3;
+fn cat_rows(talk: TourTalk, talking: bool, happy: bool) -> [Vec<Span<'static>>; 3] {
+    let f = talk.frame as usize;
+    let mouth = if talking { mouth_for(talk.last) } else { "ﻌ" };
+    let eye = if happy {
+        "^"
+    } else if !talking && f.is_multiple_of(14) {
+        "˘"
+    } else {
+        "⁼"
+    };
+    let body = fg(C_FG);
+    let face = fg(C_WHITE).add_modifier(Modifier::BOLD);
+    [
+        vec![Span::styled(r" /\ /\ ".to_string(), body)],
+        vec![
+            Span::styled("=(".to_string(), body),
+            Span::styled(format!("{eye}{mouth}{eye}"), face),
+            Span::styled(")=".to_string(), body),
+        ],
+        vec![Span::styled("  ╱ ╲  ".to_string(), body)],
+    ]
+}
+
+/// Darken every cell outside `keep` (the focused region) and outside
+/// `card`: the coach-mark effect. Colors are scaled in RGB rather than
+/// tagged DIM so the look is identical on every terminal (SGR 2 is
+/// interpreted inconsistently) and asserted in tests. Cells with no explicit
+/// color (Reset) get the app bg so text on them still recedes.
+fn tour_darken(f: &mut Frame<'_>, area: Rect, keep: Rect, card: Rect) {
+    const K: f64 = 0.38;
+    let inside = |r: Rect, x: u16, y: u16| {
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    };
+    let buf = f.buffer_mut();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if inside(keep, x, y) || inside(card, x, y) {
+                continue;
+            }
+            let Some(cell) = buf.cell_mut((x, y)) else { continue };
+            let st = cell.style();
+            let nfg = match st.fg {
+                Some(Color::Rgb(r, g, b)) => rgb(scale((r, g, b), K)),
+                _ => rgb(scale(C_FG, K)),
+            };
+            let nbg = match st.bg {
+                Some(Color::Rgb(r, g, b)) => rgb(scale((r, g, b), K)),
+                _ => rgb(C_BG),
+            };
+            cell.set_style(
+                Style::default()
+                    .fg(nfg)
+                    .bg(nbg)
+                    .add_modifier(st.add_modifier & !Modifier::BOLD),
+            );
+        }
+    }
+}
+
+/// Where the strip goes: below the focused region when it fits, else
+/// above, else pinned to the edge FARTHEST from the focus (top when the
+/// focus sits low, bottom when it sits high). `prefer_top` pins it to the
+/// focus's own top row (views whose content hugs the bottom). A zero-size
+/// focus → centered (WELCOME / FINISH); `focus == area` → bottom edge.
+fn tour_place(area: Rect, focus: Rect, prefer_top: bool, w: u16, h: u16) -> Rect {
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let h = h.min(area.height);
+    if focus.width == 0 || focus.height == 0 {
+        return centered(area, w, h);
+    }
+    let bottom_y = (area.y + area.height).saturating_sub(h).max(area.y);
+    if prefer_top && focus != area {
+        // one row in, so the view's own header line stays readable
+        let y = if focus.height > h + 1 { focus.y + 1 } else { focus.y };
+        return Rect { x, y, width: w, height: h };
+    }
+    let below = focus.y + focus.height;
+    if focus != area && below + h <= area.y + area.height {
+        // one row of breathing space when there is one
+        let y = if below + h < area.y + area.height { below + 1 } else { below };
+        return Rect { x, y, width: w, height: h };
+    }
+    if focus != area && focus.y >= area.y + h {
+        let y = if focus.y > area.y + h { focus.y - h - 1 } else { focus.y - h };
+        return Rect { x, y, width: w, height: h };
+    }
+    // top edge only when the focus starts in the lower half (its own top
+    // row is what would be covered otherwise); a tall focus → bottom
+    let area_mid = area.y + area.height / 2;
+    let y = if focus != area && focus.y > area_mid { area.y } else { bottom_y };
+    Rect { x, y, width: w, height: h }
+}
+
+/// Paint one tour stop over the finished frame: darken everything but the
+/// focused region, then the cyan strip — the cat on the left, its speech
+/// typing out beside it (wrapped to the strip's width, revealed `talk.pos`
+/// chars in), the keys line in amber, progress dots + nav on the last row.
+/// Cyan on purpose: every other overlay is amber, so the guide reads as a
+/// different voice from the instrument.
+pub fn render_tour(
+    card: &TourCard,
+    talk: TourTalk,
+    focus: Rect,
+    prefer_top: bool,
+    f: &mut Frame<'_>,
+    area: Rect,
+) {
+    if area.width < 30 || area.height < 7 {
+        return;
+    }
+    let w = area.width.saturating_sub(2).clamp(30, 84);
+    let tw = w as usize - 2 - CAT_W as usize - 2; // borders, cat, gutter
+    // wrap the FULL speech first (layout must not jump as it types), then
+    // reveal `pos` chars across the wrapped lines
+    let full: Vec<String> = wrap_line(&card.speech, tw);
+    let total: usize = card.speech.chars().count();
+    let talking = talk.pos < total;
+    let mut left = talk.pos;
+    let mut placed = false; // the caret sits on the line being typed
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for l in &full {
+        let n = l.chars().count();
+        let shown: String = l.chars().take(left).collect();
+        let cursor = if talking && !placed && left <= n {
+            placed = true;
+            "▏"
+        } else {
+            ""
+        };
+        left = left.saturating_sub(n + 1); // +1: the swallowed break space
+        rows.push(Line::from(vec![
+            Span::styled(shown, fg(C_FG)),
+            Span::styled(cursor.to_string(), fg(C_CYAN)),
+        ]));
+    }
+    if !card.keys.is_empty() {
+        rows.push(Line::styled(card.keys.clone(), fg(C_AMBER)));
+    }
+    let dots: String = (0..card.n)
+        .map(|i| if i <= card.idx { '●' } else { '○' })
+        .collect();
+    let nav = if card.idx + 1 == card.n {
+        "⏎ finish · ← back"
+    } else if card.idx == 0 {
+        "→ next · esc skip · ? help"
+    } else {
+        "→ next · ← back · esc skip"
+    };
+    let pad = tw.saturating_sub(dots.chars().count() + nav.chars().count() + 1);
+    rows.push(Line::from(vec![
+        Span::styled(dots, fg(C_CYAN)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(format!("{nav} "), fg(C_DIM)),
+    ]));
+    let inner_h = (rows.len() as u16).max(CAT_H);
+    let h = (inner_h + 2).min(area.height);
+    let rect = tour_place(area, focus, prefer_top, w, h);
+    tour_darken(f, area, focus, rect);
+    f.render_widget(Clear, rect);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(fg(C_CYAN))
+        .title_top(
+            Line::styled(format!(" {}/{} ", card.idx + 1, card.n), fg(C_DIM))
+                .alignment(Alignment::Right),
+        )
+        .style(Style::default().bg(rgb(C_BG)));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 || inner.width <= CAT_W + 2 {
+        return;
+    }
+    // the cat, top-left; happy on the last stop
+    let cat = cat_rows(talk, talking, card.idx + 1 == card.n);
+    let cat_lines: Vec<Line<'static>> = cat.into_iter().map(Line::from).collect();
+    f.render_widget(
+        Paragraph::new(cat_lines),
+        Rect { width: CAT_W, height: CAT_H.min(inner.height), ..inner },
+    );
+    f.render_widget(
+        Paragraph::new(rows),
+        Rect {
+            x: inner.x + CAT_W + 2,
+            width: inner.width - CAT_W - 2,
+            ..inner
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5452,7 +5697,7 @@ pub fn render_footer(
     }
     let hint: String = match tab {
         0 if inspect => "←/→ walk · enter open/peek · p peek · esc exit".into(),
-        0 => "m map-mode · +/- rung · ←/→ turn · c post-mortem · i inspect · ? help".into(),
+        0 => "m map-mode · +/- rung · ←/→ turn · c post-mortem · i inspect · ? help · w tour".into(),
         1 => match files_view {
             FilesView::History => {
                 "j/k select · s sort · v now/history · enter detail · o $EDITOR".into()

@@ -311,6 +311,120 @@
     "COMPACTION",
     "dropped"
    ]
+  },
+  {
+   "name": "tour-welcome",
+   "keys": [
+    "w"
+   ],
+   "animated": true,
+   "overlay": true,
+   "expect_contains": [
+    "1/16",
+    "=(⁼"
+   ]
+  },
+  {
+   "name": "tour-map-lenses",
+   "keys": [
+    "w",
+    "Right",
+    "Right",
+    "Right"
+   ],
+   "animated": true,
+   "overlay": true,
+   "expect_contains": [
+    "this box IS the budget",
+    "4/16",
+    "m lens"
+   ]
+  },
+  {
+   "name": "tour-inspect",
+   "keys": [
+    "w",
+    "Right",
+    "Right",
+    "Right",
+    "Right"
+   ],
+   "animated": true,
+   "overlay": true,
+   "expect_contains": [
+    "INSPECT",
+    "5/16",
+    "born t"
+   ]
+  },
+  {
+   "name": "tour-rewind",
+   "keys": [
+    "w",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right"
+   ],
+   "animated": true,
+   "overlay": true,
+   "expect_contains": [
+    "REPLAY",
+    "7/16"
+   ]
+  },
+  {
+   "name": "tour-postmortem",
+   "keys": [
+    "w",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right"
+   ],
+   "animated": true,
+   "overlay": true,
+   "expect_contains": [
+    "COMPACTION",
+    "12/16",
+    "autopsy"
+   ]
+  },
+  {
+   "name": "tour-wall",
+   "keys": [
+    "w",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right",
+    "Right"
+   ],
+   "animated": true,
+   "overlay": true,
+   "expect_contains": [
+    "SYSTEM-WIDE",
+    "15/16",
+    "=(⁼"
+   ]
   }
  ]
 }

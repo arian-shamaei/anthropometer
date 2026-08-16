@@ -622,9 +622,48 @@ per-session deterministic palette), all draining live, in a stable
    TURNS column anatomy (cr/5m/1h/in bands, ▀wl tick, ▼▲◆ rail, lane color
    rules).
 
+### Welcome tour (`w`, first launch) — the instrument explains itself
+
+A nearly wordless, animated walkthrough IN the TUI (the amtrino help
+philosophy: the graphics do the talking, one caption per scene). Sixteen
+stops — WELCOME · ribbon · tabs · MAP · INSPECT · trend · REPLAY · FILES ·
+TURNS · AGENTS · EVENTS · post-mortem · SHELL · SESSIONS · SYSTEM-WIDE ·
+finish. Each stop DRIVES the real UI (switches the tab, turns INSPECT on,
+rewinds the cursor, opens SESSIONS / the wall / a post-mortem) and then loops
+a small demonstration on a run-loop clock: the four lenses cycle, the
+segment cursor sweeps, the playhead steps back eight turns and snaps LIVE,
+HISTORY→NOW flips, grid⇄ledger flips, console⇄retrieval flips, the wall
+walks its tiles and quicklooks one. Everything outside the stop's focus
+region is darkened (RGB-scaled, not SGR dim — identical on every terminal)
+and a cyan strip is placed beside the focus (below, else above, else the far
+edge; a `prefer_top` override for tail-hugging views). The strip is the
+GUIDE: a three-row monochrome cat (`/\ /\` · `=(⁼ﻌ⁼)=` · `╱ ╲`, width-1 glyphs) on
+the left whose speech types out beside it one char per 22 ms beat with a
+caret on the line being typed — the beat stretches ×2 on spaces, ×5 on
+commas, ×12 at sentence ends (dialogue-box pacing) and the mouth takes the
+shape of the char just spoken (vowel `o` · consonant `‿` · `!?` `▽` ·
+space/punctuation `ﻌ`), so the face reads as speaking the words; then it
+settles to `ﻌ` and idles on a 220 ms beat (blink `˘˘` every 14 frames; `^^`
+on the last stop). Speech is one or two
+sentences in the cat's voice per stop and asks the reader to try that
+stop's pass-through keys; under it the keys line (amber), then progress
+dots + nav.
+
+Dispatch: the tour sits ABOVE every other overlay. `→`/`⏎`/`␣`/`n` next ·
+`←`/`b` back · `esc` skip · `q` quit · `?` hands over to help; each stop has
+a small pass-through key set (its own keys — `m t +/-` on MAP, `j/k s v` on
+FILES, `↑/↓` on SESSIONS …) and the first pass-through key parks that stop's
+animation; everything else is swallowed. Leaving a stop undoes what it
+opened; finishing (or skipping) returns to OVERVIEW · LIVE.
+
+First-launch rule: opens by itself iff `~/.claude/amtr/welcomed` is absent
+(written when the tour ends, any way — content: the greeting version);
+`--tour` forces it, `--no-tour` / `AMTR_NO_TOUR=1` suppress it, `--demo`
+never auto-opens (it is the testbench). `w` reopens it any time.
+
 ### Keybindings (dispatch: overlay > tab-contextual > global)
 
-Global: `q` quit · `?` help · `1–5` tabs · `f`/`0` fleet · `p` pause render ·
+Global: `q` quit · `?` help · `w` welcome tour · `1–5` tabs · `f`/`0` fleet · `p` pause render ·
 `x` amtr3d mode · `←/→` cursor ±1 · `Shift+←/→` ±10 · `Home` first ·
 `End`/`Esc` LIVE · `m` MAP mode · `c` latest post-mortem · `R` write report ·
 `+/-` MAP rung override.

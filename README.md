@@ -51,7 +51,9 @@ every session already writes a complete transcript. `amtr` just reads it in real
 
 A fast, keyboard-driven terminal UI. Tabs `1`–`6`, `f` for the session picker
 (`tab` there for the system-wide wall), `i` to inspect, `R` to build a report,
-`?` for help, `q` to quit.
+`?` for help, `q` to quit. The very first launch opens a short **welcome tour**:
+a small cat walks you through every view, driving the instrument as it talks
+and asking you to try the keys (`w` replays it any time; `--no-tour` skips it).
 
 ### Context map — where your budget actually goes
 

@@ -8,6 +8,7 @@
 mod demo;
 mod ipc;
 mod state;
+mod tour;
 mod viz;
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -23,9 +24,14 @@ use ratatui::widgets::{Block, Paragraph};
 
 use ipc::{Control, Update};
 use state::State;
+use tour::TOUR;
 use viz::{AgentFilter, AgentSort, FileSort, FilesView, MapMode, ShellFilter, ShellView, Tier, Ui};
 
 const BG: Color = Color::Rgb(viz::C_BG.0, viz::C_BG.1, viz::C_BG.2);
+
+/// welcome tour — the cat's speaking beat (one char) and idle beat
+const TALK_MS: u64 = 22;
+const TALK_IDLE_MS: u64 = 220;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -48,12 +54,18 @@ usage: amtr [--session FILE|ID] [--project PATH] [--budget N]
 
   --demo         run a deterministic demo session (no engine) — the
                  reproducible scene source for visual/animation validation
+  --tour         open the welcome tour at launch (it opens by itself on the
+                 very first launch; `w` reopens it any time)
+  --no-tour      never auto-open the tour (also: AMTR_NO_TOUR=1)
 
-keys: 1-6 tabs · f sessions · ? help · ←/→ scrub · m map mode · t theme · q quit";
+keys: 1-6 tabs · f sessions · ? help · w tour · ←/→ scrub · m map mode · t theme · q quit";
 
 struct Cli {
     help: bool,
     demo: bool,
+    /// Some(true) = --tour (force open) · Some(false) = --no-tour · None =
+    /// first-launch rule (open once, then never again)
+    tour: Option<bool>,
     python: String,
     engine: std::path::PathBuf,
     passthrough: Vec<String>,
@@ -63,6 +75,7 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut cli = Cli {
         help: false,
         demo: false,
+        tour: None,
         python: "python3".to_string(),
         engine: ipc::default_engine_path(),
         passthrough: Vec::new(),
@@ -79,6 +92,8 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
         match argv[i].as_str() {
             "--help" | "-h" => cli.help = true,
             "--demo" => cli.demo = true,
+            "--tour" => cli.tour = Some(true),
+            "--no-tour" => cli.tour = Some(false),
             "--theme" => {
                 let v = val(&mut i)?;
                 if !viz::set_theme(&v) {
@@ -231,6 +246,20 @@ struct App {
     amtr3d_bridge: Option<std::process::Child>,
     /// session switched while amtr3d was on: respawn once the new meta lands
     amtr3d_restart: bool,
+    /// welcome tour: Some(stop index) while open. Opens by itself on the
+    /// very first launch (`~/.claude/amtr/welcomed` absent), `w` reopens.
+    /// While open it OWNS →/⏎/␣/←/esc; each stop passes a few keys through
+    /// so the reader can try the thing being explained.
+    tour: Option<usize>,
+    /// animation frame within the current stop (0 = as entered)
+    tour_frame: u32,
+    /// when the next animation frame is due; None = still stop, or parked
+    /// because the reader took over with a pass-through key
+    tour_next: Option<Instant>,
+    /// the cat's speech: chars revealed + idle/mouth frame counter
+    talk: viz::TourTalk,
+    /// next talk tick (fast while typing, slow idle after)
+    talk_next: Option<Instant>,
 }
 
 impl App {
@@ -292,6 +321,11 @@ impl App {
             now_override: None,
             amtr3d_bridge: None,
             amtr3d_restart: false,
+            tour: None,
+            tour_frame: 0,
+            tour_next: None,
+            talk: viz::TourTalk::default(),
+            talk_next: None,
         }
     }
 
@@ -747,6 +781,44 @@ impl App {
         let code = k.code;
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         self.dirty = true;
+
+        if let Some(i) = self.tour {
+            // the tour owns navigation; the stop's try-keys fall through to
+            // the normal chain (so `m` really cycles the MAP, ↑/↓ really move
+            // in SESSIONS …); everything else is swallowed so the reader
+            // can't wander off mid-tour by accident. `q` still quits.
+            match code {
+                KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('n') => {
+                    self.tour_step(1);
+                    return;
+                }
+                KeyCode::Left | KeyCode::Char('b') => {
+                    self.tour_step(-1);
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.tour_end();
+                    return;
+                }
+                KeyCode::Char('q') => {
+                    self.tour_end();
+                    self.quit();
+                    return;
+                }
+                KeyCode::Char('?') => {
+                    self.tour_end();
+                    self.show_help = true;
+                    *self.help.get_mut() = viz::HelpState::default();
+                    return;
+                }
+                _ => {
+                    if !TOUR[i].allows(code) {
+                        return;
+                    }
+                    self.tour_next = None; // the reader took over: park the loop
+                }
+            }
+        }
 
         if self.show_help {
             // searchable browser: `/` types into the filter (fleet idiom),
@@ -1472,6 +1544,7 @@ impl App {
                 self.show_help = true;
                 *self.help.get_mut() = viz::HelpState::default();
             }
+            KeyCode::Char('w') => self.tour_open(),
             KeyCode::Char(c @ '1'..='6') => {
                 self.tab = (c as usize) - ('1' as usize);
             }
@@ -1565,6 +1638,128 @@ impl App {
     fn quit(&mut self) {
         self.send(Control::Quit);
         self.quitting = true;
+    }
+
+    // --- welcome tour -----------------------------------------------------
+
+    /// Open the tour at its first stop. Any overlay that was open closes:
+    /// the tour drives the instrument itself and expects a clean stage.
+    fn tour_open(&mut self) {
+        self.show_help = false;
+        self.postmortem = None;
+        self.peek = None;
+        self.fleet_peek = None;
+        self.fleet_kill = None;
+        self.show_fleet = false;
+        self.system_wide = false;
+        self.tour_goto(0);
+    }
+
+    /// Land on stop `i`: enter it and arm its animation clock.
+    fn tour_goto(&mut self, i: usize) {
+        self.tour = Some(i);
+        self.tour_frame = 0;
+        self.talk = viz::TourTalk::default();
+        self.talk_next = Some(Instant::now() + Duration::from_millis(TALK_MS));
+        TOUR[i].enter(self);
+        self.tour_next = TOUR[i]
+            .period_ms()
+            .map(|ms| Instant::now() + Duration::from_millis(ms));
+        self.dirty = true;
+    }
+
+    /// The cat's clock: reveal a couple of chars per tick while there is
+    /// speech left (the mouth cycles on the same beat), then idle slowly —
+    /// the frame keeps counting so the blink and ear twitch stay alive.
+    fn talk_tick(&mut self) {
+        let Some(i) = self.tour else {
+            self.talk_next = None;
+            return;
+        };
+        let speech = TOUR[i].card(self, i, TOUR.len()).speech;
+        let total = speech.chars().count();
+        self.talk.frame = self.talk.frame.wrapping_add(1);
+        let ms = if self.talk.pos < total {
+            // one char per beat; the mouth takes that char's shape, and the
+            // beat stretches on punctuation (a breath at commas, a full
+            // pause at sentence ends) — dialogue-box pacing
+            let c = speech.chars().nth(self.talk.pos);
+            self.talk.pos += 1;
+            self.talk.last = c;
+            match c {
+                Some('.' | '!' | '?') => TALK_MS * 12,
+                Some(',' | ';' | ':' | '—') => TALK_MS * 5,
+                Some(' ') => TALK_MS * 2,
+                _ => TALK_MS,
+            }
+        } else {
+            self.talk.last = None;
+            TALK_IDLE_MS
+        };
+        self.talk_next = Some(Instant::now() + Duration::from_millis(ms));
+        self.dirty = true;
+    }
+
+    /// Reveal the whole speech at once (tests / instant mode).
+    #[cfg(test)]
+    fn talk_finish(&mut self) {
+        if let Some(i) = self.tour {
+            self.talk.pos = TOUR[i].card(self, i, TOUR.len()).speech.chars().count();
+        }
+    }
+
+    /// One animation frame of the current stop (run-loop clock).
+    fn tour_tick(&mut self) {
+        let Some(i) = self.tour else {
+            self.tour_next = None;
+            return;
+        };
+        self.tour_frame = self.tour_frame.wrapping_add(1);
+        TOUR[i].tick(self, self.tour_frame);
+        self.tour_next = TOUR[i]
+            .period_ms()
+            .map(|ms| Instant::now() + Duration::from_millis(ms));
+        self.dirty = true;
+    }
+
+    /// Move ±1 stop; past the last stop = finish.
+    fn tour_step(&mut self, dir: i32) {
+        let Some(i) = self.tour else { return };
+        TOUR[i].leave(self);
+        let next = i as i32 + dir;
+        if next < 0 {
+            self.tour_goto(0);
+        } else if next as usize >= TOUR.len() {
+            self.tour = None;
+            self.tour_next = None;
+            self.talk_next = None;
+            self.tour_finish();
+        } else {
+            self.tour_goto(next as usize);
+        }
+        self.dirty = true;
+    }
+
+    /// esc / q / ? — leave the tour from wherever it is (counts as seen).
+    fn tour_end(&mut self) {
+        if let Some(i) = self.tour.take() {
+            self.tour_next = None;
+            self.talk_next = None;
+            TOUR[i].leave(self);
+            self.tour_finish();
+        }
+    }
+
+    /// Common exit: the stage returns to a clean OVERVIEW · LIVE and the
+    /// first-launch marker is written so the tour never opens by itself
+    /// again (`w` / `--tour` reopen it on demand).
+    fn tour_finish(&mut self) {
+        self.tab = 0;
+        self.go_live();
+        if !self.demo && self.now_override.is_none() {
+            mark_welcomed();
+        }
+        self.dirty = true;
     }
 
     /// Clamp the rung override at PRESS time so the effective rung stays on
@@ -1778,6 +1973,45 @@ fn render_all(f: &mut Frame<'_>, app: &App) {
     if app.show_help {
         viz::render_help(&mut app.help.borrow_mut(), app.tab, f, area);
     }
+    if let Some(i) = app.tour {
+        // the guide paints LAST: it darkens the finished frame around the
+        // stop's focus region and drops its card beside it
+        let stop = &TOUR[i];
+        let focus = stop.focus(app, area, &panes);
+        viz::render_tour(
+            &stop.card(app, i, TOUR.len()),
+            app.talk,
+            focus,
+            stop.prefer_top(),
+            f,
+            area,
+        );
+    }
+}
+
+/// OVERVIEW's vertical split (map header · MAP · legend/inspect line · EKG).
+/// Shared by the renderer and the tour's focus rects so both agree.
+fn overview_layout(app: &App, tier: Tier, body: Rect) -> [Rect; 4] {
+    let ui0 = app.ui(tier);
+    // legend wraps to the width: reserve exactly the rows it needs
+    // (INSPECT replaces it with a single identity line)
+    let legend_h = if app.inspect {
+        1
+    } else {
+        viz::legend_rows(&app.st, body.width)
+    };
+    let reserved = 1 + legend_h + 3; // map header + legend + min EKG
+    let max_map = (body.height.saturating_sub(reserved)).max(3);
+    let map_h = viz::map_rows_needed(&app.st, &ui0, body.width, max_map)
+        .max(3)
+        .min(max_map);
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(map_h),
+        Constraint::Length(legend_h),
+        Constraint::Min(3),
+    ])
+    .areas(body)
 }
 
 fn render_tab_body(f: &mut Frame<'_>, app: &App, ui: &Ui, tier: Tier, body: Rect) {
@@ -1799,26 +2033,7 @@ fn render_tab_body(f: &mut Frame<'_>, app: &App, ui: &Ui, tier: Tier, body: Rect
             // + the EKG trend fills the rest as a line graph. The old headline
             // gauge was dropped — R / % / rate / compaction all live in the top
             // ribbon already, and the MAP box IS the context-space headline.
-            let ui0 = app.ui(tier);
-            // legend wraps to the width: reserve exactly the rows it needs
-            // (INSPECT replaces it with a single identity line)
-            let legend_h = if app.inspect {
-                1
-            } else {
-                viz::legend_rows(&app.st, body.width)
-            };
-            let reserved = 1 + legend_h + 3; // map header + legend + min EKG
-            let max_map = (body.height.saturating_sub(reserved)).max(3);
-            let map_h = viz::map_rows_needed(&app.st, &ui0, body.width, max_map)
-                .max(3)
-                .min(max_map);
-            let [maphdr, map, legend, ekg] = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Length(map_h),
-                Constraint::Length(legend_h),
-                Constraint::Min(3),
-            ])
-            .areas(body);
+            let [maphdr, map, legend, ekg] = overview_layout(app, tier, body);
             viz::render_map_header(&app.st, ui, f, maphdr, map);
             app.map_geom.set((map.width, map.height));
             viz::render_map(&app.st, ui, f, map);
@@ -1986,6 +2201,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
             deadline = deadline.min(next_heat);
         }
         deadline = deadline.min(next_blink);
+        if let Some(t) = app.tour_next {
+            deadline = deadline.min(t);
+        }
+        if let Some(t) = app.talk_next {
+            deadline = deadline.min(t);
+        }
         let timeout = deadline
             .saturating_duration_since(now0)
             .max(Duration::from_micros(500));
@@ -2053,6 +2274,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
             next_blink += Duration::from_millis(500);
             app.dirty = true;
         }
+        // welcome tour animation: one frame per due tick (the tick re-arms)
+        if app.tour_next.is_some_and(|t| now >= t) {
+            app.tour_tick();
+        }
+        if app.talk_next.is_some_and(|t| now >= t) {
+            app.talk_tick();
+        }
 
         // input: zero-timeout drain, modal-first dispatch, Press only
         while event::poll(Duration::from_millis(0))? {
@@ -2094,6 +2322,39 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// first-launch marker (~/.claude/amtr/welcomed)
+// ---------------------------------------------------------------------------
+
+fn welcomed_path() -> Option<std::path::PathBuf> {
+    viz::state_dir().map(|d| d.join("welcomed"))
+}
+
+/// The tour opens by itself exactly once per user: `--tour` forces it,
+/// `--no-tour` / `AMTR_NO_TOUR=1` suppress it (scripted runs, recordings),
+/// otherwise it opens iff the marker file is absent.
+fn should_open_tour(flag: Option<bool>) -> bool {
+    match flag {
+        Some(v) => v,
+        None => {
+            if std::env::var_os("AMTR_NO_TOUR").is_some_and(|v| !v.is_empty() && v != "0") {
+                return false;
+            }
+            welcomed_path().map(|p| !p.exists()).unwrap_or(false)
+        }
+    }
+}
+
+/// Written when the tour ends (finished, skipped or quit mid-way) — the
+/// content is the version that greeted the user, for the record.
+fn mark_welcomed() {
+    let Some(p) = welcomed_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, format!("amtr {}\n", env!("CARGO_PKG_VERSION")));
+}
+
 fn main() -> std::io::Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cli = match parse_args(&argv) {
@@ -2124,6 +2385,9 @@ fn main() -> std::io::Result<()> {
             .unwrap_or(0.0);
         app.demo = true;
         demo::populate(&mut app, now);
+        if cli.tour == Some(true) {
+            app.tour_open(); // demo never auto-opens: it is the testbench
+        }
         let mut terminal = ratatui::init();
         let res = run(&mut terminal, &mut app);
         ratatui::restore();
@@ -2148,6 +2412,9 @@ fn main() -> std::io::Result<()> {
     };
 
     let mut app = App::new(tx, rx);
+    if should_open_tour(cli.tour) {
+        app.tour_open();
+    }
     let mut terminal = ratatui::init(); // installs a restoring panic hook
     // mouse capture (wheel scroll): ratatui's init/restore does not manage
     // it, so enable here, release on every exit path — including panic,
@@ -5657,5 +5924,244 @@ mod screenshots {
             app.peek.is_none() && app.inspect,
             "i must close the overlay only"
         );
+    }
+
+    // ---- welcome tour ----------------------------------------------------
+
+    /// Every stop renders its strip with the right progress, drives the view
+    /// it talks about, and the tour leaves the instrument clean at the end.
+    #[test]
+    fn tour_walks_every_stop() {
+        let mut app = demo_app();
+        app.demo = true;
+        app.tour_open();
+        assert_eq!(app.tour, Some(0));
+        let n = TOUR.len();
+        for i in 0..n {
+            assert_eq!(app.tour, Some(i), "stop {i}");
+            app.talk_finish(); // the cat has said its piece
+            if TOUR[i] == tour::Stop::Rewind {
+                app.tour_tick(); // first frame of the loop steps back
+            }
+            let s = draw(&mut app, 110, 34);
+            assert!(s.contains(&format!("{}/{n}", i + 1)), "progress {}/{n} missing:\n{s}", i + 1);
+            match TOUR[i] {
+                tour::Stop::Welcome => assert!(s.contains("I'm your amtr guide"), "{s}"),
+                tour::Stop::Map => assert!(app.tab == 0 && s.contains("this box IS the budget"), "{s}"),
+                tour::Stop::Inspect => assert!(app.inspect && s.contains("INSPECT"), "{s}"),
+                tour::Stop::Rewind => assert!(s.contains("REPLAY"), "rewind must show « REPLAY:\n{s}"),
+                tour::Stop::Files => assert_eq!(app.tab, 1),
+                tour::Stop::Turns => assert_eq!(app.tab, 2),
+                tour::Stop::Agents => assert_eq!(app.tab, 3),
+                tour::Stop::Events => assert_eq!(app.tab, 4),
+                tour::Stop::Postmortem => {
+                    assert!(app.postmortem.is_some() && s.contains("COMPACTION 1"), "{s}")
+                }
+                tour::Stop::Shell => assert_eq!(app.tab, 5),
+                tour::Stop::Sessions => assert!(app.show_fleet && !app.system_wide && s.contains("SESSIONS"), "{s}"),
+                tour::Stop::Wall => assert!(app.system_wide && s.contains("SYSTEM-WIDE"), "{s}"),
+                tour::Stop::Finish => assert!(s.contains("that's the instrument") && s.contains("⏎ finish") && s.contains("=(^ﻌ^)="), "{s}"),
+                _ => {}
+            }
+            press(&mut app, KeyCode::Right);
+        }
+        // past the last stop: closed, back on OVERVIEW · LIVE, nothing left open
+        assert!(app.tour.is_none());
+        assert_eq!(app.tab, 0);
+        assert!(app.cursor.is_none() && !app.inspect && !app.show_fleet && app.postmortem.is_none());
+        let s = draw(&mut app, 110, 34);
+        assert!(!s.contains("/16 ╮"), "strip must be gone:\n{s}");
+        // ← from the first stop stays on the first stop; esc ends from anywhere
+        app.tour_open();
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.tour, Some(0));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right); // MAP
+        press(&mut app, KeyCode::Esc);
+        assert!(app.tour.is_none() && app.tab == 0);
+    }
+
+    /// Dispatch: the tour owns nav; a stop's own keys pass through (and park
+    /// the animation); everything else is swallowed; `w` reopens; `?` hands
+    /// over to help.
+    #[test]
+    fn tour_dispatch() {
+        let mut app = demo_app();
+        app.demo = true;
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.tour, Some(0));
+        // swallowed: `f` on WELCOME must not open SESSIONS, `2` must not switch
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('2'));
+        assert!(!app.show_fleet && app.tab == 0);
+        // to MAP: `m` passes through and cycles the lens, parking the loop
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Right);
+        }
+        assert_eq!(TOUR[app.tour.unwrap()], tour::Stop::Map);
+        assert!(app.tour_next.is_some(), "MAP is an animated stop");
+        assert!(app.map_mode == MapMode::Class);
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.map_mode == MapMode::Heat);
+        assert!(app.tour_next.is_none(), "a pass-through key parks the animation");
+        // space / enter also advance; backspace-free `b` goes back
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(TOUR[app.tour.unwrap()], tour::Stop::Inspect);
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(TOUR[app.tour.unwrap()], tour::Stop::Map);
+        // `?` closes the tour and opens help
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.tour.is_none() && app.show_help);
+        press(&mut app, KeyCode::Esc);
+        // `q` quits (and ends the tour)
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.tour.is_none() && app.quitting);
+    }
+
+    /// The loops: each animated stop changes the instrument frame to frame.
+    #[test]
+    fn tour_animation_frames() {
+        let mut app = demo_app();
+        app.demo = true;
+        app.tour_open();
+        let goto = |app: &mut App, want: tour::Stop| {
+            let i = TOUR.iter().position(|&s| s == want).unwrap();
+            app.tour_goto(i);
+        };
+        goto(&mut app, tour::Stop::Map);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            app.tour_tick();
+            seen.insert(app.map_mode.label().to_string());
+        }
+        assert_eq!(seen.len(), 4, "MAP loop must visit all four lenses");
+        goto(&mut app, tour::Stop::Inspect);
+        app.tour_tick();
+        assert_eq!(app.inspect_idx, 1);
+        goto(&mut app, tour::Stop::Rewind);
+        let last = app.st.last_turn().unwrap();
+        app.tour_tick();
+        assert_eq!(app.cursor, Some(last - 1), "first frame steps back one turn");
+        for _ in 0..7 {
+            app.tour_tick();
+        }
+        assert_eq!(app.cursor, Some(last - 8), "eight ← then hold");
+        for _ in 0..8 {
+            app.tour_tick();
+        }
+        assert!(app.cursor.is_none(), "the loop snaps back to LIVE");
+        goto(&mut app, tour::Stop::Files);
+        app.tour_tick();
+        assert_eq!(app.file_sel, 1);
+        goto(&mut app, tour::Stop::Agents);
+        app.tour_tick();
+        assert!(!app.agent_grid, "AGENTS flips grid ⇄ ledger");
+        goto(&mut app, tour::Stop::Shell);
+        app.tour_tick();
+        assert!(app.shell_view == ShellView::Retrieval);
+        goto(&mut app, tour::Stop::Wall);
+        let n = viz::fleet_live_rows(&app.st).len().clamp(1, 6);
+        for _ in 0..n {
+            app.tour_tick();
+        }
+        assert!(app.fleet_peek.is_some(), "the wall loop quicklooks a tile");
+        let s = draw(&mut app, 110, 34);
+        assert!(s.contains("PREVIEW"), "quicklook overlay under the strip:\n{s}");
+        // leaving the stop clears what it opened
+        press(&mut app, KeyCode::Right);
+        assert!(app.fleet_peek.is_none() && !app.show_fleet);
+    }
+
+    /// The coach-mark: cells outside the focus are darkened, cells inside
+    /// keep their color, the strip is placed beside (not over) the focus.
+    #[test]
+    fn tour_darkens_outside_focus() {
+        let mut app = demo_app();
+        app.demo = true;
+        let plain = buffer_of(&mut app, 110, 34);
+        app.tour_open();
+        app.tour_goto(1); // RIBBON: focus = row 0
+        let toured = buffer_of(&mut app, 110, 34);
+        let rgb_of = |c: Color| match c {
+            Color::Rgb(r, g, b) => (r as u32, g as u32, b as u32),
+            _ => (0, 0, 0),
+        };
+        // ribbon cell (row 0) unchanged; a MAP cell (row 8) darker
+        let (a, b) = (&plain[(3, 0)], &toured[(3, 0)]);
+        assert_eq!(a.fg, b.fg, "focused row must keep its color");
+        let (a, b) = (&plain[(40, 8)], &toured[(40, 8)]);
+        let (pa, pb) = (rgb_of(a.fg), rgb_of(b.fg));
+        assert!(pb.0 + pb.1 + pb.2 < pa.0 + pa.1 + pa.2, "outside cell must darken: {pa:?} → {pb:?}");
+        // the strip sits right under the focus row, never on it
+        let s = draw(&mut app, 110, 34);
+        let row2: String = s.lines().nth(2).unwrap().to_string();
+        assert!(row2.contains("2/16"), "strip expected on row 2 (below the ribbon):\n{s}");
+    }
+
+    /// The cat talks: speech types out two chars per tick with a caret on
+    /// the line being typed, the mouth cycles while typing, then it settles
+    /// to ω and idles (blink frames) — and a new stop starts a new speech.
+    #[test]
+    fn tour_cat_talks() {
+        let mut app = demo_app();
+        app.demo = true;
+        app.tour_open();
+        let s = draw(&mut app, 110, 34);
+        assert!(s.contains("=(⁼") && s.contains("▏"), "cat + caret at start:\n{s}");
+        assert!(!s.contains("meow! I'm"), "nothing revealed yet:\n{s}");
+        app.talk_tick();
+        assert_eq!(app.talk.pos, 1);
+        let mut mouths = std::collections::HashSet::new();
+        for _ in 0..12 {
+            app.talk_tick();
+            let s = draw(&mut app, 110, 34);
+            let row = s.lines().find(|l| l.contains("=(⁼")).unwrap().to_string();
+            let m = row.split("=(⁼").nth(1).unwrap().chars().next().unwrap();
+            mouths.insert(m);
+        }
+        assert!(mouths.len() >= 3, "mouth must follow the words while talking: {mouths:?}");
+        // the shape is the char's: "meow" → m ‿ · e o · o o · w ‿ · space ﻌ
+        assert_eq!(viz::mouth_for(Some('e')), "o");
+        assert_eq!(viz::mouth_for(Some('m')), "‿");
+        assert_eq!(viz::mouth_for(Some(' ')), "ﻌ");
+        assert_eq!(viz::mouth_for(Some('!')), "▽");
+        let total = TOUR[0].card(&app, 0, TOUR.len()).speech.chars().count();
+        for _ in 0..total {
+            app.talk_tick();
+        }
+        assert_eq!(app.talk.pos, total, "reveal clamps at the end");
+        let s = draw(&mut app, 110, 34);
+        assert!(
+            (s.contains("=(⁼ﻌ⁼)=") || s.contains("=(˘ﻌ˘)=")) && !s.contains("▏"),
+            "settled mouth (or a blink), no caret:\n{s}"
+        );
+        assert!(s.contains("press → when you're ready"), "full speech visible:\n{s}");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.talk.pos, 0, "a new stop starts a fresh speech");
+        assert!(app.talk_next.is_some());
+    }
+
+    /// No-panic sweep: every stop × sizes from 1×1 through 200×60.
+    #[test]
+    fn tour_no_panic_size_sweep() {
+        let widths = [1u16, 5, 14, 24, 30, 49, 50, 79, 80, 109, 110, 200];
+        let heights = [1u16, 5, 6, 9, 14, 15, 23, 24, 29, 30, 34, 60];
+        for i in 0..TOUR.len() {
+            let mut app = demo_app();
+            app.demo = true;
+            app.tour_open();
+            app.tour_goto(i);
+            for _ in 0..3 {
+                app.tour_tick();
+            }
+            for &w in &widths {
+                for &h in &heights {
+                    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    term.draw(|f| render_all(f, &mut app)).unwrap();
+                }
+            }
+        }
     }
 }
