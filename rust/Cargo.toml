@@ -1,6 +1,6 @@
 [package]
 name = "amtr"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "the agentic debugger for Claude Code: live context-window memory map, INSPECT/REPLAY, cache economics, subagent drill-in, compaction post-mortems"
 license = "MIT"
