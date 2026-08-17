@@ -431,7 +431,7 @@ history (`▁▂▃▄▅▆▇█`, fixed 0–16k). Sorts (`s`): size/recent/ch
 Selection ↔ roll row ↔ MAP highlight. `o` opens in `$EDITOR` (suspend/resume).
 `Enter` = detail line (full path, alpha-calibrated vs raw est, access counts).
 
-**NOW = live file activity, no turn history** (btop-process-list perspective).
+**NOW = live file activity, no turn history** (process-list perspective).
 - Hot ⟺ `now − last_epoch < 118.8 s` (the exact age where MAP heat goes static:
   `0.70·e^(−dt/45) ≤ 0.05` — one shared law). Order: `last_epoch` desc; files
   with `last_epoch == 0` sink to the cold tail. Evicted files stay (with `✝`)

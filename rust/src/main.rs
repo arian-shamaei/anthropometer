@@ -1,4 +1,4 @@
-//! amtr — a btop-style diagnostic instrument for Claude Code sessions.
+//! amtr — the agentic debugger for Claude Code sessions.
 //!
 //! This process owns ONLY the terminal UI (layout, keys, renderers). All data
 //! — session discovery, transcript tailing, token accounting — lives in the

@@ -1,5 +1,5 @@
 class Amtr < Formula
-  desc "Btop-style real-time context monitor for Claude Code sessions"
+  desc "Agentic debugger for Claude Code: live context map, replay, subagents, post-mortems"
   homepage "https://github.com/arian-shamaei/anthropometer"
   # TODO-confirm(tag): confirm the first release tag. NOTE: rust/Cargo.toml is
   url "https://github.com/arian-shamaei/anthropometer/archive/refs/tags/v0.4.0.tar.gz"

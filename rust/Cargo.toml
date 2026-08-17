@@ -2,13 +2,13 @@
 name = "amtr"
 version = "0.4.0"
 edition = "2024"
-description = "btop-style live monitor for Claude Code sessions: context-window memory map, cache economics, compaction forensics"
+description = "the agentic debugger for Claude Code: live context-window memory map, INSPECT/REPLAY, cache economics, subagent drill-in, compaction post-mortems"
 license = "MIT"
 repository = "https://github.com/arian-shamaei/anthropometer"
 homepage = "https://github.com/arian-shamaei/anthropometer"
 readme = "README.md"
-keywords = ["claude", "claude-code", "tui", "ratatui", "monitoring"]
-categories = ["command-line-utilities", "development-tools::profiling", "visualization"]
+keywords = ["claude", "claude-code", "debugger", "agents", "tui"]
+categories = ["command-line-utilities", "development-tools::debugging", "development-tools::profiling", "visualization"]
 include = ["src/**", "engine/*.py", "README.md"]
 
 [dependencies]

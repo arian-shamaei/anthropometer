@@ -1,12 +1,13 @@
 # anthropometer &nbsp;·&nbsp; `amtr`
 
-**A btop-style, real-time diagnostic instrument for Claude Code sessions.**
+**The agentic debugger for Claude Code.**
 
-`amtr` attaches to a Claude Code session's transcript and renders — live — exactly
-what is happening inside the model's context window: how the token budget is being
-spent, which files and tools are resident, when compactions fire, what subagents
-are doing, and the true cost of every turn. Press **`R`** and it compiles a
-ground-truth PDF report of the whole session.
+`amtr` attaches to a running agent session and lets you debug it the way you
+would a process: see the model's context window as a live memory map, step
+through what fills it and read the actual text, rewind to any turn, price every
+call, drill into each subagent's own window, and autopsy every compaction. Press
+**`R`** and it compiles a ground-truth PDF report of the whole session. Codex CLI
+sessions appear alongside in the fleet views.
 
 ![amtr — the context window filling up over a session](docs/assets/context-fill.gif)
 
@@ -34,9 +35,16 @@ ground-truth PDF report of the whole session.
 
 ---
 
-## Why
+## Why "debugger"
 
-`/context` gives you one number. `amtr` gives you the whole picture, continuously:
+A monitor tells you *how much*. A debugger lets you look *inside* and move
+*through time* — and that is what these keys are: **`i`** INSPECT walks the
+context window segment by segment and reads back the bytes the model actually
+holds (`⏎`); **`←/→`** REPLAY re-renders every view at any past turn from the
+engine's own snapshot; **`⏎`** on an agent re-targets the whole instrument to
+that subagent's window (backspace returns); **`c`** opens a compaction's
+post-mortem — what was dropped, by category and by file. `/context` gives you
+one number. `amtr` gives you the whole picture, continuously:
 the context window as a **live memory map**, file access as a **traffic seismograph**,
 cache economics as a **per-turn ledger**, compactions as **forensic events**, and
 subagents as an **economics table** — every quantity labeled *authoritative*

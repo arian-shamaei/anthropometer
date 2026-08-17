@@ -1,6 +1,6 @@
 # amtr was built in one conversation. It performed the autopsy itself.
 
-*amtr is a btop-style monitor for Claude Code sessions: it attaches to a session's transcript and
+*amtr is the agentic debugger for Claude Code: it attaches to a session's transcript and
 shows, live, exactly what is in the model's context window. amtr was itself vibe-coded in Claude
 Code — which means the complete, token-level record of its own construction is sitting on disk,
 in the very format it was built to read.*
