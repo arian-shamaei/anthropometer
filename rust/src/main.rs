@@ -43,7 +43,8 @@ amtr — context monitor for Claude Code sessions (UI side; data via amtr_engine
 usage: amtr [--session FILE|ID] [--project PATH] [--budget N]
             [--engine PATH] [--python PATH] [--engine-args ARGS...]
 
-  --session      attach to a specific session (.jsonl path or session id)
+  --session      attach to a session: Claude Code, Codex CLI or Gemini CLI
+                 transcript path, or its session id
   --project      newest session under this project path
   --budget       pin the context budget (tokens); passed to the engine
   --engine       path to amtr_engine.py (default: repo root, or $AMTR_ENGINE)

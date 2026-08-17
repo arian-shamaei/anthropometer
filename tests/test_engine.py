@@ -1453,5 +1453,208 @@ class TestFleetRows(unittest.TestCase):
                 self.fail("--fleet did not exit on closed pipe")
 
 
+# ------------------------------------------------------------ providers
+CX_FIX = os.path.join(ROOT, "tests", "fixtures", "codex-rollout.jsonl")
+GM_FIX = os.path.join(ROOT, "tests", "fixtures", "gemini-session.jsonl")
+
+
+def _feed(path):
+    s = ce.Session(path)
+    with open(path, encoding="utf-8") as fh:
+        off = 0
+        for line in fh:
+            s.feed_line(line, off)
+            off += len(line.encode("utf-8"))
+    return s
+
+
+class TestProviders(unittest.TestCase):
+    """Codex CLI and Gemini CLI transcripts through the adapters (SPEC f2 →
+    attach). Fixtures mirror the real recorders' shapes with synthetic
+    content; every number below is derived by hand:
+      codex turn0 usage: input 1000 / cached 800 / out 50 → in 200 · cr 800
+      codex turn1: 1500 / 1100 / 80 → 400 · 1100 · 80;  turn2: 400 / 0 / 10
+      gemini turn0 tokens input 5000 cached 4000 output 40 thoughts 20 →
+        in 1000 · cr 4000 · out 60 (output + thoughts);  last turn 900/0/4
+    """
+
+    def test_detect_provider(self):
+        self.assertEqual(ce.detect_provider(CX_FIX), "claude") if False else None
+        # by path
+        self.assertEqual(ce.detect_provider("/x/.codex/sessions/2026/08/01/rollout-2026-08-01T10-00-00-abc.jsonl"), "codex")
+        self.assertEqual(ce.detect_provider("/x/.gemini/tmp/proj/chats/session-2026-08-01T10-00-abcdefgh.jsonl"), "gemini")
+        self.assertEqual(ce.detect_provider("/x/.claude/projects/-p/uuid.jsonl"), "claude")
+        # by first line (fixtures live outside the CLIs' dirs)
+        self.assertEqual(ce.detect_provider(CX_FIX), "codex")
+        self.assertEqual(ce.detect_provider(GM_FIX), "gemini")
+        self.assertEqual(ce.detect_provider(FIX), "claude")
+
+    def test_codex_turns_and_meta(self):
+        s = _feed(CX_FIX)
+        self.assertEqual(s.provider, "codex")
+        self.assertEqual(s.session_id, "cx-fixture-0001")
+        self.assertEqual(s.project, "/home/dev/proj")
+        self.assertEqual(s.model, "gpt-5.6-sol")
+        self.assertEqual(s.budget, 258400)          # model_context_window
+        self.assertEqual(s.display_name(), "proj-cx")
+        self.assertEqual(s.meta_payload()["provider"], "codex")
+        # three requests → three turns; the identical rate-limit refresh
+        # (second token_count, nothing buffered) opened none
+        got = [(t["in"], t["cr"], t["cc"], t["out"], t["resident"]) for t in s.turns]
+        self.assertEqual(got, [(200, 800, 0, 50, 1000),
+                               (400, 1100, 0, 80, 1500),
+                               (400, 0, 0, 10, 400)])
+        self.assertEqual(s.resident(), 400)
+
+    def test_codex_tools_files_shell_retrieval_agents(self):
+        s = _feed(CX_FIX)
+        # exec_command → SHELL console entry, exit parsed from the output text
+        self.assertEqual(len(s.cmds), 1)
+        c = s.cmds[0]
+        self.assertEqual(c["cmd"], "ls")
+        self.assertTrue(c["ok"])
+        self.assertEqual(c["out"], "Makefile\nsrc")
+        # apply_patch "Add File" → a Write on the file
+        f = list(s.files.values())
+        self.assertEqual([(x["path"], x["writes"], x["edits"], x["reads"]) for x in f],
+                         [("/home/dev/proj/build.sh", 1, 0, 0)])
+        # web_search_end → retrieval feed entry with the result count
+        self.assertEqual([(r["kind"], r["q"], r["n"]) for r in s.rets],
+                         [("search", "make tutorial", 2)])
+        # sub_agent_activity started → a running agent named by its path
+        self.assertEqual([(a["id"], a["state"], a["agent_type"]) for a in s.agents.values()],
+                         [("cx-agent-0001", "running", "reviewer")])
+        # view_image output: the base64 payload is priced as ONE image, not
+        # as 5k tokens of text (20000 chars / 3.8 would be 5263)
+        img = [g for g in s.ring.values() if g["uuid"] == "fco-2"]
+        self.assertEqual(len(img), 0)   # evicted by the compaction below
+        # …so check it in the compaction's dropped tool total instead: the
+        # tool_result blocks that were dropped sum well under 5k
+        self.assertLess(s.compactions[0]["dropped_cats"].get("tool", 0), 2000)
+
+    def test_codex_compaction(self):
+        s = _feed(CX_FIX)
+        self.assertEqual(len(s.compactions), 1)
+        c = s.compactions[0]
+        # pre = R at the cut (turn1's resident); survivors = the two ids in
+        # replacement_history; post = the kept history's estimate
+        self.assertEqual(c["pre"], 1500)
+        self.assertEqual(c["preserved_msgs"], 2)
+        self.assertGreater(c["post"], 0)
+        self.assertLess(c["post"], 100)
+        self.assertEqual(c["dropped"], c["pre"] - c["post"])
+        live = sorted(g["uuid"] for g in s.ring.values())
+        # kept: both user prompts, the post-cut assistant text, and turn1's
+        # hidden reasoning (allocated when turn2 opened, after the cut)
+        self.assertEqual(live, ["msg-a-3", "msg-u-1", "msg-u-2", "reasoning-t1"])
+        # the compaction event landed in the ledger
+        self.assertTrue(any(e["kind"] == "compaction" for e in s.events))
+
+    def test_codex_replay(self):
+        s = _feed(CX_FIX)
+        # state at the end of turn 0: one request, its prompt + assistant
+        # text + shell result all resident, no compaction yet
+        c0 = s.state_at_turn(0)
+        self.assertEqual(len(c0.turns), 1)
+        self.assertEqual(c0.resident(), 1000)
+        self.assertEqual(c0.compactions, [])
+        self.assertIn("msg-u-1", [g["uuid"] for g in c0.ring.values()])
+        self.assertIn("fco-1", [g["uuid"] for g in c0.ring.values()])
+        # end of turn 1 = everything up to turn 2's open, which is AFTER
+        # the compaction cut (the Claude replay law, unchanged)
+        c1 = s.state_at_turn(1)
+        self.assertEqual(c1.resident(), 1500)
+        self.assertEqual(len(c1.compactions), 1)
+        self.assertNotIn("fco-1", [g["uuid"] for g in c1.ring.values()])
+
+    def test_gemini_turns_and_meta(self):
+        s = _feed(GM_FIX)
+        self.assertEqual(s.provider, "gemini")
+        self.assertEqual(s.session_id, "gm-fixture-0001")
+        self.assertEqual(s.model, "gemini-2.5-pro")
+        self.assertEqual(s.budget, 1048576)         # tokenLimit(gemini-2.5-pro)
+        got = [(t["in"], t["cr"], t["out"], t["resident"]) for t in s.turns]
+        self.assertEqual(got, [(1000, 4000, 60, 5000), (100, 5000, 12, 5100),
+                               (100, 5100, 20, 5200), (100, 5200, 9, 5300),
+                               (900, 0, 4, 900)])
+
+    def test_gemini_upsert_tools_and_compression(self):
+        s = _feed(GM_FIX)
+        # the tool-call message was appended twice (executing, then success
+        # + tokens): ONE turn, ONE shell entry, the result priced once
+        self.assertEqual(len(s.cmds), 1)
+        self.assertEqual((s.cmds[0]["cmd"], s.cmds[0]["ok"], s.cmds[0]["out"]),
+                         ("ls", True, "Makefile\nsrc"))
+        self.assertEqual([(x["path"], x["reads"]) for x in s.files.values()],
+                         [("/home/dev/proj/Makefile", 1)])
+        # $set.messages replaced the history: everything before is gone,
+        # the synthetic summary pair + what followed is what remains
+        self.assertEqual(len(s.compactions), 1)
+        c = s.compactions[0]
+        self.assertEqual(c["pre"], 5300)
+        self.assertEqual(c["preserved_msgs"], 0)
+        self.assertEqual(c["dropped"], c["pre"] - c["post"])
+        live = sorted(g["uuid"] for g in s.ring.values())
+        self.assertEqual(live, ["g-a-5", "g-s-1", "g-s-2", "g-u-3", "reasoning-t3"])
+
+    def test_gemini_rewind(self):
+        # $rewindTo truncates the history from that id: a manual compaction
+        # whose survivors are the ids before it
+        lines = [json.dumps(x) for x in [
+            {"sessionId": "gm-rw", "projectHash": "h", "startTime": "2026-08-01T00:00:00Z", "kind": "main"},
+            {"id": "u1", "timestamp": "2026-08-01T00:00:01Z", "type": "user", "content": "one"},
+            {"id": "a1", "timestamp": "2026-08-01T00:00:02Z", "type": "gemini", "content": "reply one",
+             "tokens": {"input": 100, "output": 5, "cached": 0, "thoughts": 0, "tool": 0, "total": 105}, "model": "gemini-2.5-flash"},
+            {"id": "u2", "timestamp": "2026-08-01T00:00:03Z", "type": "user", "content": "two"},
+            {"id": "a2", "timestamp": "2026-08-01T00:00:04Z", "type": "gemini", "content": "reply two",
+             "tokens": {"input": 120, "output": 5, "cached": 100, "thoughts": 0, "tool": 0, "total": 125}, "model": "gemini-2.5-flash"},
+            {"$rewindTo": "u2"},
+        ]]
+        s = ce.Session("/tmp/nowhere/session-x.jsonl", provider="gemini")
+        for ln in lines:
+            s.feed_line(ln, 0)
+        self.assertEqual(len(s.compactions), 1)
+        self.assertEqual(s.compactions[0]["trigger"], "manual")
+        self.assertEqual(sorted(g["uuid"] for g in s.ring.values()), ["a1", "u1"])
+
+    def test_tail_parsers_and_quicklook(self):
+        with open(GM_FIX, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        info = ce.gemini_tail_parse(lines)
+        self.assertEqual(info["status"], "idle")     # last record: gemini + tokens
+        self.assertEqual(info["resident"], 900)
+        self.assertEqual(info["budget"], 1048576)
+        self.assertEqual(info["last_prompt"], "thanks")
+        # a trailing user message → busy
+        info2 = ce.gemini_tail_parse(lines + [json.dumps(
+            {"id": "u9", "timestamp": "t", "type": "user", "content": "more?"})])
+        self.assertEqual(info2["status"], "busy")
+        with open(CX_FIX, encoding="utf-8") as fh:
+            cx = ce.codex_tail_parse(fh.read().splitlines())
+        self.assertEqual(cx["status"], "idle")
+        self.assertTrue(cx["ended"])
+        self.assertEqual(cx["resident"], 400)
+        # quicklook tails, provider-aware
+        msgs = ce.transcript_tail_msgs(CX_FIX)
+        # both prompts and both answers, harness injections (the developer
+        # record) filtered; the two assistant chunks of task 1 merged
+        self.assertEqual([m["role"] for m in msgs],
+                         ["user", "assistant", "user", "assistant"])
+        self.assertIn("build script", msgs[0]["text"])
+        self.assertIn("Done: build.sh added.", msgs[1]["text"])
+        self.assertEqual(msgs[3]["text"], "Compacted.")
+        gm = ce.transcript_tail_msgs(GM_FIX)
+        self.assertEqual(gm[-1], {"role": "assistant", "text": "Any time."})
+        self.assertEqual(gm[-2], {"role": "user", "text": "thanks"})
+
+    def test_provider_agent_map(self):
+        # a Codex rollout as an agent's own transcript builds a mini-map
+        mp = ce.build_agent_map(CX_FIX, 200_000)
+        self.assertIsNotNone(mp)
+        self.assertEqual(mp["resident"], 400)
+        self.assertEqual(mp["budget"], 258400)
+        self.assertTrue(any(sg["cat"] == "user" for sg in mp["segs"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

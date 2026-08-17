@@ -782,8 +782,9 @@ are built (TUI picker included):
   file whose old pid was since reused (`kill -0` passes), duplicating the
   session; among duplicates the alive entry with the newest `updatedAt`
   wins. Consumers still MUST tolerate duplicates (version-drift law).
-- **Providers (additive)** — the feed MAY append rows for OTHER local agent
-  CLIs, tagged `provider:str` (absent ⇒ claude). v1 ships a Codex adapter.
+- **Providers (additive)** — the roster carries rows for OTHER local agent
+  CLIs, tagged `provider:str` (absent ⇒ claude), in the picker, the wall
+  and this feed alike, and their transcripts ATTACH (section f3). Codex:
   Codex append-closes its rollout files (open-file discovery is impossible)
   and a session that has not taken a prompt has no rollout at all, so the
   pairing law is: each live `codex` process (process scan) claims the
@@ -793,9 +794,86 @@ are built (TUI picker included):
   rollout's `task_started`/`task_complete` events (event-precise),
   `resident` = last `token_count` `last_token_usage.input_tokens`,
   `budget` = `model_context_window`, `last_prompt` from `user_message`,
-  tmux locator by pane-tty match. Provider rows appear ONLY in this feed —
-  the TUI cannot attach a non-Claude transcript, so they never enter its
-  picker.
+  tmux locator by pane-tty match. Gemini: each live `gemini` process (a
+  node script — matched by argv, not comm) claims the newest unclaimed
+  recording under `~/.gemini/tmp/<short>/chats/session-*.jsonl`, where
+  `<short>` is the CLI's project id for the process cwd
+  (`~/.gemini/projects.json`, else sha256(cwd)); Gemini writes no task
+  events, so status is inferred from the tail — a trailing `user` record
+  (or a `gemini` record still without `tokens`) is busy, else idle;
+  `resident` = last `tokens.input`, `budget` = the CLI's `tokenLimit`
+  (1,048,576; 256k for Gemma 4), `last_prompt` = last user text. Recent
+  offline transcripts of both providers (Codex: last 30 day-dirs; Gemini:
+  newest 60) join the roster as `offline` rows so they can be attached.
+
+## (f3) Providers → attach — one accounting core, three transcript formats
+
+A `Session` detects its provider from the path (`/.codex/`, `rollout-*` ·
+`/.gemini/` + `session-*`) or the first line (`session_meta` · a
+`sessionId`+`projectHash` metadata line) and, for a non-Claude provider,
+feeds every raw line through a stateful, deep-copyable ADAPTER that emits
+Claude-shaped records (`user` · `assistant` · `attachment` · `system
+compact_boundary` · `provider_meta` · `provider_event`) which `feed_obj`
+digests unchanged. Checkpoints clone the adapter with the session, so
+replay/seek resumes mid-stream; `state_at_turn` replays raw lines through
+`translate()` and stops on the first emitted record that would open a turn
+past the target (the Claude law).
+
+**Ordering law (both adapters):** the usage record OPENS the turn first,
+then the response's content records (each with its OWN uuid — compaction
+survivors match by uuid), then the tool_result records; content is held
+until the request's usage is known, so allocations always land in the turn
+that paid for them.
+
+**Codex** (`~/.codex/sessions/…/rollout-*.jsonl`): `session_meta` →
+provider_meta (id, cwd, cli_version; subagent rollouts carry the nickname
+as title); `turn_context.model` → model; `task_started` /
+`token_count.model_context_window` → budget (authoritative, `provider_meta
+budget`); one `token_count` = one turn: `in = input − cached`, `cr =
+cached`, `cc = cache_write`, `out = output` (reasoning tokens ride inside
+`out`, so hidden reasoning = out − visible works unchanged); an identical
+`last_token_usage` with nothing buffered is a rate-limit refresh, not a
+turn. `response_item message role:user` → user (the harness's own
+`# AGENTS.md…` / `<environment_context>` injections → attach), role
+developer/system → attach, role assistant → assistant text; `reasoning` →
+its visible summary as thinking; `function_call exec_command|shell` → Bash
+(`{command, workdir}`; the output's `Process exited with code N` is the
+exit status, the text after `Output:` the stdout → SHELL); `custom_tool_call
+apply_patch` → one Write (`*** Add File`) / Edit (`*** Update File`) per
+file, fan-out ids `call#i` sharing the one output; `view_image` outputs
+(base64 `input_image` parts) → the flat-priced image block, never text;
+`web_search_end` → WebSearch + result count (RETRIEVAL); `sub_agent_activity
+started` → a running Task agent named by its `agent_path` whose OWN rollout
+(`rollout-*-<agent_thread_id>.jsonl`) the engine finds and tails for
+resident (= own_tok), completion (`task_complete`) and its mini-map;
+`compacted.replacement_history` ids → the compaction's survivors, `pre` = R
+at the cut, `post` = the kept history's estimate; `task_complete` /
+`turn_aborted` flush anything still buffered under the last request.
+
+**Gemini** (`~/.gemini/tmp/<short>/chats/session-*.jsonl`, an UPSERT log —
+a message may be re-appended with more fields; only the delta is emitted):
+the metadata line → provider_meta; a `user` message → user; a `gemini`
+message → ONE turn keyed by its id: `in = tokens.input − cached`, `cr =
+cached`, `cc = 0`, `out = output + thoughts`; its `content` → assistant
+text, `thoughts[]` (subject/description) → thinking, `toolCalls[]` (once
+finished) → tool_use + tool_result: `read_file`/`read_many_files` → Read
+(the response text is the file copy), `write_file` → Write, `replace`/`edit`
+→ Edit, `run_shell_command` → Bash (`Output:` … `Exit Code:` parsed),
+`google_web_search`/`web_fetch` → WebSearch/WebFetch, `agentId` → a Task
+agent whose recording is `chats/<parent id>/<agent id>.jsonl` (idle tail ⇒
+done); `inlineData` parts → the image block. `$set.messages` = the history
+REPLACED (chat compression): survivors are the new set's ids that were
+already seen (normally none), the new synthetic messages are emitted right
+after; `$set.summary` → title; `$rewindTo: id` → a manual compaction whose
+survivors are the ids before it. `budget` = `tokenLimit(model)`. The
+recording never names its project: `~/.gemini/tmp/<short>/.project_root`
+(else the registry inverse) fills it at attach.
+
+Everything downstream — MAP, INSPECT peek, REPLAY, FILES, TURNS, SHELL,
+RETRIEVAL, EVENTS, post-mortems, AGENTS drill-in, quicklook tails
+(`_provider_tail_msgs`), the report — is provider-blind. Fixtures:
+`tests/fixtures/codex-rollout.jsonl`, `tests/fixtures/gemini-session.jsonl`
+(real recorder shapes, synthetic content); tests in `TestProviders`.
 
 ## (g) Demo / visual-testbench mode
 

@@ -6,8 +6,10 @@
 would a process: see the model's context window as a live memory map, step
 through what fills it and read the actual text, rewind to any turn, price every
 call, drill into each subagent's own window, and autopsy every compaction. Press
-**`R`** and it compiles a ground-truth PDF report of the whole session. Codex CLI
-sessions appear alongside in the fleet views.
+**`R`** and it compiles a ground-truth PDF report of the whole session.
+
+Works on **Claude Code**, **Codex CLI** and **Gemini CLI** sessions — every
+view, every key, one instrument (see [Providers](#providers)).
 
 ![amtr — the context window filling up over a session](docs/assets/context-fill.gif)
 
@@ -122,6 +124,32 @@ post-mortem on `Enter`). A timeline scrubber holds the whole session; `←/→` 
 every view to any past turn.
 
 ---
+
+## Providers
+
+`amtr` reads each CLI's own transcript and translates it into one accounting
+model, so the whole instrument works the same on all three:
+
+| CLI | transcript it reads | turn = | context window |
+|---|---|---|---|
+| Claude Code | `~/.claude/projects/<slug>/<sid>.jsonl` | one API request | 200k / 1M rung, auto-bumped |
+| Codex CLI | `~/.codex/sessions/Y/M/D/rollout-<ts>-<id>.jsonl` | one `token_count` | `model_context_window` (authoritative) |
+| Gemini CLI | `~/.gemini/tmp/<project>/chats/session-<ts>-<id>.jsonl` | one `gemini` message | the CLI's own model limit (1M; 256k Gemma) |
+
+Live Codex and Gemini sessions show up in **SESSIONS** (`f`) and the
+**SYSTEM-WIDE** wall next to Claude ones (`name-cx` / `name-gm`), with status,
+resident, last prompt and quicklook; recent transcripts of both are attachable
+too. Once attached: MAP, INSPECT, REPLAY, FILES (Codex `apply_patch` files,
+Gemini `read_file`/`write_file`/`replace`), TURNS (Codex cached vs uncached
+input; Gemini cached vs prompt tokens, thoughts counted as output), SHELL
+(`exec_command` / `run_shell_command` with exit status), EVENTS + post-mortems
+(Codex `compacted`, Gemini history compression / rewind), AGENTS with drill-in
+(Codex subagent rollouts, Gemini subagent recordings) and the PDF report.
+What a provider does not record (Codex has no cache-write tier, Gemini has no
+compaction sizes) stays absent and labeled *estimated* — never invented.
+
+`amtr --session <path-or-id>` takes a Codex rollout / Gemini recording path
+or session id directly.
 
 ## The report — press `R`
 
