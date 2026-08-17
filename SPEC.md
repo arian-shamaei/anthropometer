@@ -324,8 +324,8 @@ green R/B<0.60, amber <0.85, red ≥0.85 (fixed). Fill rate = EMA(ΔR per turn,
 k=8). ETA = `(T_auto·B − R)/max(1,slope)` turns, slope = least-squares over last
 16 turns (UI-computed from its turn ring).
 Row 1 — **tabs line**: `[1]OVERVIEW [2]FILES [3]TURNS [4]AGENTS [5]EVENTS
-(f)FLEET (?)help`, active tab inverse; right side `● LIVE` (green) or
-`« REPLAY t=N/M` (amber). Glyph discipline: width-1 glyphs ONLY throughout the
+(f)FLEET (?)help`, active tab inverse; right side blank while live, or
+`« REPLAY t=N/M` (amber) when rewound. Glyph discipline: width-1 glyphs ONLY throughout the
 UI (blocks, eighths, shade, braille, `▼◆▲✝«»·`); no emoji, no wide glyphs.
 Row 2 — **timeline scrubber** (the whole session in one row): column c covers
 turn bucket `[c·M/(W), (c+1)·M/W)`; glyph = shade ramp `·░▒▓█` of max resident/B

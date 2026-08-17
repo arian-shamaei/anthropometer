@@ -5513,20 +5513,21 @@ pub fn render_ribbon(
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Row 1 — tabs line with the LIVE / REPLAY indicator right-aligned.
+/// Row 1 — tabs line with the REPLAY indicator right-aligned (empty when live).
 pub fn render_tabs(st: &State, ui: &Ui, active: usize, f: &mut Frame<'_>, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    // Right end: « REPLAY while rewound; nothing while following live.
     let right = match ui.cursor {
-        None => ("● LIVE".to_string(), C_GREEN),
+        None => (String::new(), C_GREEN),
         Some(t) => (
             format!("« REPLAY t={}/{}", t, st.last_turn().unwrap_or(0)),
             C_AMBER,
         ),
     };
     // SPEC elision rule: shorten the LEFT content (drop hints, then compact
-    // tab labels) before ever clipping the LIVE/REPLAY indicator.
+    // tab labels) before ever clipping the REPLAY indicator.
     let w = area.width as usize;
     let right_w = right.0.chars().count();
     let hints = "(f)SESSIONS (?)help";
@@ -5565,9 +5566,10 @@ pub fn render_tabs(st: &State, ui: &Ui, active: usize, f: &mut Frame<'_>, area: 
         .saturating_sub(used)
         .saturating_sub(right.0.chars().count());
     spans.push(Span::raw(" ".repeat(pad)));
-    // Steady — the LIVE indicator no longer blinks (it read as an alarm).
-    let rstyle = fg(right.1).add_modifier(Modifier::BOLD);
-    spans.push(Span::styled(right.0, rstyle));
+    if !right.0.is_empty() {
+        let rstyle = fg(right.1).add_modifier(Modifier::BOLD);
+        spans.push(Span::styled(right.0, rstyle));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 

@@ -346,7 +346,7 @@ impl Stop {
                 "",
             ),
             Stop::Tabs => (
-                "six views, one key each. the right end says ● LIVE while you follow along and « REPLAY when you've rewound. try 1 through 6 — I'll wait!".into(),
+                "six views, one key each. the right end shows « REPLAY whenever you've rewound; blank means you're following live. try 1 through 6 — I'll wait!".into(),
                 "1–6",
             ),
             Stop::Map => (

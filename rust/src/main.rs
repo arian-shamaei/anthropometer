@@ -2740,7 +2740,7 @@ mod screenshots {
         app.tab = 0;
         let s = draw(&mut app, 110, 30);
         assert!(s.contains("OVERVIEW"), "tab bar missing:\n{s}");
-        assert!(s.contains("● LIVE"), "live indicator missing:\n{s}");
+        assert!(!s.contains("LIVE"), "no live indicator anymore:\n{s}");
         assert!(s.contains("R 121k/200k"), "ribbon R missing:\n{s}");
         assert!(s.contains("▪="), "MAP rung label missing:\n{s}");
         assert!(s.contains("class"), "MAP mode label missing:\n{s}");
@@ -5322,18 +5322,19 @@ mod screenshots {
     }
 
     /// (10) six tabs under the unmodified elision ladder: hints drop first,
-    /// labels compact next, the LIVE/REPLAY indicator never clips.
+    /// labels compact next, the REPLAY indicator never clips.
     #[test]
     fn tabs_six_elide_80() {
         let mut app = demo_app();
         let s = draw(&mut app, 80, 24);
         assert!(s.contains("[6]SHELL"), "sixth tab missing:\n{s}");
-        assert!(!s.contains("(f)SESSIONS"), "hints must drop at 80:\n{s}");
-        assert!(s.contains("● LIVE"), "LIVE must survive:\n{s}");
+        assert!(s.contains("(f)SESSIONS"), "hints fit at 80 with no right badge:\n{s}");
+        assert!(!s.contains("LIVE"), "no LIVE badge:\n{s}");
         app.cursor = Some(15);
         let s = draw(&mut app, 80, 24);
         assert!(s.contains("« REPLAY t=15/39"), "REPLAY must survive:\n{s}");
         assert!(s.contains("[6]SHELL"), "full labels survive REPLAY at 80:\n{s}");
+        assert!(!s.contains("(f)SESSIONS"), "hints drop first under REPLAY at 80:\n{s}");
         app.cursor = None;
         let s = draw(&mut app, 54, 16);
         assert!(s.contains("[6]"), "compact label missing:\n{s}");
