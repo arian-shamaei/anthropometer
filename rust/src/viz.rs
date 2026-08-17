@@ -3676,7 +3676,7 @@ fn render_shell_header(
 }
 
 /// Header posture, shared by both SHELL perspectives:
-/// replay > follow (blink-dimmed like ● LIVE) > browsing.
+/// replay > follow (blink-dimmed) > browsing.
 fn feed_posture(ui: &Ui, follow: bool, newer: usize, what: &str) -> (String, Style) {
     if let Some(t) = ui.cursor {
         (
@@ -5565,10 +5565,8 @@ pub fn render_tabs(st: &State, ui: &Ui, active: usize, f: &mut Frame<'_>, area: 
         .saturating_sub(used)
         .saturating_sub(right.0.chars().count());
     spans.push(Span::raw(" ".repeat(pad)));
-    let mut rstyle = fg(right.1).add_modifier(Modifier::BOLD);
-    if ui.cursor.is_none() && !ui.blink {
-        rstyle = fg(scale(right.1, 0.6));
-    }
+    // Steady — the LIVE indicator no longer blinks (it read as an alarm).
+    let rstyle = fg(right.1).add_modifier(Modifier::BOLD);
     spans.push(Span::styled(right.0, rstyle));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
