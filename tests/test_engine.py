@@ -1720,6 +1720,49 @@ class TestLocalBackendProbe(unittest.TestCase):
         b = ce._backend_from_entry("http://h:11434", e, False)
         self.assertEqual((b["ctx"], b["loaded"]), (40960, False))
 
+    def test_truncation_event_at_served_window(self):
+        # served window 65536 -> margin 1310 (2%): warn crossing 64226,
+        # once (hysteresis), re-armed only after relief below 90%
+        s = ce.Session("/x.jsonl", budget=65536, budget_pinned=True)
+        s.backend = {"kind": "ollama", "url": "u", "params": "27.3B",
+                     "quant": "Q4_K_M", "ctx": 65536, "loaded": True}
+        def turn(rid, r_in):
+            s.feed_obj({"type": "assistant", "uuid": "u-" + rid,
+                        "requestId": rid,
+                        "timestamp": "2026-07-17T11:00:00.000Z",
+                        "message": {"role": "assistant", "model": "qwen3.8",
+                                    "content": [],
+                                    "usage": {"input_tokens": r_in,
+                                              "output_tokens": 1,
+                                              "cache_read_input_tokens": 0,
+                                              "cache_creation_input_tokens": 0}}})
+        def truncs():
+            return [e for e in s.events if e["kind"] == "truncation"]
+        turn("r1", 60_000)
+        self.assertEqual(len(truncs()), 0)
+        turn("r2", 64_300)              # inside the margin -> event
+        self.assertEqual(len(truncs()), 1)
+        turn("r3", 65_000)              # still inside -> no duplicate
+        self.assertEqual(len(truncs()), 1)
+        turn("r4", 50_000)              # relief below 90% re-arms
+        turn("r5", 65_000)
+        self.assertEqual(len(truncs()), 2)
+
+    def test_no_truncation_without_backend(self):
+        # an Anthropic session at 99% of budget must NOT truncation-warn:
+        # pressure covers it, compaction resolves it
+        s = ce.Session("/x.jsonl", budget=200_000, budget_pinned=True)
+        s.feed_obj({"type": "assistant", "uuid": "u-r1", "requestId": "r1",
+                    "timestamp": "2026-07-17T11:00:00.000Z",
+                    "message": {"role": "assistant", "model": "claude-fable-5",
+                                "content": [],
+                                "usage": {"input_tokens": 199_000,
+                                          "output_tokens": 1,
+                                          "cache_read_input_tokens": 0,
+                                          "cache_creation_input_tokens": 0}}})
+        self.assertEqual(
+            [e for e in s.events if e["kind"] == "truncation"], [])
+
     def test_meta_carries_backend(self):
         s = ce.Session("/x.jsonl", budget=200_000)
         self.assertIsNone(s.meta_payload()["backend"])

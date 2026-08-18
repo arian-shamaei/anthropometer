@@ -1290,6 +1290,7 @@ class Session:
         self._sig_turn = -1      # last turn index the thrash signals ran for
         self._sid_seen = False
         self.zone = 0
+        self._trunc_warned = False
         # map
         self.map_rev = 0
         self.map_base_n = 0      # segs in the last coalesced map emission
@@ -1774,6 +1775,23 @@ class Session:
                 self._event("pressure", "warn", ts,
                             "context %.0f%% of budget (amber)" % (frac * 100))
         self.zone = z
+        # local-backend truncation: the served window is a hard ceiling the
+        # CLI does not know about — pressure on Anthropic ends in a compaction,
+        # here it ends in the server silently dropping the OLDEST context.
+        # Warn on the upward crossing into the margin; re-arm only after real
+        # relief (compaction or rebuild pulls R back under 90%).
+        ctx = (self.backend or {}).get("ctx") if isinstance(self.backend, dict) \
+            else None
+        if ctx and (self.backend or {}).get("loaded"):
+            if R >= ctx - max(1024, ctx // 50):
+                if not self._trunc_warned:
+                    self._trunc_warned = True
+                    self._event("truncation", "error", ts,
+                                "R %dk at served window %dk — server will "
+                                "truncate oldest context"
+                                % (R // 1000, ctx // 1000))
+            elif R < int(ctx * 0.90):
+                self._trunc_warned = False
 
     def _bump_budget(self, need, ts):
         for rung in BUDGET_RUNGS:

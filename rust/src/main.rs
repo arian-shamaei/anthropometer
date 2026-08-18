@@ -3561,6 +3561,73 @@ mod screenshots {
         }
     }
 
+    // ---- local-backend truncation cliff ------------------------------------
+
+    #[test]
+    fn map_truncation_cliff_band() {
+        // a probe-pinned served window paints its last-2% margin: free cells
+        // there = dim red edge, content reaching it = danger-tinted. An
+        // identical session WITHOUT backend shows neither color anywhere.
+        let mk = |backend: Option<ipc::Backend>| {
+            let mut app = bare_app();
+            app.st.meta = Some(Meta {
+                session_id: "s".into(),
+                attach_gen: 1,
+                path: String::new(),
+                project: String::new(),
+                name: "qwen".into(),
+                title: None,
+                model: "qwen3.8".into(),
+                budget: 65_536,
+                t_auto: 0.85,
+                cc_version: None,
+                started_at: None,
+                backend,
+            });
+            app.st.budget = 65_536;
+            app.st.resident = 65_000;
+            app.apply_update(Update::Map(MapMsg {
+                rev: 1,
+                alpha: 1.0,
+                segs: vec![seg(0, "overhead", 3_000, None, 0, 60.0),
+                           seg(1, "file", 62_000, Some(1), 0, 30.0)],
+                resident: None,
+                budget: None,
+            }));
+            app.tab = 0;
+            app
+        };
+        let colors = |app: &mut App| -> std::collections::HashSet<ratatui::style::Color> {
+            let buf = buffer_of(app, 110, 30);
+            let mut out = std::collections::HashSet::new();
+            for y in 0..30u16 {
+                for x in 0..110u16 {
+                    let st = buf[(x, y)].style();
+                    out.extend(st.fg);
+                    out.extend(st.bg);
+                }
+            }
+            out
+        };
+        let edge = ratatui::style::Color::Rgb;
+        let (er, eg, eb) = viz::scale(viz::C_RED, 0.35);
+        let mut local = mk(Some(ipc::Backend {
+            kind: "ollama".into(),
+            url: "u".into(),
+            params: "27.3B".into(),
+            quant: "Q4_K_M".into(),
+            ctx: Some(65_536),
+            loaded: true,
+        }));
+        let got = colors(&mut local);
+        assert!(got.contains(&edge(er, eg, eb)),
+                "cliff edge color missing from local-backend map");
+        let mut api = mk(None);
+        let got = colors(&mut api);
+        assert!(!got.contains(&edge(er, eg, eb)),
+                "cliff edge color must not appear without a backend");
+    }
+
     // ---- (3) MAP fixed-scale invariance ------------------------------------
 
     #[test]

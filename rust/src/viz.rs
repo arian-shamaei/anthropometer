@@ -744,6 +744,18 @@ fn cell_px(
 ) -> CellPx {
     let reversed = false; // never reverse a solid map cell — it renders black
     let mut color: Option<Color> = None;
+    // local-backend truncation cliff (engine probe): the served window is a
+    // hard ceiling, not a compaction trigger — its last 2% (min 1024 tok) is
+    // loss territory. Only when the budget IS the served window (probe-pinned).
+    let trunc_lo = st
+        .meta
+        .as_ref()
+        .and_then(|m| m.backend.as_ref())
+        .and_then(|b| {
+            let ctx = b.ctx.filter(|c| b.loaded && *c == st.budget && *c > 0)?;
+            Some(ctx - (ctx / 50).max(1024).min(ctx))
+        });
+    let in_band = |lo: u64| addr + s_tok > lo;
     if let Some(oi) = owner {
         let sg = &segs[oi];
         let base = match ui.map_mode {
@@ -769,6 +781,11 @@ fn cell_px(
             }
         };
         color = Some(rgb(base));
+        // content that reached the cliff band burns toward danger red —
+        // these tokens are next to fall off server-side (selection wins below)
+        if trunc_lo.is_some_and(&in_band) {
+            color = Some(rgb(lerp(base, C_RED, 0.55)));
+        }
         // selection highlights (every mode): FILES cross-link · INSPECT walk.
         // The INSPECT walk ANIMATES on the blink clock — a static inversion
         // vanishes into a dense map; a white↔inverted breath does not.
@@ -792,6 +809,10 @@ fn cell_px(
     } else if addr < total {
         // a zero-token hole inside the resident span (shouldn't happen)
         color = Some(rgb(C_GRID));
+    } else if trunc_lo.is_some_and(&in_band) {
+        // free cells at the cliff: a dim red edge, visible before the fill
+        // arrives — the API map has no cliff, so free space stays C_FREE there
+        color = Some(rgb(scale(C_RED, 0.35)));
     }
     // pulse overrides (all modes)
     if st.compact_sweep > 0 && color.is_some() {

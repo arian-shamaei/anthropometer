@@ -355,6 +355,7 @@ impl State {
         if e.severity >= Severity::Warn {
             let label = match e.kind.as_str() {
                 "api_error" => "API_ERROR",
+                "truncation" => "TRUNCATED",
                 "model_fallback" => "MODEL_FALLBACK",
                 "agent_failed" => "AGENT_FAILED",
                 "stall" => "STALLED",
