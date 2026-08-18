@@ -1263,6 +1263,7 @@ class Session:
         self.provider_budget = False    # a provider adapter set the window
         self.t_auto = t_auto
         self.model = ""
+        self.backend = None    # local-backend identity (§ backend probe)
         self.cc_version = None
         self.started_at = None
         self.started_epoch = 0.0
@@ -2373,6 +2374,7 @@ class Session:
                 "provider": self.provider,
                 "project": self.project or "", "title": self.title,
                 "model": self.model or "?", "budget": int(self.budget),
+                "backend": self.backend,
                 "t_auto": round(self.t_auto, 4), "cc_version": self.cc_version,
                 "started_at": self.started_at}
 
@@ -2978,6 +2980,127 @@ def fleet_budget(base, resident):
             return max(base, r)
     return max(base, BUDGET_RUNGS[-1])
 
+# ---------------------------------------------------- local-backend probe
+# A session whose model is not an Anthropic name (e.g. `ollama launch
+# claude --model qwen3.8`) is served by a local/proxied backend. The
+# transcript cannot say WHAT serves it, but the machine can: the claude
+# process's env carries ANTHROPIC_BASE_URL, and an Ollama server answers
+# /api/ps with the loaded model's parameter size, quantization, and its
+# EFFECTIVE context window — which is the session's true budget. Everything
+# here is asked, never guessed: no answer -> no backend shown.
+
+def _env_kv(tokens):
+    """NAME=VALUE pairs from ps/environ token streams (values are URLs or
+    model names — never contain spaces, so token-wise parsing is safe)."""
+    out = {}
+    for t in tokens:
+        if "=" in t and re.match(r"^[A-Z][A-Z0-9_]*=", t):
+            k, _, v = t.partition("=")
+            out[k] = v
+    return out
+
+_MODEL_ENV_KEYS = ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                   "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                   "ANTHROPIC_DEFAULT_HAIKU_MODEL")
+
+def _proc_env(pid):
+    """Env of a same-user process: /proc on Linux, `ps -wwE` on macOS."""
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as fh:
+            return _env_kv(fh.read().decode("utf-8", "replace").split("\0"))
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["ps", "-wwE", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5).stdout
+        return _env_kv(out.split())
+    except Exception:
+        return {}
+
+def _base_url_for_model(model):
+    """The ANTHROPIC_BASE_URL of the claude process that serves `model`.
+    Joined on the model NAME (env hints or --model arg), not the session id:
+    the transcript is the only place the session id lives, and no process
+    advertises it. A lone base_url-bearing claude process wins by default."""
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "pid=,command="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    weak = None
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid, cmd = int(parts[0]), parts[1]
+        head = cmd.split()[0] if cmd.split() else ""
+        if os.path.basename(head) != "claude" or " --bg-" in cmd:
+            continue
+        env = _proc_env(pid)
+        url = env.get("ANTHROPIC_BASE_URL")
+        if not url:
+            continue
+        hints = [env[k] for k in _MODEL_ENV_KEYS if env.get(k)]
+        m = re.search(r"--model[ =](\S+)", cmd)
+        if m:
+            hints.append(m.group(1))
+        if model in hints:
+            return url                      # strong join: named our model
+        weak = weak or url
+    return weak
+
+def _http_json(url, payload=None, timeout=2.5):
+    import urllib.request
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+def _ollama_pick(models, model):
+    """The entry serving `model`: exact name, then tag-stripped name."""
+    want = model.split(":")[0]
+    for m in models or []:
+        name = m.get("name") or m.get("model") or ""
+        if name == model or name.split(":")[0] == want:
+            return m
+    return None
+
+def _backend_from_entry(url, entry, loaded):
+    d = entry.get("details") or {}
+    info = {"kind": "ollama", "url": url,
+            "params": d.get("parameter_size") or "",
+            "quant": d.get("quantization_level") or "",
+            "ctx": None, "loaded": loaded}
+    ctx = entry.get("context_length")
+    if not ctx:
+        # /api/show: model_info carries "<family>.context_length" — the
+        # model's MAX window, not the served one; better than nothing
+        mi = entry.get("model_info") or {}
+        for k, v in mi.items():
+            if k.endswith(".context_length"):
+                ctx = v
+                break
+    if isinstance(ctx, int) and ctx > 0:
+        info["ctx"] = ctx
+    return info
+
+def probe_local_backend(model, url=None):
+    """Identity of the local backend serving `model`, or None. Only the
+    /api/ps `context_length` is the served (budget-true) window."""
+    url = (url or _base_url_for_model(model)
+           or "http://localhost:11434").rstrip("/")
+    try:
+        if "version" not in _http_json(url + "/api/version"):
+            return None
+        entry = _ollama_pick(_http_json(url + "/api/ps").get("models"), model)
+        if entry:
+            return _backend_from_entry(url, entry, True)
+        entry = _http_json(url + "/api/show", {"model": model})
+        return _backend_from_entry(url, entry, False)
+    except Exception:
+        return None
+
 # ---------------------------------------------------------------- engine
 class Engine:
     def __init__(self, args):
@@ -3222,6 +3345,46 @@ class Engine:
         if meta != self._last_meta:
             self._last_meta = meta
             send(dict({"type": "meta"}, **meta))
+        self._maybe_probe_backend(sess)
+
+    # ---- local-backend probe ----------------------------------------------------
+    def _maybe_probe_backend(self, sess):
+        """Fire the probe once per (session, model), off-thread — the tail
+        loop must never wait on a network answer."""
+        m = sess.model
+        if (not m or m == "?" or sess.provider != "claude"
+                or m.startswith("claude-")):
+            return
+        if getattr(sess, "_probed_model", None) == m:
+            return
+        sess._probed_model = m
+        threading.Thread(target=self._probe_backend, args=(sess, m),
+                         daemon=True).start()
+
+    def _probe_backend(self, sess, model):
+        info = probe_local_backend(model)
+        if info is None:
+            return
+        with self.lock:
+            if self.session is not sess or sess.model != model:
+                return
+            sess.backend = info
+            ctx = info.get("ctx")
+            if info.get("loaded") and ctx and not sess.budget_pinned \
+                    and ctx != sess.budget:
+                # /api/ps ctx is the SERVED window — authoritative, pin it
+                old, sess.budget = sess.budget, int(ctx)
+                sess.budget_pinned = True
+                send({"type": "event", "kind": "backend", "severity": "info",
+                      "ts": now_hhmmss(),
+                      "turn": max(0, len(sess.turns) - 1),
+                      "msg": "local backend %s (%s %s): budget %d -> %d"
+                             % (model, info.get("params") or "?",
+                                info.get("quant") or "?", old, sess.budget)})
+            meta = sess.meta_payload()
+            if meta != self._last_meta:
+                self._last_meta = meta
+                send(dict({"type": "meta"}, **meta))
 
     # ---- tail thread -------------------------------------------------------------
     def tail_loop(self):

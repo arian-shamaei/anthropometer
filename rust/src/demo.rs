@@ -69,6 +69,7 @@ pub(crate) fn populate(app: &mut App, now: f64) {
             t_auto: 0.85,
             cc_version: Some("2.1.212".into()),
             started_at: None,
+            backend: None,
         }));
         st.ready = true;
         st.health = Some(Health {

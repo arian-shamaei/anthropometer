@@ -1686,5 +1686,47 @@ class TestProviders(unittest.TestCase):
         self.assertTrue(any(sg["cat"] == "user" for sg in mp["segs"]))
 
 
+class TestLocalBackendProbe(unittest.TestCase):
+    def test_env_kv_ignores_args(self):
+        kv = ce._env_kv(["/usr/bin/claude", "--model", "qwen3.8",
+                         "ANTHROPIC_BASE_URL=http://h:11434",
+                         "path=/lower/case/skipped",
+                         "ANTHROPIC_DEFAULT_SONNET_MODEL=qwen3.8"])
+        self.assertEqual(kv["ANTHROPIC_BASE_URL"], "http://h:11434")
+        self.assertEqual(kv["ANTHROPIC_DEFAULT_SONNET_MODEL"], "qwen3.8")
+        self.assertNotIn("path", kv)
+
+    def test_ollama_pick_matches_tag_stripped(self):
+        models = [{"name": "llama3:8b"}, {"name": "qwen3.8:latest"}]
+        self.assertEqual(ce._ollama_pick(models, "qwen3.8")["name"],
+                         "qwen3.8:latest")
+        self.assertIsNone(ce._ollama_pick(models, "mistral"))
+
+    def test_backend_from_ps_entry(self):
+        # /api/ps shape: served (effective) context_length at top level
+        e = {"name": "qwen3.8:latest",
+             "details": {"parameter_size": "27.3B",
+                         "quantization_level": "Q4_K_M"},
+             "context_length": 65536}
+        b = ce._backend_from_entry("http://h:11434", e, True)
+        self.assertEqual(b, {"kind": "ollama", "url": "http://h:11434",
+                             "params": "27.3B", "quant": "Q4_K_M",
+                             "ctx": 65536, "loaded": True})
+
+    def test_backend_from_show_entry(self):
+        # /api/show shape: max window under model_info.<family>.context_length
+        e = {"details": {"parameter_size": "8B", "quantization_level": "Q8_0"},
+             "model_info": {"qwen3.context_length": 40960}}
+        b = ce._backend_from_entry("http://h:11434", e, False)
+        self.assertEqual((b["ctx"], b["loaded"]), (40960, False))
+
+    def test_meta_carries_backend(self):
+        s = ce.Session("/x.jsonl", budget=200_000)
+        self.assertIsNone(s.meta_payload()["backend"])
+        s.backend = {"kind": "ollama", "url": "u", "params": "27.3B",
+                     "quant": "Q4_K_M", "ctx": 65536, "loaded": True}
+        self.assertEqual(s.meta_payload()["backend"]["ctx"], 65536)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

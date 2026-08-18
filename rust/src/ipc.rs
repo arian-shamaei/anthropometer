@@ -501,6 +501,30 @@ pub struct Meta {
     /// type unspecified in the spec — accept anything (version-drift law)
     #[serde(default)]
     pub started_at: Option<serde_json::Value>,
+    /// local-backend identity (engine probe): present only when a
+    /// non-Anthropic backend answered for this session's model
+    #[serde(default)]
+    pub backend: Option<Backend>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Backend {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub url: String,
+    /// parameter size as the server states it, e.g. "27.3B"
+    #[serde(default)]
+    pub params: String,
+    /// quantization level, e.g. "Q4_K_M"
+    #[serde(default)]
+    pub quant: String,
+    /// served context window (tokens); the session's true budget
+    #[serde(default)]
+    pub ctx: Option<u64>,
+    /// true when read from the loaded model (/api/ps), not the registry
+    #[serde(default)]
+    pub loaded: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

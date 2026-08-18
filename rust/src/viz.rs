@@ -5436,7 +5436,22 @@ pub fn render_ribbon(
     ));
     let title_at = spans.len(); // title placeholder — elided FIRST (name wins)
     spans.push(Span::raw(String::new()));
-    spans.push(Span::styled(format!("{model} "), fg(C_DIM)));
+    // local backend known (engine probe): the model gets its true identity
+    // inline — `qwen3.8·27.3B·Q4_K_M·ollama` — instead of a bare name
+    let backend = st.meta.as_ref().and_then(|m| m.backend.as_ref());
+    let model_txt = match backend {
+        Some(b) => {
+            let mut parts = vec![model.clone()];
+            for p in [b.params.as_str(), b.quant.as_str(), b.kind.as_str()] {
+                if !p.is_empty() {
+                    parts.push(p.to_string());
+                }
+            }
+            parts.join("·")
+        }
+        None => model.clone(),
+    };
+    spans.push(Span::styled(format!("{model_txt} "), fg(C_DIM)));
     spans.push(Span::styled("│ ".to_string(), fg(C_GRID)));
     spans.push(Span::styled(
         format!(
