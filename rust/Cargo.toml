@@ -2,7 +2,7 @@
 name = "amtr"
 version = "0.5.1"
 edition = "2024"
-description = "the agentic debugger for Claude Code: live context-window memory map, INSPECT/REPLAY, cache economics, subagent drill-in, compaction post-mortems"
+description = "the agentic debugger for AI coding agents (Claude Code, Codex CLI): live context-window memory map, INSPECT/REPLAY, cache economics, subagent drill-in, compaction post-mortems"
 license = "MIT"
 repository = "https://github.com/arian-shamaei/anthropometer"
 homepage = "https://github.com/arian-shamaei/anthropometer"

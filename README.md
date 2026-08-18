@@ -52,8 +52,9 @@ cache economics as a **per-turn ledger**, compactions as **forensic events**, an
 subagents as an **economics table** — every quantity labeled *authoritative*
 (read straight from the API usage records) or *estimated*, never blurred together.
 
-It works on any Claude Code session — interactive or headless (`claude -p`) — because
-every session already writes a complete transcript. `amtr` just reads it in real time.
+It works on any session — Claude Code interactive or headless (`claude -p`), and
+Codex CLI — because every agent already writes a complete transcript. `amtr` just
+reads it in real time; new agents are a parser away.
 
 ---
 
