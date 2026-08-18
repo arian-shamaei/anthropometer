@@ -2694,16 +2694,16 @@ def build_agent_map(path, budget):
 
 
 def tail_usage(path, span=65536):
-    """Resident tokens of the newest non-synthetic assistant usage, from a
-    bounded backward read. Returns int or None."""
+    """(resident tokens, model) of the newest non-synthetic assistant usage,
+    from a bounded backward read. Returns (int, str) or (None, "")."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
             fh.seek(max(0, size - span))
             data = fh.read(span + 1)
     except OSError:
-        return None
-    best = None
+        return None, ""
+    best, model = None, ""
     for line in data.split(b"\n"):
         if b'"usage"' not in line or b'"assistant"' not in line:
             continue
@@ -2711,16 +2711,21 @@ def tail_usage(path, span=65536):
             d = json.loads(line.decode("utf-8", "replace"))
         except Exception:
             continue
-        if not isinstance(d, dict) or d.get("type") != "assistant" or not d.get("requestId"):
+        if not isinstance(d, dict) or d.get("type") != "assistant":
             continue
         m = d.get("message")
         if not isinstance(m, dict) or (m.get("model") or "") == "<synthetic>":
+            continue
+        # message.id fallback: local backends write no requestId (same rule
+        # as _feed_assistant)
+        if not (d.get("requestId") or m.get("id")):
             continue
         u = m.get("usage")
         if isinstance(u, dict):
             best = (_i(u.get("input_tokens")) + _i(u.get("cache_read_input_tokens"))
                     + _i(u.get("cache_creation_input_tokens")))
-    return best
+            model = m.get("model") or model
+    return best, model
 
 def history_last_prompts(span=65536):
     """sessionId -> last prompt display, from the tail of ~/.claude/history.jsonl."""
@@ -3090,6 +3095,10 @@ def _backend_from_entry(url, entry, loaded):
             "params": d.get("parameter_size") or "",
             "quant": d.get("quantization_level") or "",
             "ctx": None, "loaded": loaded}
+    for k in ("size", "size_vram"):
+        v = entry.get(k)
+        if isinstance(v, int) and v > 0:
+            info[k] = v
     ctx = entry.get("context_length")
     if not ctx:
         # /api/show: model_info carries "<family>.context_length" — the
@@ -3143,7 +3152,8 @@ class Engine:
         self._last_health_emit = 0.0
         self._last_growth = time.time()
         self._roster_cache = []
-        self._resident_cache = {}              # path -> (mtime, resident)
+        self._resident_cache = {}      # path -> (mtime, (resident, model))
+        self._backend_ctx = {}         # model -> served window (probe result)
         self._agent_map_cache = {}             # agent path -> (mtime, map|None)
         # seek coalescing (latest wins)
         self._seek_cond = threading.Condition()
@@ -3379,6 +3389,11 @@ class Engine:
         threading.Thread(target=self._probe_backend, args=(sess, m),
                          daemon=True).start()
 
+    def _backend_event(self, sess, msg, severity="info"):
+        send({"type": "event", "kind": "backend", "severity": severity,
+              "ts": now_hhmmss(), "turn": max(0, len(sess.turns) - 1),
+              "msg": msg})
+
     def _probe_backend(self, sess, model):
         info = probe_local_backend(model)
         if info is None:
@@ -3388,21 +3403,72 @@ class Engine:
                 return
             sess.backend = info
             ctx = info.get("ctx")
+            if info.get("loaded") and ctx:
+                self._backend_ctx[model] = int(ctx)   # fleet rows inherit it
             if info.get("loaded") and ctx and not sess.budget_pinned \
                     and ctx != sess.budget:
                 # /api/ps ctx is the SERVED window — authoritative, pin it
                 old, sess.budget = sess.budget, int(ctx)
                 sess.budget_pinned = True
-                send({"type": "event", "kind": "backend", "severity": "info",
-                      "ts": now_hhmmss(),
-                      "turn": max(0, len(sess.turns) - 1),
-                      "msg": "local backend %s (%s %s): budget %d -> %d"
-                             % (model, info.get("params") or "?",
-                                info.get("quant") or "?", old, sess.budget)})
+                self._backend_event(
+                    sess, "local backend %s (%s %s): budget %d -> %d"
+                    % (model, info.get("params") or "?",
+                       info.get("quant") or "?", old, sess.budget))
+            # partial CPU offload: the standing explanation for every slow
+            # turn that follows — said once, where the user looks when slow
+            size, vram = info.get("size"), info.get("size_vram")
+            if size and vram and vram < size * 0.95:
+                self._backend_event(
+                    sess, "vram %.1fG/%.1fG — partial CPU offload, "
+                    "slow decode expected" % (vram / 1e9, size / 1e9))
             meta = sess.meta_payload()
             if meta != self._last_meta:
                 self._last_meta = meta
                 send(dict({"type": "meta"}, **meta))
+        self._backend_watch(sess, model, info["url"])
+
+    def _backend_watch(self, sess, model, url):
+        """Slow /api/ps poll: model lifecycle as MOMENTS in the events feed —
+        unload (cold load ahead), reload (window may change). Transitions
+        only; a quiet server stays quiet. Runs until the session detaches."""
+        loaded = True
+        while not self._quitting.wait(15):
+            with self.lock:
+                if self.session is not sess or sess.model != model:
+                    return
+            try:
+                entry = _ollama_pick(
+                    _http_json(url + "/api/ps").get("models"), model)
+            except Exception:
+                continue                 # server hiccup: silent, keep watching
+            now_loaded = entry is not None
+            if now_loaded == loaded:
+                continue
+            loaded = now_loaded
+            with self.lock:
+                if self.session is not sess or sess.model != model:
+                    return
+                if not now_loaded:
+                    self._backend_event(
+                        sess, "model %s unloaded — cold load on next turn"
+                        % model)
+                    continue
+                info = _backend_from_entry(url, entry, True)
+                self._backend_event(sess, "model %s loaded" % model)
+                sess.backend = info
+                ctx = info.get("ctx")
+                if ctx:
+                    self._backend_ctx[model] = int(ctx)
+                if ctx and ctx != sess.budget:
+                    old, sess.budget = sess.budget, int(ctx)
+                    sess.budget_pinned = True
+                    self._backend_event(
+                        sess, "served window changed: budget %d -> %d"
+                        % (old, sess.budget))
+                meta = sess.meta_payload()
+                if meta != self._last_meta:
+                    self._last_meta = meta
+                    send(dict({"type": "meta"}, **meta))
 
     # ---- tail thread -------------------------------------------------------------
     def tail_loop(self):
@@ -3731,19 +3797,20 @@ class Engine:
                 continue
             tp = find_transcript(sid)
             mt = 0.0
-            res = None
+            res, rmodel = None, ""
             if tp:
                 try:
                     mt = os.path.getmtime(tp)
                 except OSError:
                     pass
-                res = self._resident_of(tp, mt)
+                res, rmodel = self._resident_of(tp, mt)
             status = fleet_row_status(e.get("status"), e["_alive"], mt, now)
             out.append({"id": sid, "path": tp or "", "pid": e.get("pid"),
                         "name": e.get("name") or memorable_name(sid),
                         "project": e.get("cwd") or "",
                         "status": status, "mtime": mt, "live": e["_alive"],
-                        "resident": res, "budget": self._row_budget(res),
+                        "resident": res,
+                        "budget": self._row_budget(res, rmodel),
                         "last_prompt": prompts.get(sid),
                         # additive (SPEC b version-drift law): the session's
                         # tmux home "session:@window.%pane" when hosted there
@@ -3774,12 +3841,12 @@ class Engine:
         recents.sort(reverse=True)
         for mt, p, d in recents[:500]:
             sid = os.path.basename(p)[:-6]
-            res = self._resident_of(p, mt)
+            res, rmodel = self._resident_of(p, mt)
             out.append({"id": sid, "path": p, "pid": None,
                         "name": memorable_name(sid),
                         "project": d, "status": "offline", "mtime": mt,
                         "live": False, "resident": res,
-                        "budget": self._row_budget(res),
+                        "budget": self._row_budget(res, rmodel),
                         "last_prompt": prompts.get(sid)})
         # other providers: live rows first (interleaved with the live Claude
         # rows by the front end's own sort), then their recent transcripts
@@ -3826,9 +3893,15 @@ class Engine:
                          "last_prompt": None, "provider": "gemini"})
         return rows
 
-    def _row_budget(self, resident):
-        """A fleet row's budget: pinned --budget verbatim, else the base
-        budget auto-bumped to fit the row's own resident (`fleet_budget`)."""
+    def _row_budget(self, resident, model=""):
+        """A fleet row's budget: a probe-confirmed served window when the
+        row's model has one (local sessions render on THEIR window, not an
+        Anthropic rung), else pinned --budget verbatim, else the base budget
+        auto-bumped to fit the row's own resident (`fleet_budget`)."""
+        if model and not model.startswith("claude-"):
+            ctx = self._backend_ctx.get(model)
+            if ctx:
+                return int(ctx)
         if self.budget_pinned:
             return self.budget
         return fleet_budget(self.budget, resident)
@@ -4152,6 +4225,7 @@ class Engine:
         return rows
 
     def _resident_of(self, path, mtime):
+        """(resident, model) of a roster transcript, mtime-cached."""
         c = self._resident_cache.get(path)
         if c and c[0] == mtime:
             return c[1]
@@ -4242,7 +4316,17 @@ class Engine:
             status = "dead"
         else:
             status = entry.get("status") or "idle"
-            if status == "busy" and now - max(mt, self._last_growth) > 120:
+            # stall threshold is API-shaped (120s); a local model legitimately
+            # thinks longer — scale by ITS observed rhythm (3x median turn
+            # duration), only when a backend is confirmed, so API sessions
+            # keep the exact historical behavior
+            limit = 120.0
+            if sess.backend:
+                durs = sorted(t["dur_ms"] for t in sess.turns[-32:]
+                              if t.get("dur_ms"))
+                if durs:
+                    limit = max(limit, 3.0 * durs[len(durs) // 2] / 1000.0)
+            if status == "busy" and now - max(mt, self._last_growth) > limit:
                 status = "stalled"
         payload = {"status": status, "last_activity_ts": mt,
                    "api_errors": sess.api_errors,
@@ -4256,7 +4340,8 @@ class Engine:
             send({"type": "event", "kind": "stall", "severity": "warn",
                   "ts": now_hhmmss(),
                   "turn": max(0, len(sess.turns) - 1),
-                  "msg": "no transcript growth for 120s while busy"})
+                  "msg": "no transcript growth for %ds while busy"
+                         % int(limit)})
         if changed or now - self._last_health_emit >= 5.0:
             self._last_health = payload
             self._last_health_emit = now

@@ -259,6 +259,16 @@ impl State {
         self.eta_alerted = false;
     }
 
+    /// No cache mechanism exists here: a local backend serves the session and
+    /// no observed turn ever carried a cached token. The cache instruments go
+    /// DORMANT (muted `—`), because a 0% hit reads as bad performance when
+    /// the truth is "there is no cache". One cached token anywhere wakes them.
+    pub fn cache_dormant(&self) -> bool {
+        self.meta.as_ref().is_some_and(|m| m.backend.is_some())
+            && !self.turns.is_empty()
+            && self.turns.iter().all(|t| t.cr == 0 && t.cc == 0)
+    }
+
     fn apply_turn(&mut self, t: Turn) {
         // The engine upserts: a turn is re-emitted when streamed same-requestId
         // usage or a trailing turn_duration updates it. Replace in place — the

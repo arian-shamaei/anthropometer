@@ -3561,6 +3561,49 @@ mod screenshots {
         }
     }
 
+    // ---- cache dormancy ----------------------------------------------------
+
+    #[test]
+    fn cache_dormant_needs_backend_and_no_cached_token() {
+        let mut app = bare_app();
+        let meta = |backend: Option<ipc::Backend>| Meta {
+            session_id: "s".into(),
+            attach_gen: 1,
+            path: String::new(),
+            project: String::new(),
+            name: "qwen".into(),
+            title: None,
+            model: "qwen3.8".into(),
+            budget: 65_536,
+            t_auto: 0.85,
+            cc_version: None,
+            started_at: None,
+            backend,
+        };
+        let be = || {
+            Some(ipc::Backend {
+                kind: "ollama".into(),
+                url: "u".into(),
+                params: "27.3B".into(),
+                quant: "Q4_K_M".into(),
+                ctx: Some(65_536),
+                loaded: true,
+            })
+        };
+        // backend + all-zero cache -> dormant
+        app.st.meta = Some(meta(be()));
+        app.st.apply(Update::Turn(t4(0, 0, 0, 0, 0, 57_000)));
+        assert!(app.st.cache_dormant());
+        // one cached token wakes the instruments
+        app.st.apply(Update::Turn(t4(1, 512, 0, 0, 0, 57_000)));
+        assert!(!app.st.cache_dormant());
+        // no backend -> never dormant, even with zero cache
+        let mut api = bare_app();
+        api.st.meta = Some(meta(None));
+        api.st.apply(Update::Turn(t4(0, 0, 0, 0, 0, 57_000)));
+        assert!(!api.st.cache_dormant());
+    }
+
     // ---- local-backend truncation cliff ------------------------------------
 
     #[test]

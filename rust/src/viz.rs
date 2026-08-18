@@ -2263,8 +2263,13 @@ pub fn render_turns_tab(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
                 chunks[2],
             );
         }
+        // cache dormant (local backend, no cached token ever): the ku lane's
+        // hit-coloring would paint every column miss-red — the truth is "no
+        // cache exists", so the lane goes muted instead of alarmed
+        let ku_color: &dyn Fn(&crate::ipc::Turn) -> (u8, u8, u8) =
+            if st.cache_dormant() { &|_| C_DIM } else { &ku_lane_color };
         f.render_widget(
-            Paragraph::new(lane(&|t| t.cost_u, &ku_lane_color, 100.0, "ku")),
+            Paragraph::new(lane(&|t| t.cost_u, ku_color, 100.0, "ku")),
             chunks[lane_rows as usize],
         );
     }
@@ -2274,10 +2279,16 @@ pub fn render_turns_tab(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
         let d = chunks[chunks.len() - 1];
         let lines: Vec<Line<'static>> = match by_turn.get(&cursor_turn) {
             Some(t) => {
+                // dormant cache: `hit —`, not a 0.0% that reads as failure
+                let hit_txt = if st.cache_dormant() {
+                    "—".to_string()
+                } else {
+                    format!("{:.1}%", t.hit * 100.0)
+                };
                 let mut l2: Vec<Span<'static>> = vec![Span::styled(
                     format!(
-                        "hit {:.1}%   cost {:.1}ku   dur {}   stop {}   tools {}",
-                        t.hit * 100.0,
+                        "hit {}   cost {:.1}ku   dur {}   stop {}   tools {}",
+                        hit_txt,
                         t.cost_u,
                         t.dur_ms.map(fmt_dur).unwrap_or_else(|| "—".into()),
                         t.stop.clone().unwrap_or_else(|| "—".into()),

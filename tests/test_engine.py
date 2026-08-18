@@ -1763,6 +1763,33 @@ class TestLocalBackendProbe(unittest.TestCase):
         self.assertEqual(
             [e for e in s.events if e["kind"] == "truncation"], [])
 
+    def test_tail_usage_returns_model_and_accepts_local(self):
+        import tempfile
+        rec = {"type": "assistant", "uuid": "u1",
+               "message": {"role": "assistant", "model": "qwen3.8",
+                           "id": "msg_a",
+                           "usage": {"input_tokens": 500, "output_tokens": 9,
+                                     "cache_read_input_tokens": 0,
+                                     "cache_creation_input_tokens": 0}}}
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl",
+                                         delete=False) as fh:
+            fh.write(json.dumps(rec) + "\n")
+            p = fh.name
+        try:
+            self.assertEqual(ce.tail_usage(p), (500, "qwen3.8"))
+        finally:
+            os.unlink(p)
+
+    def test_row_budget_inherits_served_window(self):
+        import types
+        eng = types.SimpleNamespace(budget=200_000, budget_pinned=False,
+                                    _backend_ctx={"qwen3.8": 65536})
+        rb = types.MethodType(ce.Engine._row_budget, eng)
+        self.assertEqual(rb(57_000, "qwen3.8"), 65536)      # probed window
+        self.assertEqual(rb(57_000, "claude-fable-5"), 200_000)
+        self.assertEqual(rb(57_000, ""), 200_000)
+        self.assertEqual(rb(57_000, "mistral"), 200_000)    # never probed
+
     def test_meta_carries_backend(self):
         s = ce.Session("/x.jsonl", budget=200_000)
         self.assertIsNone(s.meta_payload()["backend"])
