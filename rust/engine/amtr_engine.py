@@ -2268,14 +2268,24 @@ class Session:
                 "uuid": None, "born": 0, "est": 0, "tok": 0, "file": None,
                 "excerpt": "", "truncated": False}
         if sid == 0:
+            txt = ("Request preamble the transcript omits: the system "
+                   "prompt, tool schemas, skill listings and MCP "
+                   "instructions. Measured honestly as R minus everything "
+                   "visible (re-based at each compaction).")
+            if self.backend:
+                # local backend: the preamble IS observable — on the wire
+                item = None
+                rec = latest_proxy_record(self.model)
+                if rec:
+                    item = proxy_itemization(rec)
+                txt += "\n\n" + (item or (
+                    "The wire has it: run `amtr_engine.py --proxy "
+                    "--upstream %s` and point ANTHROPIC_BASE_URL at "
+                    "127.0.0.1:11435 to itemize this from the real "
+                    "request bytes." % self.backend.get("url", "...")))
             base.update({
                 "found": True, "cat": "overhead", "kind": "overhead",
-                "tok": int(self.overhead),
-                "excerpt": ("Server-side context the transcript cannot "
-                            "itemize: the system prompt, tool schemas, "
-                            "skill listings and MCP instructions. Measured "
-                            "honestly as R minus everything visible "
-                            "(re-based at each compaction).")})
+                "tok": int(self.overhead), "excerpt": txt})
             return base
         seg = self.ring.get(sid)
         if seg is None:
@@ -3127,6 +3137,181 @@ def probe_local_backend(model, url=None):
         return _backend_from_entry(url, entry, False)
     except Exception:
         return None
+
+# ---------------------------------------------------- request-wire proxy
+# The transcript never carries the request preamble (system prompt, tool
+# schemas, MCP instructions) — that is a property of the CLIENT, not the
+# backend. But with a local backend the full request is on the wire, on the
+# user's own machine. `--proxy` is a recording passthrough: point
+# ANTHROPIC_BASE_URL at it, it forwards untouched and records each
+# request's COMPOSITION, so the overhead slab can be itemized from the real
+# bytes the model received instead of inferred as R minus visible.
+
+PROXY_DIR = os.path.expanduser("~/.claude/amtr-proxy")
+PROXY_LOG = os.path.join(PROXY_DIR, "requests.jsonl")
+
+def _jchars(v):
+    """Chars of a request part as serialized — the size the wire carried."""
+    if v is None:
+        return 0
+    if isinstance(v, str):
+        return len(v)
+    try:
+        return len(json.dumps(v, ensure_ascii=False))
+    except Exception:
+        return 0
+
+def proxy_compose(body):
+    """One composition record from a /v1/messages request body (bytes)."""
+    try:
+        d = json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(d, dict) or "messages" not in d:
+        return None
+    tools = d.get("tools") if isinstance(d.get("tools"), list) else []
+    msgs = d.get("messages") if isinstance(d.get("messages"), list) else []
+    rec = {"ts": datetime.now(timezone.utc).isoformat(),
+           "model": str(d.get("model") or ""),
+           "system_chars": _jchars(d.get("system")),
+           "tools_n": len(tools), "tools_chars": _jchars(tools),
+           "msgs_n": len(msgs), "msgs_chars": _jchars(msgs),
+           "input_tokens": None}
+    rec["total_chars"] = (rec["system_chars"] + rec["tools_chars"]
+                          + rec["msgs_chars"])
+    return rec
+
+_IN_TOK_RE = re.compile(rb'"input_tokens"\s*:\s*(\d+)')
+
+def latest_proxy_record(model, max_age=900, span=65536):
+    """Newest proxy composition record for `model` (fresh within max_age s),
+    or None. Bounded backward read, same discipline as tail_usage."""
+    try:
+        size = os.path.getsize(PROXY_LOG)
+        with open(PROXY_LOG, "rb") as fh:
+            fh.seek(max(0, size - span))
+            data = fh.read(span + 1)
+    except OSError:
+        return None
+    best = None
+    for line in data.split(b"\n"):
+        try:
+            d = json.loads(line.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if isinstance(d, dict) and d.get("model") == model:
+            best = d
+    if best is None:
+        return None
+    try:
+        age = (datetime.now(timezone.utc)
+               - datetime.fromisoformat(best["ts"])).total_seconds()
+    except Exception:
+        return None
+    return best if 0 <= age <= max_age else None
+
+def proxy_itemization(rec):
+    """Human lines itemizing overhead from a composition record. The server
+    reported input_tokens for the WHOLE request; each part's share is its
+    serialized chars scaled by the one measured chars/token ratio — every
+    byte visible, only the ratio shared."""
+    tot_tok, tot_ch = rec.get("input_tokens"), rec.get("total_chars") or 0
+    if not tot_tok or not tot_ch:
+        return None
+    cpt = tot_ch / tot_tok
+    part = lambda ch: int(round(ch / cpt))
+    hh = (rec.get("ts") or "")[11:16]
+    return ("Itemized from the wire (amtr proxy, %sZ): system prompt "
+            "≈%s tok · %d tool schemas ≈%s tok · history ≈%s tok "
+            "(server-reported total %s tok)."
+            % (hh, fmt_tok(part(rec["system_chars"])), rec["tools_n"],
+               fmt_tok(part(rec["tools_chars"])),
+               fmt_tok(part(rec["msgs_chars"])), fmt_tok(tot_tok)))
+
+def fmt_tok(n):
+    return "%.1fk" % (n / 1000.0) if n >= 1000 else str(n)
+
+def run_proxy(args):
+    import urllib.request
+    import urllib.error
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    upstream = args.upstream.rstrip("/")
+    os.makedirs(PROXY_DIR, exist_ok=True)
+    wlock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        # HTTP/1.0 + Connection: close — close-delimited responses let SSE
+        # stream through without re-implementing chunked framing
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _relay(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if n else b""
+            rec = None
+            if self.command == "POST" and "/messages" in self.path:
+                rec = proxy_compose(body)
+            req = urllib.request.Request(upstream + self.path,
+                                         data=body or None,
+                                         method=self.command)
+            skip = {"host", "content-length", "connection",
+                    "accept-encoding"}
+            for k, v in self.headers.items():
+                if k.lower() not in skip:
+                    req.add_header(k, v)
+            try:
+                resp = urllib.request.urlopen(req, timeout=600)
+            except urllib.error.HTTPError as e:
+                resp = e
+            except Exception as e:
+                self.send_error(502, str(e))
+                return
+            self.send_response(resp.getcode())
+            for k, v in resp.getheaders():
+                if k.lower() not in ("transfer-encoding", "connection",
+                                     "content-length"):
+                    self.send_header(k, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            # relay as the bytes arrive (SSE stays live); sniff the server's
+            # input_tokens for the composition record
+            sniff = b""
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                if rec is not None and rec["input_tokens"] is None \
+                        and len(sniff) < 262144:
+                    sniff += chunk
+                    m = _IN_TOK_RE.search(sniff)
+                    if m:
+                        rec["input_tokens"] = int(m.group(1))
+            if rec is not None:
+                with wlock:
+                    with open(PROXY_LOG, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(rec) + "\n")
+
+        do_GET = do_POST = do_DELETE = do_PUT = _relay
+
+    srv = ThreadingHTTPServer(("127.0.0.1", args.listen), Handler)
+    print("amtr proxy: 127.0.0.1:%d -> %s" % (args.listen, upstream),
+          file=sys.stderr)
+    print("recording request composition to %s" % PROXY_LOG,
+          file=sys.stderr)
+    print("point the client at it, e.g.:\n"
+          "  ANTHROPIC_BASE_URL=http://127.0.0.1:%d claude --model <name>"
+          % args.listen, file=sys.stderr)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        return 0
 
 # ---------------------------------------------------------------- engine
 class Engine:
@@ -5221,6 +5406,16 @@ def main():
                     help="disable the per-category ratio fit: size every "
                          "category with the single global constant (the "
                          "pre-fit behaviour, for comparison)")
+    ap.add_argument("--proxy", action="store_true",
+                    help="recording passthrough between an Anthropic-API "
+                         "client and a local backend: forwards untouched, "
+                         "records each request's composition so overhead "
+                         "can be itemized from the real wire bytes")
+    ap.add_argument("--listen", type=int, default=11435,
+                    help="with --proxy: port to listen on (default 11435)")
+    ap.add_argument("--upstream", default="http://localhost:11434",
+                    help="with --proxy: backend base URL "
+                         "(default http://localhost:11434)")
     args = ap.parse_args()
     if args.cal:
         Est.chars_per_tok = args.cal
@@ -5236,6 +5431,8 @@ def main():
         sys.exit(run_report(args))
     if args.fleet:
         sys.exit(run_fleet(args))
+    if args.proxy:
+        sys.exit(run_proxy(args))
     Engine(args).run()
 
 if __name__ == "__main__":

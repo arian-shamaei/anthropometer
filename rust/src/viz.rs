@@ -5501,13 +5501,21 @@ pub fn render_ribbon(
         fg(C_DIM),
     ));
     spans.push(Span::styled("│ ".to_string(), fg(C_GRID)));
-    spans.push(Span::styled(
-        match st.compact_eta() {
-            Some(eta) => format!("compact≈{:.0}t ", eta.ceil()),
-            None => "compact — ".to_string(),
-        },
-        fg(C_DIM),
-    ));
+    // backend-pinned sessions count down to server truncation, not to a
+    // compaction that is never coming (the CLI does not know the window)
+    spans.push(match st.trunc_eta() {
+        Some(t) => Span::styled(
+            format!("trunc≈{:.0}t ", t.ceil()),
+            if t <= 3.0 { fg(C_RED) } else { fg(C_DIM) },
+        ),
+        None => Span::styled(
+            match st.compact_eta() {
+                Some(eta) => format!("compact≈{:.0}t ", eta.ceil()),
+                None => "compact — ".to_string(),
+            },
+            fg(C_DIM),
+        ),
+    });
     spans.push(Span::styled("│ ".to_string(), fg(C_GRID)));
     spans.push(Span::styled(
         format!("{:.0}ku ", st.cost_total),

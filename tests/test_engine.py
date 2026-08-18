@@ -1790,6 +1790,54 @@ class TestLocalBackendProbe(unittest.TestCase):
         self.assertEqual(rb(57_000, ""), 200_000)
         self.assertEqual(rb(57_000, "mistral"), 200_000)    # never probed
 
+    def test_proxy_compose_and_itemization(self):
+        body = json.dumps({
+            "model": "qwen3.8", "max_tokens": 100,
+            "system": "S" * 4000,
+            "tools": [{"name": "Bash", "input_schema": {}},
+                      {"name": "Read", "input_schema": {}}],
+            "messages": [{"role": "user", "content": "hi there"}],
+        }).encode()
+        rec = ce.proxy_compose(body)
+        self.assertEqual(rec["model"], "qwen3.8")
+        self.assertEqual(rec["system_chars"], 4000)
+        self.assertEqual(rec["tools_n"], 2)
+        self.assertEqual(rec["total_chars"],
+                         rec["system_chars"] + rec["tools_chars"]
+                         + rec["msgs_chars"])
+        # itemization scales parts by the one measured chars/token ratio
+        rec["input_tokens"] = rec["total_chars"] // 4
+        line = ce.proxy_itemization(rec)
+        self.assertIn("system prompt ≈1.0k tok", line)
+        self.assertIn("2 tool schemas", line)
+        # non-message bodies (e.g. /api/show probes) never record
+        self.assertIsNone(ce.proxy_compose(b'{"model": "x"}'))
+        self.assertIsNone(ce.proxy_compose(b"not json"))
+
+    def test_latest_proxy_record_filters_model_and_age(self):
+        import tempfile
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"ts": now.isoformat(), "model": "other", "total_chars": 1},
+            {"ts": (now - timedelta(hours=2)).isoformat(),
+             "model": "qwen3.8", "total_chars": 2},   # stale
+            {"ts": now.isoformat(), "model": "qwen3.8", "total_chars": 3},
+        ]
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl",
+                                         delete=False) as fh:
+            fh.write("\n".join(json.dumps(r) for r in rows) + "\n")
+            p = fh.name
+        old = ce.PROXY_LOG
+        ce.PROXY_LOG = p
+        try:
+            self.assertEqual(
+                ce.latest_proxy_record("qwen3.8")["total_chars"], 3)
+            self.assertIsNone(ce.latest_proxy_record("mistral"))
+        finally:
+            ce.PROXY_LOG = old
+            os.unlink(p)
+
     def test_meta_carries_backend(self):
         s = ce.Session("/x.jsonl", budget=200_000)
         self.assertIsNone(s.meta_payload()["backend"])

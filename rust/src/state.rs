@@ -203,6 +203,21 @@ impl State {
         Some(room / slope.max(1.0))
     }
 
+    /// ETA in turns to the served-window truncation cliff — backend-pinned
+    /// sessions only. There the honest countdown is to TRUNCATION, not
+    /// compaction: the CLI does not know the served window, so its
+    /// auto-compact is not coming; the server drops oldest context instead.
+    pub fn trunc_eta(&self) -> Option<f64> {
+        let b = self.meta.as_ref()?.backend.as_ref()?;
+        let ctx = b.ctx.filter(|c| b.loaded && *c == self.budget && *c > 0)?;
+        let band = ctx - (ctx / 50).max(1024).min(ctx);
+        let slope = self.slope();
+        if slope <= 0.0 {
+            return None;
+        }
+        Some(((band as f64 - self.resident as f64) / slope.max(1.0)).max(0.0))
+    }
+
     fn raise_alert(&mut self, label: &str, severity: Severity, msg: String) {
         self.alert = Some(Alert {
             label: label.to_string(),
@@ -337,14 +352,19 @@ impl State {
             self.pressure_zone = zone;
         }
 
-        // compact-ETA alert, edge-triggered
-        match self.compact_eta() {
+        // ETA alert, edge-triggered. Backend-pinned sessions count down to
+        // server truncation (trunc_eta) — their auto-compact is not coming
+        let (label, verb, eta) = match self.trunc_eta() {
+            Some(t) => ("TRUNC_ETA", "server truncation", Some(t)),
+            None => ("COMPACT_ETA", "auto-compact", self.compact_eta()),
+        };
+        match eta {
             Some(eta) if eta <= 3.0 => {
                 if !self.eta_alerted {
                     self.raise_alert(
-                        "COMPACT_ETA",
+                        label,
                         Severity::Warn,
-                        format!("auto-compact in ≈{:.0} turns", eta.max(0.0)),
+                        format!("{verb} in ≈{:.0} turns", eta.max(0.0)),
                     );
                     self.eta_alerted = true;
                 }

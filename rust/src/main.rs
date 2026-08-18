@@ -3604,6 +3604,46 @@ mod screenshots {
         assert!(!api.st.cache_dormant());
     }
 
+    // ---- truncation ETA ----------------------------------------------------
+
+    #[test]
+    fn trunc_eta_counts_down_to_cliff() {
+        let mut app = bare_app();
+        app.st.budget = 65_536;
+        app.st.meta = Some(Meta {
+            session_id: "s".into(),
+            attach_gen: 1,
+            path: String::new(),
+            project: String::new(),
+            name: "qwen".into(),
+            title: None,
+            model: "qwen3.8".into(),
+            budget: 65_536,
+            t_auto: 0.85,
+            cc_version: None,
+            started_at: None,
+            backend: Some(ipc::Backend {
+                kind: "ollama".into(),
+                url: "u".into(),
+                params: "27.3B".into(),
+                quant: "Q4_K_M".into(),
+                ctx: Some(65_536),
+                loaded: true,
+            }),
+        });
+        for i in 0..6 {
+            app.st
+                .apply(Update::Turn(t4(i, 0, 0, 0, 0, 50_000 + i * 1_000)));
+        }
+        // band 64226 (65536 − max(1024, 2%)), R 55k, slope ≈1k/t → ≈9t
+        let eta = app.st.trunc_eta().expect("backend-pinned session");
+        assert!((eta - 9.2).abs() < 1.5, "eta {eta}");
+        // without a backend the countdown stays compaction's
+        app.st.meta.as_mut().unwrap().backend = None;
+        assert!(app.st.trunc_eta().is_none());
+        assert!(app.st.compact_eta().is_some());
+    }
+
     // ---- local-backend truncation cliff ------------------------------------
 
     #[test]
