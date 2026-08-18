@@ -1257,6 +1257,10 @@ class Session:
         self.rebase_pending = False
         self.alpha = 1.0
         self.overhead = 0
+        # between a compact_boundary and the next usage record turns[-1]
+        # still holds the PRE-cut R; the boundary's post size is the honest
+        # interim resident for map sizing (cleared at the next usage)
+        self.interim_R = None
         # config / meta
         self.budget = budget if budget else BUDGET_RUNGS[0]
         self.budget_pinned = budget_pinned
@@ -1701,6 +1705,7 @@ class Session:
 
     def _on_turn_usage(self, tr, ts, new_turn=False):
         R = tr["resident"]
+        self.interim_R = None    # authoritative usage supersedes the boundary
         # budget auto-bump
         if not self.budget_pinned and R > self.budget:
             self._bump_budget(R, ts)
@@ -1722,6 +1727,13 @@ class Session:
         # overhead calibration (the honesty rule)
         if self.overhead0 is None or self.rebase_pending:
             self.overhead0 = max(0, R - self.est_live)
+            if self.rebase_pending and not self.pending["map_rebuild"]:
+                # the compaction-time map went out sized to interim numbers;
+                # re-emit it now that the split is measured, or the interim
+                # map (field-found: a giant overhead slab) sticks until the
+                # next full rebuild
+                self.map_rev += 1
+                self.pending["map_rebuild"] = True
             self.rebase_pending = False
         E = self.live_est()
         # with a fit active the invisible overhead is the FITTED intercept
@@ -2141,6 +2153,13 @@ class Session:
             if frac > self.t_auto:
                 self.t_auto = min(0.99, frac)
         self.rebase_pending = True
+        self.interim_R = post if post > 0 else None
+        if self.interim_R is not None:
+            # interim overhead by the same rule the rebase will apply
+            # (overhead = R − E), so the cut-time map/legend split stays
+            # sensible until the next usage record re-measures
+            self.overhead = max(0, self.interim_R
+                                - int(self.est_live * self.alpha))
         self.post_compact_grace = True
         self._compact_between = True     # this R drop is NOT a server rebuild
         self.zone = 0
@@ -2166,6 +2185,10 @@ class Session:
 
     def build_map_segs(self, cap=1024):
         R = self.resident()
+        if self.interim_R is not None:
+            # pre-cut R would dump the whole dropped span into the overhead
+            # seg via the sum-to-R correction below
+            R = min(R, self.interim_R)
         oh = {"id": 0, "cat": "overhead", "tok": int(self.overhead),
               "file": None, "born": 0, "ts": self.started_epoch}
         segs = [oh]

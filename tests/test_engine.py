@@ -281,6 +281,45 @@ class TestCompaction(unittest.TestCase):
         fid = self.s.path2id["/Users/tester/proj/src/config.py"]
         self.assertEqual(c["dropped_files"], [{"file": fid, "tok": 894}])
 
+    def test_interim_map_sized_to_post_not_pre(self):
+        # feed the fixture only THROUGH the compact_boundary: turns[-1] still
+        # holds the pre-cut R (15200), so the cut-time map rebuild must size
+        # itself to postTokens (2600) — not dump the whole dropped span into
+        # the overhead seg (field-found: a giant overhead slab after /compact
+        # that outlived the legend's corrected totals)
+        s = ce.Session(FIX, budget=200_000, budget_pinned=True)
+        with open(FIX, "rb") as fh:
+            for raw in fh:
+                s.feed_line(raw.decode("utf-8"))
+                if s.compactions:
+                    break
+        self.assertEqual(s.resident(), 15200)      # ledger still pre-cut
+        self.assertEqual(s.interim_R, 2600)
+        segs = s.build_map_segs()
+        self.assertEqual(sum(x["tok"] for x in segs), 2600)
+        # interim overhead follows the rebase rule (R − E), not stale pre-cut
+        self.assertEqual(s.overhead, 2600 - s.est_live)
+
+    def test_map_reemitted_at_first_post_compaction_usage(self):
+        # after the cut-time rebuild is drained, the first usage record must
+        # flag ANOTHER full map emission (the interim map was built against
+        # interim numbers) with a bumped rev so stale map_adds cannot append
+        s = ce.Session(FIX, budget=200_000, budget_pinned=True)
+        lines = open(FIX, "rb").read().splitlines(keepends=True)
+        i = 0
+        while not s.compactions:
+            s.feed_line(lines[i].decode("utf-8"))
+            i += 1
+        self.assertTrue(s.pending["map_rebuild"])
+        rev0 = s.map_rev
+        s.pending = ce._fresh_pending()            # simulate the drain
+        for raw in lines[i:]:
+            s.feed_line(raw.decode("utf-8"))
+        self.assertTrue(s.pending["map_rebuild"])
+        self.assertEqual(s.map_rev, rev0 + 1)
+        self.assertIsNone(s.interim_R)
+        self.assertEqual(sum(x["tok"] for x in s.build_map_segs()), 2960)
+
     def test_eviction_set(self):
         # ring keeps only allUuids survivors + post-boundary records
         # (reasoning-t6 is post-boundary: allocated when turn 7 opens)
@@ -459,9 +498,15 @@ class TestSelftestStream(unittest.TestCase):
         self.assertEqual(by["turn"][-1]["resident"], 2960)
         comp = by["compaction"][0]
         self.assertEqual((comp["pre"], comp["post"]), (15200, 2600))
-        # exactly one map rebuild after ready, rev bumped to 1
-        self.assertEqual(types[6:].count("map"), 1)
-        self.assertEqual([m for m in msgs[6:] if m["type"] == "map"][0]["rev"], 1)
+        # two map rebuilds after ready: the interim one at the cut (sized to
+        # postTokens — the ledger's R is still pre-cut there) and the
+        # corrected one when the first post-compaction usage re-measures
+        maps = [m for m in msgs[6:] if m["type"] == "map"]
+        self.assertEqual([m["rev"] for m in maps], [1, 2])
+        self.assertEqual(sum(s["tok"] for s in maps[0]["segs"]), 2600)
+        # corrected map is built at a-a8's usage (R=2910); a-a8b's
+        # same-request upsert to 2960 streams incrementally afterwards
+        self.assertEqual(sum(s["tok"] for s in maps[1]["segs"]), 2910)
         self.assertTrue(any("cross-check" in m["msg"] for m in by["log"]))
 
 
