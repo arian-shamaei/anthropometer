@@ -1376,13 +1376,14 @@ class Session:
         m = d.get("message")
         if not isinstance(m, dict):
             return False
-        if (m.get("model") or "") == "<synthetic>" or not d.get("requestId"):
+        rid = d.get("requestId") or m.get("id")
+        if (m.get("model") or "") == "<synthetic>" or not rid:
             return False
         if d.get("isApiErrorMessage"):
             return False
         if not isinstance(m.get("usage"), dict):
             return False
-        return d.get("requestId") != self.req_last
+        return rid != self.req_last
 
     def feed_obj(self, d):
         if d.get("isSidechain") and not self.sidechain_ok:
@@ -1516,9 +1517,13 @@ class Session:
             self._event("api_error", "error", ts,
                         str(d.get("error") or "api error (synthetic turn)"))
             return
-        if model == "<synthetic>" or not d.get("requestId"):
+        # requestId is absent when a non-Anthropic backend serves the session
+        # (Ollama et al.); the streamed message id groups
+        # same-response upserts exactly like requestId, so it is the fallback
+        # turn key. True synthetics always carry model "<synthetic>".
+        rid = d.get("requestId") or m.get("id")
+        if model == "<synthetic>" or not rid:
             return  # synthetic: never a turn, never resident
-        rid = d.get("requestId")
         usage = m.get("usage") if isinstance(m.get("usage"), dict) else None
         content = m.get("content")
         # --- turn bookkeeping (LAST usage per requestId wins) ---

@@ -123,6 +123,36 @@ class TestTurnLedger(unittest.TestCase):
                          [0, 1, 1, 1, 1, 1, 1, 0])
         self.assertEqual(self.s.turns[0]["dur_ms"], 3200)
 
+    def test_local_backend_without_requestid(self):
+        # Ollama-served sessions write NO requestId; message.id is the turn
+        # key. Two streamed upserts of msg_a = one turn (last usage wins),
+        # msg_b opens the second; model reaches meta.
+        s = ce.Session("/x.jsonl", budget=200_000, budget_pinned=True)
+        def rec(uuid, mid, out):
+            return {"type": "assistant", "uuid": uuid,
+                    "timestamp": "2026-07-17T10:00:00.000Z",
+                    "message": {"role": "assistant", "model": "qwen3.8",
+                                "id": mid, "content": [],
+                                "usage": {"input_tokens": 500,
+                                          "output_tokens": out,
+                                          "cache_read_input_tokens": 0,
+                                          "cache_creation_input_tokens": 0}}}
+        self.assertTrue(s.is_new_turn(rec("u1", "msg_a", 0)))
+        s.feed_obj(rec("u1", "msg_a", 0))
+        self.assertFalse(s.is_new_turn(rec("u2", "msg_a", 40)))
+        s.feed_obj(rec("u2", "msg_a", 40))      # upsert, same turn
+        s.feed_obj(rec("u3", "msg_b", 7))
+        self.assertEqual(len(s.turns), 2)
+        self.assertEqual(s.turns[0]["out"], 40)  # last usage won
+        self.assertEqual(s.turns[1]["out"], 7)
+        self.assertEqual(s.meta_payload()["model"], "qwen3.8")
+        # synthetics stay filtered even though they also lack requestId
+        syn = rec("u4", "msg_c", 0)
+        syn["message"]["model"] = "<synthetic>"
+        self.assertFalse(s.is_new_turn(syn))
+        s.feed_obj(syn)
+        self.assertEqual(len(s.turns), 2)
+
 
 class TestOverheadAlpha(unittest.TestCase):
     def test_overhead0_first_turn(self):
