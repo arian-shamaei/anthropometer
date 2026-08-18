@@ -62,12 +62,14 @@ jobs:
           bundle="amtr-${tag}-${target}"
 
           # Everything a user needs at runtime lives side-by-side in the bundle:
-          # the binary, all 5 engine modules, and the license/readme. The engine
+          # the binary, the stdlib-only engine, and the license/readme. The engine
           # sits RIGHT NEXT TO the binary so ipc.rs::default_engine_path()'s
-          # "next to the executable" check wins after install.
+          # "next to the executable" check wins after install. The PDF/figures
+          # report builder is NOT bundled — it ships as the `amtr-paper` pip
+          # package, discovered on PATH by the engine's R handler.
           mkdir -p "$bundle"
           cp "rust/target/${target}/release/amtr" "$bundle/"
-          cp amtr_engine.py amtr_figures.py amtr_paper.py amtr_phases.py amtr_turns.py "$bundle/"
+          cp amtr_engine.py "$bundle/"
           cp LICENSE README.md "$bundle/"
 
           # Flat tarball (no leading directory): `tar -C "$bundle" .` archives the

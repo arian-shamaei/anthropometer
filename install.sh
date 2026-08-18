@@ -8,9 +8,11 @@
 # ~/.local (no Rust, no Homebrew). POSIX sh — no bashisms.
 #
 # Environment overrides:
-#   AMTR_VERSION   install a specific tag (e.g. v0.1.0) instead of "latest"
-#   AMTR_PREFIX    install prefix (default: $HOME/.local)
-#   AMTR_TARBALL   use a local tarball instead of downloading (offline install)
+#   AMTR_VERSION      install a specific tag (e.g. v0.1.0) instead of "latest"
+#   AMTR_PREFIX       install prefix (default: $HOME/.local)
+#   AMTR_TARBALL      use a local tarball instead of downloading (offline install)
+#   AMTR_WITH_REPORT  =1 -> also pip-install the amtr-paper plugin (the
+#                     compiled PDF/figures report behind the R key)
 
 set -eu
 
@@ -166,6 +168,31 @@ if ! have python3; then
   note "only) at runtime. Install it from your package manager or https://python.org."
 fi
 
+# ---------------------------------------------------------------------------
+# optional report plugin (AMTR_WITH_REPORT=1) — the "complete package" path.
+# The core install above is done either way; a plugin failure never fails it.
+# ---------------------------------------------------------------------------
+if [ "${AMTR_WITH_REPORT:-}" = "1" ]; then
+  note ""
+  if have python3; then
+    note "Installing the report plugin (amtr-paper) ..."
+    if python3 -m pip install --user amtr-paper >/dev/null 2>&1 \
+       || python3 -m pip install --user --break-system-packages amtr-paper >/dev/null 2>&1; then
+      note "  amtr-paper installed (the R key auto-discovers it)."
+      have tectonic || note "  For the PDF itself, also install tectonic (e.g. 'brew install tectonic')."
+    else
+      note "WARNING: pip install amtr-paper failed — install it manually:"
+      note "  python3 -m pip install --user amtr-paper"
+    fi
+  else
+    note "WARNING: AMTR_WITH_REPORT=1 set but python3 was not found; skipped."
+  fi
+fi
+
 note ""
 note "Done. Try:  amtr --help"
-note "(Report extras — the 'R' PDF report — additionally need: pip install matplotlib pillow, plus tectonic.)"
+if [ "${AMTR_WITH_REPORT:-}" != "1" ]; then
+  note "(Just the monitor was installed. For the compiled PDF report behind the"
+  note " R key: pip install amtr-paper && brew install tectonic — or re-run"
+  note " this installer with AMTR_WITH_REPORT=1.)"
+fi

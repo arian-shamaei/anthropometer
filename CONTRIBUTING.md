@@ -12,7 +12,9 @@ Two processes over newline-delimited JSON (`SPEC.md` is the normative contract):
   discovery, tailing, token accounting, checkpoints, and replay.
 
 The report pipeline (`amtr_paper.py` + `amtr_figures.py` / `amtr_turns.py` / `amtr_phases.py`)
-is separate and only needs `matplotlib`, `Pillow`, and `tectonic`.
+is separate — it needs `matplotlib`, `Pillow`, and `tectonic`, and ships to users
+as the `amtr-paper` pip package built from `report/` (core installs stay
+stdlib-only; the engine's `R` handler discovers `amtr-paper` on PATH).
 
 Read `SPEC.md` before changing behavior on either side — both are implemented against it alone.
 

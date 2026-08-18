@@ -1,0 +1,38 @@
+# amtr-paper — the amtr compiled PDF/figures report plugin, packaged for PyPI.
+#
+# Named after the command it installs: `amtr-paper` (package name == script
+# name). The stdlib `amtr-report` markdown command stays in core amtr.
+#
+# The module sources are NOT stored here: build.sh vendors the canonical
+# copies from the repo root (amtr_paper.py, amtr_figures.py, amtr_phases.py,
+# amtr_turns.py, amtr_engine.py) into this directory right before building,
+# the same pattern packaging/sync-engine.sh uses for the cargo crate. The
+# wheel is self-contained — `amtr-paper` works with no amtr install at all.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amtr-paper"
+version = "0.1.0"
+description = "Compiled PDF/figures forensic report plugin for amtr (anthropometer)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib>=3.5",
+    "pillow>=9",
+]
+urls = { Homepage = "https://github.com/arian-shamaei/anthropometer" }
+
+[project.scripts]
+amtr-paper = "amtr_paper:main"
+
+[tool.setuptools]
+py-modules = [
+    "amtr_paper",
+    "amtr_figures",
+    "amtr_phases",
+    "amtr_turns",
+    "amtr_engine",
+]

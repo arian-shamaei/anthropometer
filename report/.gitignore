@@ -1,0 +1,10 @@
+# vendored at build time by build.sh — canonical copies live at the repo root
+amtr_paper.py
+amtr_figures.py
+amtr_phases.py
+amtr_turns.py
+amtr_engine.py
+# build output
+dist/
+build/
+*.egg-info/

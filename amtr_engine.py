@@ -2656,6 +2656,29 @@ def find_transcript(session_id):
     hits = glob.glob(os.path.join(PROJECTS_DIR, "*", session_id + ".jsonl"))
     return hits[0] if hits else None
 
+def find_paper_builder():
+    """Locate the PDF/figures paper builder — split out as the `amtr-report`
+    plugin so the core install stays stdlib-only. Preference order:
+      1. amtr_paper.py sitting next to this engine (dev checkout or a legacy
+         full bundle), but only when its heavy deps import under THIS
+         interpreter — otherwise the spawn would just die on ImportError;
+      2. the `amtr-paper` console script from `pip install amtr-paper`,
+         which runs under its own interpreter with deps guaranteed by pip.
+    Returns an argv prefix (list) to spawn, or None when no builder exists."""
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "amtr_paper.py")
+    if os.path.exists(local):
+        import importlib.util
+        try:
+            if (importlib.util.find_spec("matplotlib") is not None
+                    and importlib.util.find_spec("PIL") is not None):
+                return [sys.executable, local]
+        except (ImportError, ValueError):
+            pass
+    import shutil
+    exe = shutil.which("amtr-paper")
+    return [exe] if exe else None
+
 def newest_transcript(project=None):
     roots = []
     if project:
@@ -4664,18 +4687,27 @@ class Engine:
                     # algorithm sections + per-turn capture) in the BACKGROUND
                     # — it takes ~30-60s, so we don't block; report.md is
                     # overwritten with identical content when it completes.
-                    paper = os.path.join(os.path.dirname(
-                        os.path.abspath(__file__)), "amtr_paper.py")
-                    try:
-                        subprocess.Popen(
-                            [sys.executable, paper, "--session", sess.path,
-                             "--dir", outdir],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            start_new_session=True)   # detach: survive amtr quit
-                        msg = "md now · full report building → %s" % outdir
-                    except Exception:
-                        msg = "report written (PDF unavailable)"
+                    # The builder is the amtr-report plugin (or a dev checkout
+                    # copy); without it, report.md alone is the honest result.
+                    builder = find_paper_builder()
+                    if builder is None:
+                        msg = ("report.md written · PDF/figures need the "
+                               "plugin: pip install amtr-paper")
+                    else:
+                        try:
+                            # stderr lands in the report dir, not /dev/null —
+                            # a builder that dies must leave a diagnosable log
+                            logf = open(os.path.join(outdir, "paper.log"),
+                                        "w", encoding="utf-8")
+                            subprocess.Popen(
+                                builder + ["--session", sess.path,
+                                           "--dir", outdir],
+                                stdout=logf, stderr=logf,
+                                start_new_session=True)  # survive amtr quit
+                            logf.close()
+                            msg = "md now · full report building → %s" % outdir
+                        except Exception:
+                            msg = "report written (PDF unavailable)"
                     send({"type": "report_done", "ok": True, "path": outdir,
                           "msg": msg})
                 except Exception as e:

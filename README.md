@@ -190,8 +190,13 @@ curl -fsSL https://raw.githubusercontent.com/arian-shamaei/anthropometer/main/in
 
 If `~/.local/bin` isn't on your `PATH`, the installer tells you how to add it.
 Override the install prefix with `AMTR_PREFIX` or pin a version with `AMTR_VERSION`.
-The live TUI needs only `python3` (≥3.9, stdlib); the **report** extras (`R`) still
-need `pip install matplotlib pillow` plus `brew install tectonic`.
+The live TUI needs only `python3` (≥3.9, stdlib). For the **complete package** —
+adds the compiled PDF report plugin behind the `R` key — run the same line with
+`AMTR_WITH_REPORT=1`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/arian-shamaei/anthropometer/main/install.sh | AMTR_WITH_REPORT=1 sh
+```
 
 ### Cargo
 
@@ -212,12 +217,16 @@ brew install amtr
 ```
 
 This installs the live TUI (a small Rust binary + a stdlib Python engine — no
-heavy dependencies). To enable the **report** feature (`R` / `amtr-paper`):
+heavy dependencies). The compiled PDF **report** (`R` in the TUI) is a separate
+plugin the TUI auto-discovers:
 
 ```sh
-pip install matplotlib pillow      # figures
+pip install amtr-paper             # figures + PDF builder (matplotlib, Pillow)
 brew install tectonic              # LaTeX → PDF
 ```
+
+Without the plugin, `R` still writes `report.md` instantly and tells you what
+is missing — the monitor itself never needs the heavy dependencies.
 
 ### From source
 
@@ -313,7 +322,8 @@ fully standalone — notarized releases at
 ```
 SPEC.md            the normative protocol + view contract
 amtr_engine.py     the engine: discovery, tailing, accounting, checkpoints, replay
-amtr_paper.py      the PDF report builder (amtr_figures/_turns/_phases support it)
+amtr_paper.py      the PDF report builder (amtr_figures/_turns/_phases support it);
+                   ships separately as the `amtr-paper` pip plugin (report/)
 rust/              the TUI (cargo test runs a headless screenshot suite)
 tests/             engine test suite + synthetic fixtures
 packaging/homebrew the Homebrew formula + tap runbook

@@ -85,36 +85,32 @@ amtr --help
 `PATH`, so the engine is always found and always runs under the same
 interpreter.
 
-### 5. Enable the report/paper extras (optional)
+### 5. Enable the compiled report (optional)
 
-The core monitor needs nothing else. The report wrappers — `amtr-paper`,
-`amtr-gif`, and the PDF half of `amtr-report` — need matplotlib, Pillow, numpy
-and tectonic. Install them into the **same** python@3.12 the formula uses:
+The core monitor needs nothing else. The compiled PDF/figures report is the
+separate `amtr-paper` pip package (see `report/` in the repo), discovered on
+PATH by the engine's `R` handler:
 
 ```bash
-"$(brew --prefix python@3.12)/libexec/bin/python3" -m pip install \
-  --break-system-packages matplotlib pillow numpy
+pip install amtr-paper
 brew install tectonic
 ```
 
-(Homebrew's python is externally managed — hence `--break-system-packages`. A
-venv works too, but the wrappers call the interpreter by absolute path, so the
-deps must live in that python's site-packages.) Until then the paper wrappers
-exit with an `ImportError`; `amtr` and `amtr-report`'s markdown output are
-unaffected. This is the intended "core-only formula, opt-in extras" split.
+Any python may own `amtr-paper` — the pip console script pins its own
+interpreter, so it does not have to be the formula's python@3.12. Without the
+plugin, `R` writes `report.md` and names the missing package; `amtr` and
+`amtr-report` (markdown) are unaffected. This is the intended "core-only
+formula, separate report plugin" split.
 
 ## The bin commands
 
-| Command       | Backing module                    | Needs report extras? |
-|---------------|-----------------------------------|----------------------|
-| `amtr`        | Rust TUI + `amtr_engine.py`       | no                   |
-| `amtr-report` | `amtr_engine.py --report`         | markdown no / PDF yes|
-| `amtr-paper`  | `amtr_paper.py`                   | yes                  |
-| `amtr-gif`    | `amtr_paper.py` (GIF pipeline)    | yes                  |
+| Command       | Backing module              | Needs the plugin? |
+|---------------|-----------------------------|-------------------|
+| `amtr`        | Rust TUI + `amtr_engine.py` | no                |
+| `amtr-report` | `amtr_engine.py --report`   | no (markdown)     |
 
-Only `amtr_paper.py` exposes a CLI; `amtr-gif` fronts the same pipeline because
-the GIF animations are emitted as part of the paper build (there is no
-standalone gif entrypoint).
+`amtr-paper` (the compiled paper + figures + GIFs) is installed by
+`pip install amtr-paper`, not by this formula.
 
 ## Local validation without pushing
 

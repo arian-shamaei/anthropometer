@@ -16,9 +16,10 @@ class Amtr < Formula
   end
 
   depends_on "rust" => :build
-  # Runtime: the data engine (amtr_engine.py) is a python child the binary
-  # spawns. matplotlib/Pillow/numpy/tectonic are deliberately NOT deps — the
-  # report extras are opt-in (see `caveats`).
+  # Runtime: the data engine (amtr_engine.py) is a stdlib-only python child
+  # the binary spawns. The PDF/figures report builder is a SEPARATE package
+  # (`pip install amtr-paper`) the engine discovers on PATH — deliberately
+  # not a dep (see `caveats`).
   depends_on "python@3.12"
 
   def install
@@ -26,60 +27,45 @@ class Amtr < Formula
     #    MUST ship in the tarball) and installs into the prefix => bin/"amtr".
     system "cargo", "install", *std_cargo_args(path: "rust")
 
-    # 2. The stdlib-only engine plus the optional report modules it imports.
-    libexec.install "amtr_engine.py", "amtr_paper.py", "amtr_figures.py",
-                    "amtr_turns.py", "amtr_phases.py"
+    # 2. The stdlib-only engine. The report modules are NOT installed here —
+    #    they ship as the amtr-report pip package.
+    libexec.install "amtr_engine.py"
 
     # 3. Relocate the built binary under libexec and put a wrapper on PATH that
     #    (a) pins AMTR_ENGINE so the engine resolves regardless of the install
     #    prefix (the compile-time repo-relative fallback is wrong once
     #    installed), and (b) prepends python@3.12's unversioned bin so the
-    #    engine — spawned as "python3" — and the report wrappers all run the
-    #    SAME interpreter (one place to install the report extras).
+    #    engine — spawned as "python3" — runs a known interpreter.
     libexec.install bin/"amtr"
     python_bin = formula_opt_libexec("python@3.12")/"bin"
     (bin/"amtr").write_env_script libexec/"amtr",
                                   AMTR_ENGINE: libexec/"amtr_engine.py",
                                   PATH:        "#{python_bin}:$PATH"
 
-    # 4. Report wrappers. Only amtr_paper.py exposes a CLI; the engine owns the
-    #    plain --report. All run under python@3.12. They exit with an
-    #    ImportError until the report extras are installed — that is expected.
+    # 4. Markdown report wrapper (stdlib, always works — including --watch).
+    #    The compiled PDF/figures builder is NOT here: it is the separate
+    #    `amtr-paper` pip package, which the engine discovers on PATH.
     py = "#{python_bin}/python3"
-    wrappers = {
-      # compiled PDF paper + figures + GIF animations
-      "amtr-paper"  => "#{py} #{libexec}/amtr_paper.py",
-      # report directory: report.md always; PDF built in the background if extras present
-      "amtr-report" => "#{py} #{libexec}/amtr_engine.py --report",
-      # GIF animations are emitted by the paper pipeline (no standalone gif CLI)
-      "amtr-gif"    => "#{py} #{libexec}/amtr_paper.py",
-    }
-    wrappers.each do |name, cmd|
-      (bin/name).write <<~SH
-        #!/bin/bash
-        exec #{cmd} "$@"
-      SH
-      chmod 0755, bin/name
-    end
+    (bin/"amtr-report").write <<~SH
+      #!/bin/bash
+      exec #{py} #{libexec}/amtr_engine.py --report "$@"
+    SH
+    chmod 0755, bin/"amtr-report"
   end
 
   def caveats
     <<~EOS
-      The core monitor (`amtr`) works out of the box.
+      The core monitor (`amtr`), the markdown report (`amtr-report`), and
+      the instant half of the in-TUI `R` key work out of the box.
 
-      The report/paper extras — `amtr-paper`, `amtr-gif`, and the PDF half of
-      `amtr-report` — need matplotlib, Pillow, numpy and tectonic. Install them
-      into the SAME python@3.12 this formula uses:
+      The compiled PDF + figures report is a separate plugin. To get it
+      (adds `amtr-paper`, which the `R` key auto-discovers):
 
-        "$(brew --prefix python@3.12)/libexec/bin/python3" -m pip install \\
-          --break-system-packages matplotlib pillow numpy
-        brew install tectonic
+        pip install amtr-paper
+        brew install tectonic        # LaTeX -> PDF
 
-      (Homebrew's python is externally managed, hence --break-system-packages;
-      a venv works too but the wrappers call the interpreter directly.)
-
-      Until then the paper wrappers exit with an ImportError; `amtr` and
-      `amtr-report`'s markdown output are unaffected.
+      Without the plugin, `R` still writes report.md and tells you what is
+      missing.
     EOS
   end
 

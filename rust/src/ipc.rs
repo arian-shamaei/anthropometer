@@ -809,15 +809,12 @@ pub fn default_engine_path() -> PathBuf {
     extract_embedded_engine().unwrap_or_else(|_| PathBuf::from("amtr_engine.py"))
 }
 
-/// The whole python side, baked in at compile time (synced into `engine/` by
-/// `packaging/sync-engine.sh`). `amtr_paper.py` must sit beside the engine
-/// because the engine spawns it from its own directory for `R` reports.
+/// The python side, baked in at compile time (synced into `engine/` by
+/// `packaging/sync-engine.sh`). Core = the stdlib-only engine alone; the
+/// PDF/figures paper builder ships separately as the `amtr-paper` pip
+/// package, which the engine discovers on PATH for `R` reports.
 const EMBEDDED_ENGINE: &[(&str, &str)] = &[
     ("amtr_engine.py", include_str!("../engine/amtr_engine.py")),
-    ("amtr_paper.py", include_str!("../engine/amtr_paper.py")),
-    ("amtr_figures.py", include_str!("../engine/amtr_figures.py")),
-    ("amtr_phases.py", include_str!("../engine/amtr_phases.py")),
-    ("amtr_turns.py", include_str!("../engine/amtr_turns.py")),
 ];
 
 fn embedded_cache_dir() -> PathBuf {

@@ -57,4 +57,6 @@ rm -rf "$T"
 echo
 echo "shipped v$V. Last step (notes are hand-written, see past releases):"
 echo "  gh release edit v$V --title \"v$V — $TITLE\" --notes '...'"
+echo "note: the report plugin (amtr-paper on PyPI) releases separately —"
+echo "  ./report/build.sh --publish   (only when the report modules changed)"
 echo "reminder: never brew install amtr on this machine — the dev binary owns the command."
