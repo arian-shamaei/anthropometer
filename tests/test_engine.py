@@ -155,6 +155,33 @@ class TestTurnLedger(unittest.TestCase):
 
 
 class TestOverheadAlpha(unittest.TestCase):
+    def test_live_map_tracks_resident(self):
+        # field-found (2026-08-24, Qwen session): a session attached at turn
+        # 0 showed R 82k while its map summed to 35k — map_add appends
+        # content segs but never touches the overhead seg (id 0) or alpha,
+        # so the box drifted out of scale. Simulate the UI ring over a
+        # line-by-line drain: after EVERY usage record the segs the UI
+        # holds must sum to R exactly.
+        s = ce.Session(FIX, budget=200_000, budget_pinned=True)
+        ui, rev = None, None
+        with open(FIX, "rb") as fh:
+            for raw in fh:
+                r_before = s.resident()
+                s.feed_line(raw.decode("utf-8"))
+                p, s.pending = s.pending, ce._fresh_pending()
+                if p["map_rebuild"] or ui is None:
+                    mp = s.map_payload()
+                    ui, rev = list(mp["segs"]), mp["rev"]
+                elif p["segs"] and s.map_rev == rev:
+                    ui += [{"tok": int(s.seg_est(x) * s.alpha)}
+                           for x in p["segs"]]
+                R = s.resident()
+                if R and (R != r_before or p["map_rebuild"]):
+                    tot = sum(x["tok"] for x in ui)
+                    want = s.interim_R if s.interim_R is not None else R
+                    self.assertEqual(tot, want, "map out of scale after usage")
+        self.assertEqual(sum(x["tok"] for x in ui), 2960)
+
     def test_overhead0_first_turn(self):
         # measured at t0, BEFORE a1's own content allocates:
         # overhead0 = R0 - est(u1) = 9004 - 19 = 8985
@@ -647,15 +674,17 @@ class TestSelftestStream(unittest.TestCase):
         self.assertEqual(by["turn"][-1]["resident"], 2960)
         comp = by["compaction"][0]
         self.assertEqual((comp["pre"], comp["post"]), (15200, 2600))
-        # two map rebuilds after ready: the interim one at the cut (sized to
-        # postTokens — the ledger's R is still pre-cut there) and the
-        # corrected one when the first post-compaction usage re-measures
+        # maps after ready: a same-rev REFRESH when turn 6's usage moves R
+        # 14300 → 15200 (the overhead seg lives only in a full map, so every
+        # usage that moves it re-emits — map_add never carries it), the
+        # interim one at the cut (rev 1, sized to postTokens — the ledger's R
+        # is still pre-cut there), the corrected one when the first
+        # post-compaction usage re-measures (rev 2), and the refresh when
+        # a-a8b's upsert moves R to 2960. Every map sums to R as of its send.
         maps = [m for m in msgs[6:] if m["type"] == "map"]
-        self.assertEqual([m["rev"] for m in maps], [1, 2])
-        self.assertEqual(sum(s["tok"] for s in maps[0]["segs"]), 2600)
-        # corrected map is built at a-a8's usage (R=2910); a-a8b's
-        # same-request upsert to 2960 streams incrementally afterwards
-        self.assertEqual(sum(s["tok"] for s in maps[1]["segs"]), 2910)
+        self.assertEqual([m["rev"] for m in maps], [0, 1, 2, 2])
+        self.assertEqual([sum(s["tok"] for s in m["segs"]) for m in maps],
+                         [15200, 2600, 2910, 2960])
         self.assertTrue(any("cross-check" in m["msg"] for m in by["log"]))
 
 
@@ -1878,6 +1907,34 @@ class TestProviders(unittest.TestCase):
         self.assertEqual(mp["resident"], 400)
         self.assertEqual(mp["budget"], 258400)
         self.assertTrue(any(sg["cat"] == "user" for sg in mp["segs"]))
+
+
+class TestProcessEnvJoin(unittest.TestCase):
+    PS = ("8011 /Users/x/.local/bin/claude --dangerously-skip-permissions\n"
+          "2421 /Users/x/.local/bin/claude --dangerously-skip-permissions\n")
+    QWEN = {"ANTHROPIC_BASE_URL": "https://litellm-test.example",
+            "ANTHROPIC_MODEL": "qwen-3.8", "ANTHROPIC_AUTH_TOKEN": "sk-x"}
+
+    def env_of(self, pid):
+        return self.QWEN if pid == 8011 else {}
+
+    def test_alias_and_transcript_name_join_strongly(self):
+        # ANTHROPIC_MODEL=qwen-3.8 vs the transcript's Qwen3.8: same model
+        got = ce._pick_claude_env("Qwen3.8", self.PS, self.env_of)
+        self.assertEqual(got, self.QWEN)
+
+    def test_other_models_process_never_lends_its_env(self):
+        # field-found 2026-08-24: the lone Qwen process was the weak-join
+        # winner for claude-fable-5, so Fable sessions got tagged
+        # `fable-5·litellm·Qwen3.8` (and would inherit its window knobs)
+        got = ce._pick_claude_env("claude-fable-5", self.PS, self.env_of)
+        self.assertEqual(got, {})
+
+    def test_unhinted_lone_process_still_joins_weakly(self):
+        env = {"ANTHROPIC_BASE_URL": "http://localhost:11434"}
+        got = ce._pick_claude_env("anything", self.PS, lambda pid: env
+                                  if pid == 8011 else {})
+        self.assertEqual(got, env)
 
 
 class TestLocalBackendProbe(unittest.TestCase):

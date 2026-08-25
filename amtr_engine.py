@@ -1261,6 +1261,11 @@ class Session:
         self.rebase_pending = False
         self.alpha = 1.0
         self.overhead = 0
+        # what the last FULL map on the wire carried: map_add only appends
+        # content segs, so an overhead/alpha move is invisible to the UI
+        # until the next full map (field-found: R 82k, map summing to 35k)
+        self._map_overhead = None
+        self._map_alpha = None
         # between a compact_boundary and the next usage record turns[-1]
         # still holds the PRE-cut R; the boundary's post size is the honest
         # interim resident for map sizing (cleared at the next usage)
@@ -1806,6 +1811,15 @@ class Session:
             a = (R - base) / max(1, E)
             self.alpha = min(1.0, max(1e-6, a))
             self.overhead = int(base)
+        # the overhead seg (id 0) and alpha live ONLY in a full map; map_add
+        # never touches them. Re-emit the map (same rev: no map_add is
+        # orphaned, INSPECT survives) whenever a usage record moved either,
+        # or the live map drifts to Σsegs ≠ R and the box stops being to scale.
+        if (not self.pending["map_rebuild"]
+                and (self._map_overhead != self.overhead
+                     or self._map_alpha is None
+                     or abs(self._map_alpha - self.alpha) > 1e-3)):
+            self.pending["map_rebuild"] = True
         # thrash signals run once per turn (streamed same-requestId records
         # must not re-trigger them after the post-compaction grace is spent)
         if tr["turn"] != self._sig_turn:
@@ -2511,6 +2525,9 @@ class Session:
         segs = self.build_map_segs()
         self.map_base_n = len(segs)          # rebuild resets the cadence counter
         self.map_adds_since = 0
+        self._map_overhead = self.overhead   # what this map carries (see usage)
+        self._map_alpha = self.alpha
+        self.pending["map_rebuild"] = False  # this map IS the rebuild asked for
         return {"rev": self.map_rev, "alpha": round(self.alpha, 4),
                 "fit": self.fit_payload(), "segs": segs}
 
@@ -3288,8 +3305,23 @@ def _claude_env_for_model(model):
                              capture_output=True, text=True, timeout=5).stdout
     except Exception:
         return {}
+    return _pick_claude_env(model, out, _proc_env)
+
+def _model_key(name):
+    """Loose model identity for the process join: the gateway alias the CLI
+    asked for (`qwen-3.8`) and the name the transcript records (`Qwen3.8`)
+    are the same model."""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+def _pick_claude_env(model, ps_out, env_of):
+    """Pure core of `_claude_env_for_model` (ps text + env reader in). A
+    process whose model hints name a DIFFERENT model is never a candidate,
+    weak or strong (field-found 2026-08-24: the lone Qwen-over-LiteLLM
+    process lent its base URL, alias and token to every Fable session on
+    the machine, tagging them `fable-5·litellm·Qwen3.8`)."""
+    want = _model_key(model)
     weak = []
-    for line in out.splitlines():
+    for line in ps_out.splitlines():
         parts = line.split(None, 1)
         if len(parts) != 2 or not parts[0].isdigit():
             continue
@@ -3297,7 +3329,7 @@ def _claude_env_for_model(model):
         head = cmd.split()[0] if cmd.split() else ""
         if os.path.basename(head) != "claude" or " --bg-" in cmd:
             continue
-        env = _proc_env(pid)
+        env = env_of(pid)
         keep = {k: env[k] for k in ("ANTHROPIC_BASE_URL",) + _WINDOW_ENV_KEYS
                 + _GATEWAY_ENV_KEYS if env.get(k)}
         if not (set(keep) & set(("ANTHROPIC_BASE_URL",) + _WINDOW_ENV_KEYS)):
@@ -3306,8 +3338,10 @@ def _claude_env_for_model(model):
         m = re.search(r"--model[ =](\S+)", cmd)
         if m:
             hints.append(m.group(1))
-        if model in hints:
+        if any(_model_key(h) == want for h in hints):
             return keep                     # strong join: named our model
+        if hints:
+            continue                        # named ANOTHER model: not ours
         weak.append(keep)
     if len(weak) == 1 or (weak and all(w == weak[0] for w in weak)):
         return weak[0]
