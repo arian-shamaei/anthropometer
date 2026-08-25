@@ -371,10 +371,10 @@ class TestMeta(unittest.TestCase):
 
 
 class TestBudgetAndSignals(unittest.TestCase):
-    def _turn(self, s, rid, r_in, cr, cc):
+    def _turn(self, s, rid, r_in, cr, cc, model="claude-m"):
         s.feed_obj({"type": "assistant", "uuid": "u-" + rid, "requestId": rid,
                     "timestamp": "2026-07-17T11:00:00.000Z",
-                    "message": {"role": "assistant", "model": "m", "content": [],
+                    "message": {"role": "assistant", "model": model, "content": [],
                                 "stop_reason": "end_turn",
                                 "usage": {"input_tokens": r_in,
                                           "output_tokens": 1,
@@ -386,6 +386,155 @@ class TestBudgetAndSignals(unittest.TestCase):
         self._turn(s, "req_1", 250_000, 0, 0)          # R exceeds the rung
         self.assertEqual(s.budget, 1_000_000)
         self.assertTrue(any("budget bumped" in m for m in s.pending["logs"]))
+
+    def test_non_anthropic_model_drops_settings_rung(self):
+        # settings.json `[1m]` gave the engine a 1M base; a session on a
+        # non-Anthropic model (Qwen over ANTHROPIC_BASE_URL) renders on the
+        # window Claude Code actually runs it under: 200k, enforced by
+        # auto-compact (51k/200k in the CLI, not 51k/1000k)
+        s = ce.Session("/x.jsonl", budget=1_000_000)
+        self._turn(s, "req_1", 51_000, 0, 0, model="Qwen3.6-35B-A3B")
+        self.assertEqual((s.budget, s.budget_source), (200_000, "unknown-model"))
+        self.assertTrue(any("unknown-model" in m for m in s.pending["logs"]))
+        # ...but its OWN resident still bumps it back up
+        self._turn(s, "req_2", 260_000, 0, 0, model="Qwen3.6-35B-A3B")
+        self.assertEqual((s.budget, s.budget_source), (1_000_000, "bumped"))
+        # an Anthropic model keeps the settings rung
+        a = ce.Session("/y.jsonl", budget=1_000_000)
+        self._turn(a, "req_1", 51_000, 0, 0, model="claude-fable-5")
+        self.assertEqual((a.budget, a.budget_source), (1_000_000, "1m"))
+        # a --budget pin wins over the drop
+        pinned = ce.Session("/z.jsonl", budget=1_000_000, budget_pinned=True)
+        self._turn(pinned, "req_1", 51_000, 0, 0, model="Qwen3.6-35B-A3B")
+        self.assertEqual(pinned.budget, 1_000_000)
+
+    def test_turn_wire_facts(self):
+        # the CLI records per-response wire facts: server-counted thinking
+        # tokens, requested effort, served tier/speed — carried verbatim,
+        # and a tier/speed CHANGE is a moment in the events feed
+        s = ce.Session("/x.jsonl", budget=200_000)
+        def rec(rid, tier, speed, think):
+            s.feed_obj({"type": "assistant", "uuid": "u-" + rid, "requestId": rid,
+                        "timestamp": "2026-07-17T11:00:00.000Z", "effort": "high",
+                        "message": {"role": "assistant", "model": "claude-m",
+                                    "content": [], "stop_reason": "end_turn",
+                                    "usage": {"input_tokens": 100, "output_tokens": 50,
+                                              "cache_read_input_tokens": 0,
+                                              "cache_creation_input_tokens": 0,
+                                              "output_tokens_details": {"thinking_tokens": think},
+                                              "service_tier": tier, "speed": speed}}})
+        rec("r1", "standard", "standard", 0)
+        rec("r2", "standard", "standard", 1200)
+        t = s.turn_payload(1)
+        self.assertEqual((t["think"], t["effort"], t["tier"], t["speed"]),
+                         (1200, "high", "standard", "standard"))
+        self.assertFalse(any(e.get("kind") == "service" for e in s.events))
+        rec("r3", "priority", "fast", 0)
+        ev = [e for e in s.events if e.get("kind") == "service"]
+        self.assertEqual(len(ev), 1)
+        self.assertIn("service tier standard -> priority", ev[0]["msg"])
+        self.assertIn("speed standard -> fast", ev[0]["msg"])
+
+    def test_litellm_route_probe(self):
+        from unittest import mock
+        info = {"data": [
+            {"model_name": "local-qwen",
+             "litellm_params": {"model": "ollama_chat/qwen3.8", "api_base": "http://localhost:11434"},
+             "model_info": {"max_input_tokens": None}},
+            {"model_name": "uw-qwen",
+             "litellm_params": {"model": "anthropic/qwen-3.6",
+                                "api_base": "https://litellm-test.cs.washington.edu"},
+             "model_info": {"max_input_tokens": None}}]}
+        with mock.patch.object(ce, "_http_json_auth", return_value=info):
+            b = ce.probe_litellm("http://localhost:4000", "Qwen3.6-35B-A3B",
+                                 alias="uw-qwen", token="sk-x")
+        self.assertEqual(b["kind"], "litellm")
+        self.assertEqual(b["route"], "anthropic/qwen-3.6@litellm-test.cs.washington.edu")
+        self.assertEqual(b["alias"], "uw-qwen")
+        self.assertIsNone(b["ctx"])          # nothing declared -> no window
+        self.assertFalse(b["loaded"])
+        self.assertNotIn("sk-x", json.dumps(b))   # the bearer never leaves the probe
+        # an operator-declared window is per-model metadata
+        info["data"][1]["model_info"]["max_input_tokens"] = 262144
+        with mock.patch.object(ce, "_http_json_auth", return_value=info):
+            b = ce.probe_litellm("http://localhost:4000", "Qwen3.6-35B-A3B",
+                                 alias="uw-qwen", token="sk-x")
+        self.assertEqual((b["ctx"], b["loaded"]), (262144, True))
+        # no alias: join on the upstream name's tail; no token: no probe
+        self.assertEqual(ce._litellm_pick(info["data"], "qwen-3.6", None)["model_name"], "uw-qwen")
+        self.assertIsNone(ce.probe_litellm("http://localhost:4000", "x", token=None))
+
+    def test_open_reasoning_has_no_hidden_slab(self):
+        # a backend that returns its thinking in the open (Qwen via a
+        # gateway: thinking blocks carry text, visible ≈ billed output)
+        # gets no hidden-reasoning slab — the residual is tokenizer error;
+        # Anthropic extended thinking (empty blocks, billed in full) does
+        def sess(think_text, out):
+            s = ce.Session("/x.jsonl", budget=200_000)
+            for i in range(3):
+                rid = "r%d" % i
+                s.feed_obj({"type": "assistant", "uuid": "u-" + rid, "requestId": rid,
+                            "timestamp": "2026-07-17T11:00:0%d.000Z" % i,
+                            "message": {"role": "assistant", "model": "claude-m",
+                                        "content": [{"type": "thinking", "thinking": think_text},
+                                                    {"type": "text", "text": "x" * 380}],
+                                        "stop_reason": "end_turn",
+                                        "usage": {"input_tokens": 100, "output_tokens": out,
+                                                  "cache_read_input_tokens": 0,
+                                                  "cache_creation_input_tokens": 0}}})
+            return s
+        # Qwen-like: 3800 chars of thinking + 380 text ≈ 1100 est tok, billed 1000
+        q = sess("t" * 3800, 1000)
+        self.assertEqual(q.reasoning_state(), "open")
+        self.assertEqual(q.cat_est.get("reasoning", 0), 0)
+        self.assertEqual(q.meta_payload()["reasoning"], "open")
+        # Anthropic-like: empty thinking block, 100 visible tok, billed 1000
+        a = sess("", 1000)
+        self.assertEqual(a.reasoning_state(), "hidden")
+        self.assertGreater(a.cat_est.get("reasoning", 0), 0)
+        # summarized thinking: text present but far short of the bill -> hidden
+        m = sess("t" * 400, 4000)
+        self.assertEqual(m.reasoning_state(), "hidden")
+
+    def test_engine_window_survives_later_turns(self):
+        # the Engine resolves the window from the session's process env
+        # (CLAUDE_CODE_MAX_CONTEXT_TOKENS); the next turn on the same model
+        # must not re-run the name-only layer and undo it
+        s = ce.Session("/x.jsonl", budget=1_000_000)
+        self._turn(s, "req_1", 51_000, 0, 0, model="Qwen3.6-35B-A3B")
+        self.assertTrue(s.set_window("Qwen3.6-35B-A3B", 262_144, "env"))
+        self._turn(s, "req_2", 60_000, 0, 0, model="Qwen3.6-35B-A3B")
+        self.assertEqual((s.budget, s.budget_source), (262_144, "env"))
+        # a model switch re-resolves
+        self._turn(s, "req_3", 60_000, 0, 0, model="local-qwen")
+        self.assertEqual((s.budget, s.budget_source), (200_000, "unknown-model"))
+
+    def test_claude_window_mirrors_cli_sources(self):
+        W = ce.claude_window
+        K = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+        self.assertEqual(W("Qwen3.6-35B-A3B", {}, {}), (200_000, "unknown-model"))
+        self.assertEqual(W("Qwen3.6-35B-A3B", {K: "262144"}, {}), (262_144, "env"))
+        self.assertEqual(W("Qwen3.6-35B-A3B", {K: "junk"}, {}), (200_000, "unknown-model"))
+        self.assertEqual(W("Qwen3.6-35B-A3B",
+                           {"CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1"}, {}),
+                         (200_000, "unenforced"))
+        self.assertEqual(W("claude-fable-5", {}, {}), (200_000, "model-default"))
+        self.assertEqual(W("claude-fable-5", {}, {"model": "claude-fable-5[1m]"}),
+                         (1_000_000, "1m"))
+        # settings [1m] names the MAIN model; a different Anthropic model
+        # (a haiku subagent) does not inherit it
+        self.assertEqual(W("claude-haiku-4-5", {}, {"model": "claude-fable-5[1m]"}),
+                         (200_000, "model-default"))
+        self.assertEqual(W("claude-fable-5[1m]", {}, {}), (1_000_000, "1m"))
+        self.assertEqual(W("claude-fable-5[1m]", {"CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"}, {}),
+                         (200_000, "model-default"))
+        # modelOverrides: the override's window is the window
+        self.assertEqual(W("Qwen3.6-35B-A3B", {},
+                           {"modelOverrides": {"Qwen3.6-35B-A3B": "claude-sonnet-5[1m]"}}),
+                         (1_000_000, "1m"))
+        # env outranks everything
+        self.assertEqual(W("claude-fable-5", {K: "500000"}, {"model": "claude-fable-5[1m]"}),
+                         (500_000, "env"))
 
     def test_t_auto_refined_by_auto_compaction(self):
         s = ce.Session("/x.jsonl", budget=200_000)
@@ -769,7 +918,7 @@ class TestReasoningAndRebuild(unittest.TestCase):
               ts="2026-07-17T11:00:00.000Z"):
         s.feed_obj({"type": "assistant", "uuid": "u-" + rid, "requestId": rid,
                     "timestamp": ts,
-                    "message": {"role": "assistant", "model": "m",
+                    "message": {"role": "assistant", "model": "claude-m",
                                 "content": [], "stop_reason": "end_turn",
                                 "usage": {"input_tokens": r_in,
                                           "output_tokens": out,
@@ -877,7 +1026,7 @@ class TestReasoningAndRebuild(unittest.TestCase):
             s = ce.Session("/x.jsonl", budget=200_000, budget_pinned=True)
             s.feed_obj({"type": "assistant", "uuid": "a1", "requestId": "r1",
                         "timestamp": "2026-07-17T11:00:00.000Z",
-                        "message": {"role": "assistant", "model": "m",
+                        "message": {"role": "assistant", "model": "claude-m",
                                     "content": [{"type": "tool_use",
                                                  "id": "t1", "name": "Read",
                                                  "input": {"file_path":
@@ -1834,6 +1983,15 @@ class TestLocalBackendProbe(unittest.TestCase):
         self.assertEqual(rb(57_000, "claude-fable-5"), 200_000)
         self.assertEqual(rb(57_000, ""), 200_000)
         self.assertEqual(rb(57_000, "mistral"), 200_000)    # never probed
+        # the CLI-resolved window of a live session on that model (env
+        # CLAUDE_CODE_MAX_CONTEXT_TOKENS) is the row's window too
+        eng._model_window = {"Qwen3.6-35B-A3B": (262_144, "env")}
+        self.assertEqual(rb(57_000, "Qwen3.6-35B-A3B"), 262_144)
+        # a 1M base (settings [1m]) is an Anthropic fact: a non-Anthropic
+        # row does not inherit it
+        eng.budget = 1_000_000
+        self.assertEqual(rb(57_000, "mistral"), 200_000)
+        self.assertEqual(rb(57_000, "claude-fable-5"), 1_000_000)
 
     def test_proxy_compose_and_itemization(self):
         body = json.dumps({

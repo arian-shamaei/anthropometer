@@ -1248,6 +1248,10 @@ class Session:
         # and the ISO ts of the record that OPENED the current turn (gives
         # the synthetic reasoning seg a real epoch)
         self._vis_acc = 0
+        self._turn_think_chars = 0      # thinking TEXT returned this turn
+        # open vs hidden reasoning, judged per turn from the wire (SPEC a):
+        # a backend that returns its thinking in the open has no hidden slab
+        self._reasoning_turns = {"open": 0, "hidden": 0}
         self._turn_ts = ""
         # rebuild guard: True while a compact_boundary has run since the
         # last true turn open (its R drop must not read as a rebuild)
@@ -1265,6 +1269,8 @@ class Session:
         self.budget = budget if budget else BUDGET_RUNGS[0]
         self.budget_pinned = budget_pinned
         self.provider_budget = False    # a provider adapter set the window
+        self.budget_source = "base"     # claude_window() source / served / pin
+        self._budget_model = None       # model the budget was resolved for
         self.t_auto = t_auto
         self.model = ""
         self.backend = None    # local-backend identity (§ backend probe)
@@ -1541,12 +1547,14 @@ class Session:
                 # the closed turn). Never on same-requestId usage upserts.
                 self._close_turn_reasoning()
                 self._vis_acc = 0
+                self._turn_think_chars = 0
                 self._turn_ts = ts
                 self.req_last = rid
                 if self.model and model and model != self.model:
                     self._event("model_switch", "info", ts,
                                 "model %s -> %s" % (self.model, model))
                 self.model = model or self.model
+                self._model_budget(model)
                 self.turn_epochs.append(ts_epoch(ts))
                 # design-matrix row: what was resident (in chars, per
                 # category) when the server priced THIS request's R
@@ -1555,7 +1563,9 @@ class Session:
                                    "model": model, "in": 0, "cr": 0, "cc": 0,
                                    "cc_5m": 0, "cc_1h": 0, "out": 0,
                                    "resident": 0, "waterline": 0,
-                                   "dur_ms": None, "stop": None, "tools": 0})
+                                   "dur_ms": None, "stop": None, "tools": 0,
+                                   "think": None, "effort": None,
+                                   "tier": None, "speed": None})
             tr = self.turns[-1]
             tr["in"] = _i(usage.get("input_tokens"))
             tr["cr"] = _i(usage.get("cache_read_input_tokens"))
@@ -1568,6 +1578,20 @@ class Session:
             else:
                 tr["cc_5m"], tr["cc_1h"] = cc, 0   # split unknown -> cc_5m
             tr["out"] = _i(usage.get("output_tokens"))
+            # authoritative wire facts the CLI records per response: the
+            # server's own thinking-token count (the estimate from content
+            # blocks is the fallback, never the truth when this is present),
+            # the effort the CLI asked for, and the tier/speed it was served
+            det = usage.get("output_tokens_details")
+            if isinstance(det, dict) and isinstance(det.get("thinking_tokens"), int):
+                tr["think"] = det["thinking_tokens"]
+            if isinstance(d.get("effort"), str):
+                tr["effort"] = d["effort"]
+            for k in ("service_tier", "speed"):
+                v = usage.get(k)
+                if isinstance(v, str) and v:
+                    tr["tier" if k == "service_tier" else k] = v
+            self._service_change(tr, ts)
             tr["model"] = model or tr["model"]
             if m.get("stop_reason"):
                 tr["stop"] = m.get("stop_reason")
@@ -1591,6 +1615,7 @@ class Session:
                     txt = b.get("thinking") or ""
                     e = est_text(txt)
                     self._alloc("thinking", e, uuid, ts, chars=len(txt))
+                    self._turn_think_chars += len(txt)
                 elif bt == "tool_use":
                     e = self._tool_use(b, uuid, ts)
                 else:
@@ -1613,9 +1638,36 @@ class Session:
         if not self.turns:
             return
         t = len(self.turns) - 1
-        hid = max(0, _i(self.turns[-1]["out"]) - self._vis_acc)
+        out = _i(self.turns[-1]["out"])
+        hid = max(0, out - self._vis_acc)
+        # OPEN reasoning: the thinking blocks carry text and the visible
+        # estimate covers the billed output — the model returned its
+        # reasoning in the open (Qwen, most local backends). Any residual
+        # is tokenizer error (Qwen runs ~4.3 chars/tok, the estimator 3.8),
+        # not hidden content: no slab. Anthropic extended thinking fails
+        # this test on the wire (empty blocks, or a summary far shorter
+        # than the billed thinking) and stays hidden. Once a session has
+        # shown open reasoning and never hidden, residuals on its
+        # thinking-free turns are noise too.
+        if self._turn_think_chars > 0 and self._vis_acc >= 0.75 * out:
+            self._reasoning_turns["open"] += 1
+            return
+        if self.reasoning_state() == "open":
+            return
         if hid > 0:
+            self._reasoning_turns["hidden"] += 1
             self._alloc("reasoning", hid, "reasoning-t%d" % t, self._turn_ts)
+
+    def reasoning_state(self):
+        """'open' (reasoning returned on the wire, no hidden slab), 'hidden'
+        (billed output exceeds everything visible), or None (no turn has
+        said yet)."""
+        r = self._reasoning_turns
+        if r["open"] and not r["hidden"]:
+            return "open"
+        if r["hidden"]:
+            return "hidden"
+        return None
 
     def _tool_use(self, b, uuid, ts):
         name = b.get("name") or "?"
@@ -1805,15 +1857,69 @@ class Session:
             elif R < int(ctx * 0.90):
                 self._trunc_warned = False
 
+    def _service_change(self, tr, ts):
+        """Tier/speed are per-response server facts; a CHANGE is a moment
+        (priority tier kicked in, fast mode on/off) — said once, in events."""
+        cur = (tr.get("tier"), tr.get("speed"))
+        prev = getattr(self, "_service", None)
+        if prev is not None and cur != prev and any(cur):
+            parts = []
+            if cur[0] != prev[0]:
+                parts.append("service tier %s -> %s" % (prev[0] or "?", cur[0] or "?"))
+            if cur[1] != prev[1]:
+                parts.append("speed %s -> %s" % (prev[1] or "?", cur[1] or "?"))
+            self._event("service", "info", ts, ", ".join(parts))
+        if any(cur):
+            self._service = cur
+
+    def _model_budget(self, model):
+        """Per-model window, name-only layer (`claude_window` without the
+        process env — the Engine adds that off-thread). Runs once per model:
+        the Engine's env/served resolution for the same model must not be
+        undone by the next turn. The base budget came from settings.json
+        `[1m]`, an Anthropic fact: a session on a non-Anthropic model (Qwen
+        over ANTHROPIC_BASE_URL) gets the window Claude Code actually runs
+        it under — 200k, enforced by auto-compact — so amtr no longer shows
+        51k/1000k where the CLI says 51k/200k. A --budget pin or a
+        provider-served window always wins; `_on_turn_usage` still bumps
+        the rung if the session's own resident demands it."""
+        if (self.budget_pinned or self.provider_budget or not model
+                or model == self._budget_model):
+            return
+        self._budget_model = model
+        w, src = claude_window(model, env=None, settings={})
+        if anthropic_model(model) and "[1m]" not in model:
+            # the base budget already carries the settings [1m] answer
+            src = "1m" if self.budget >= BUDGET_RUNGS[1] else src
+            w = self.budget
+        if w != self.budget:
+            self.pending["logs"].append(
+                "model %s: budget %d -> %d (%s)" % (model, self.budget, w, src))
+            self.budget = w
+        self.budget_source = src
+
+    def set_window(self, model, tokens, source):
+        """Engine-resolved window for `model` (process env, served backend).
+        Marks the model resolved so `_model_budget` leaves it alone."""
+        self._budget_model = model
+        if self.budget_pinned or self.provider_budget:
+            return False
+        changed = tokens != self.budget
+        self.budget = int(tokens)
+        self.budget_source = source
+        return changed
+
     def _bump_budget(self, need, ts):
         for rung in BUDGET_RUNGS:
             if rung >= need:
                 if rung != self.budget:
                     self.pending["logs"].append(
                         "budget bumped %d -> %d" % (self.budget, rung))
+                    self.budget_source = "bumped"
                 self.budget = rung
                 return
         self.budget = BUDGET_RUNGS[-1]
+        self.budget_source = "bumped"
 
     def _server_rebuild(self, R, prev_R, ts):
         """Server context rebuild (SPEC a): evict every reasoning segment
@@ -2425,6 +2531,8 @@ class Session:
                 "provider": self.provider,
                 "project": self.project or "", "title": self.title,
                 "model": self.model or "?", "budget": int(self.budget),
+                "budget_source": self.budget_source,
+                "reasoning": self.reasoning_state(),
                 "backend": self.backend,
                 "t_auto": round(self.t_auto, 4), "cc_version": self.cc_version,
                 "started_at": self.started_at}
@@ -2706,10 +2814,74 @@ def newest_transcript(project=None):
                     best, bt = p, mt
     return best
 
-def default_budget():
+def anthropic_model(name):
+    """True for a first-party Anthropic model name. Anything else (a
+    `--model Qwen...` over ANTHROPIC_BASE_URL, `local-qwen`, ...) is served
+    by some other backend whose window the Anthropic rungs say nothing about."""
+    return isinstance(name, str) and name.startswith("claude-")
+
+def read_settings():
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
-            model = str((json.load(fh) or {}).get("model") or "")
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _truthy(v):
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+def claude_window(model, env=None, settings=None):
+    """The context window Claude Code itself runs `model` under — the
+    budget, because auto-compact is sized against THIS number, whatever the
+    server could take. Mirrors the CLI's own resolution (2.1.241), which
+    names its sources the same way. Returns (tokens, source):
+
+      env            CLAUDE_CODE_MAX_CONTEXT_TOKENS in the session's process
+      1m             the model name carries `[1m]` (settings `model` or
+                     --model), unless CLAUDE_CODE_DISABLE_1M_CONTEXT
+      model-default  a recognized Anthropic model: 200k
+      unknown-model  anything else: the CLI assumes 200k and ENFORCES it
+                     (auto-compact at 200k even if the model is larger)
+      unenforced     unknown model with
+                     CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT:
+                     no compaction is coming; the served window (backend
+                     probe) is the only ceiling — 200k until one answers
+
+    settings.modelOverrides (name -> recognized model) is honoured: the
+    override's window is the window. Every number here is the CLI's, never
+    a guess about the model: a model's true size only enters through the
+    knobs the CLI reads — which is what makes the budget per-model metadata
+    instead of a machine-wide setting."""
+    env = env or {}
+    settings = settings if settings is not None else read_settings()
+    m = str(model or "")
+    n = _i(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
+    if n > 0:
+        return n, "env"
+    ov = settings.get("modelOverrides")
+    if isinstance(ov, dict) and isinstance(ov.get(m), str):
+        m = ov[m]
+    big = "[1m]" in m
+    if anthropic_model(m) and not big:
+        # settings `model` names the session's main model; its [1m] is the
+        # window the CLI opened this session with (the transcript records
+        # the bare name)
+        sm = str(settings.get("model") or "")
+        big = "[1m]" in sm and sm.split("[")[0] == m.split("[")[0]
+    if big and not _truthy(env.get("CLAUDE_CODE_DISABLE_1M_CONTEXT")):
+        return BUDGET_RUNGS[1], "1m"
+    if anthropic_model(m):
+        return BUDGET_RUNGS[0], "model-default"
+    if _truthy(env.get("CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT")):
+        return BUDGET_RUNGS[0], "unenforced"
+    return BUDGET_RUNGS[0], "unknown-model"
+
+def default_budget():
+    """The Anthropic base window before any session names its model: the
+    settings.json `model` flag (`[1m]`) is the only record of the 1M rung."""
+    try:
+        model = str(read_settings().get("model") or "")
         return BUDGET_RUNGS[1] if "[1m]" in model else BUDGET_RUNGS[0]
     except Exception:
         return BUDGET_RUNGS[0]
@@ -3096,17 +3268,27 @@ def _proc_env(pid):
     except Exception:
         return {}
 
-def _base_url_for_model(model):
-    """The ANTHROPIC_BASE_URL of the claude process that serves `model`.
-    Joined on the model NAME (env hints or --model arg), not the session id:
-    the transcript is the only place the session id lives, and no process
-    advertises it. A lone base_url-bearing claude process wins by default."""
+_WINDOW_ENV_KEYS = ("CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+                    "CLAUDE_CODE_DISABLE_1M_CONTEXT",
+                    "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT")
+# the gateway probe needs the alias the CLI asked for and the bearer the CLI
+# sends — the token is used for ONE local request and never leaves the probe
+_GATEWAY_ENV_KEYS = ("ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+
+def _claude_env_for_model(model):
+    """The env of the claude process that serves `model` — its
+    ANTHROPIC_BASE_URL and the window knobs the CLI reads
+    (`_WINDOW_ENV_KEYS`). Joined on the model NAME (env hints or --model
+    arg), not the session id: the transcript is the only place the session
+    id lives, and no process advertises it. Without a strong join a lone
+    claude process that carries any of these vars wins; several that
+    disagree -> {} (never attribute one session's knobs to another)."""
     try:
         out = subprocess.run(["ps", "-axww", "-o", "pid=,command="],
                              capture_output=True, text=True, timeout=5).stdout
     except Exception:
-        return None
-    weak = None
+        return {}
+    weak = []
     for line in out.splitlines():
         parts = line.split(None, 1)
         if len(parts) != 2 or not parts[0].isdigit():
@@ -3116,17 +3298,23 @@ def _base_url_for_model(model):
         if os.path.basename(head) != "claude" or " --bg-" in cmd:
             continue
         env = _proc_env(pid)
-        url = env.get("ANTHROPIC_BASE_URL")
-        if not url:
+        keep = {k: env[k] for k in ("ANTHROPIC_BASE_URL",) + _WINDOW_ENV_KEYS
+                + _GATEWAY_ENV_KEYS if env.get(k)}
+        if not (set(keep) & set(("ANTHROPIC_BASE_URL",) + _WINDOW_ENV_KEYS)):
             continue
         hints = [env[k] for k in _MODEL_ENV_KEYS if env.get(k)]
         m = re.search(r"--model[ =](\S+)", cmd)
         if m:
             hints.append(m.group(1))
         if model in hints:
-            return url                      # strong join: named our model
-        weak = weak or url
-    return weak
+            return keep                     # strong join: named our model
+        weak.append(keep)
+    if len(weak) == 1 or (weak and all(w == weak[0] for w in weak)):
+        return weak[0]
+    return {}
+
+def _base_url_for_model(model):
+    return _claude_env_for_model(model).get("ANTHROPIC_BASE_URL")
 
 def _http_json(url, payload=None, timeout=2.5):
     import urllib.request
@@ -3168,19 +3356,72 @@ def _backend_from_entry(url, entry, loaded):
         info["ctx"] = ctx
     return info
 
-def probe_local_backend(model, url=None):
-    """Identity of the local backend serving `model`, or None. Only the
-    /api/ps `context_length` is the served (budget-true) window."""
-    url = (url or _base_url_for_model(model)
+def _http_json_auth(url, token, timeout=2.5):
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Bearer %s" % token, "x-api-key": token,
+        "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+def _litellm_pick(entries, model, alias):
+    """The /model/info entry serving the session: the alias the CLI asked
+    for (ANTHROPIC_MODEL), else the upstream name that ends in the model the
+    transcript records, else a lone entry."""
+    rows = [e for e in (entries or []) if isinstance(e, dict)]
+    for e in rows:
+        if alias and e.get("model_name") == alias:
+            return e
+    ml = (model or "").lower()
+    for e in rows:
+        up = str((e.get("litellm_params") or {}).get("model") or "").lower()
+        if ml and (up.endswith("/" + ml) or up == ml):
+            return e
+    return rows[0] if len(rows) == 1 else None
+
+def probe_litellm(url, model, alias=None, token=None):
+    """Route identity from a LiteLLM gateway's /model/info: what the alias
+    maps to and where it goes (`anthropic/qwen-3.6 @ host`). The window is
+    whatever `model_info.max_input_tokens` the operator DECLARED — per-model
+    metadata when set, absent when not; never inferred."""
+    if not token:
+        return None
+    d = _http_json_auth(url + "/model/info", token)
+    e = _litellm_pick(d.get("data"), model, alias)
+    if not e:
+        return None
+    lp, mi = e.get("litellm_params") or {}, e.get("model_info") or {}
+    up = str(lp.get("model") or "")
+    base = str(lp.get("api_base") or "")
+    host = re.sub(r"^https?://", "", base).split("/")[0]
+    route = up + ("@" + host if host else "")
+    ctx = mi.get("max_input_tokens")
+    info = {"kind": "litellm", "url": url, "params": "", "quant": "",
+            "ctx": int(ctx) if isinstance(ctx, int) and ctx > 0 else None,
+            "loaded": isinstance(ctx, int) and ctx > 0,
+            "route": route, "alias": e.get("model_name") or alias or ""}
+    return info
+
+def probe_local_backend(model, url=None, env=None):
+    """Identity of the backend serving `model`, or None: an Ollama server
+    (served window from /api/ps) or a LiteLLM gateway (route + declared
+    window from /model/info). Everything here is asked, never guessed."""
+    env = env or {}
+    url = (url or env.get("ANTHROPIC_BASE_URL") or _base_url_for_model(model)
            or "http://localhost:11434").rstrip("/")
     try:
-        if "version" not in _http_json(url + "/api/version"):
-            return None
-        entry = _ollama_pick(_http_json(url + "/api/ps").get("models"), model)
-        if entry:
-            return _backend_from_entry(url, entry, True)
-        entry = _http_json(url + "/api/show", {"model": model})
-        return _backend_from_entry(url, entry, False)
+        if "version" in _http_json(url + "/api/version"):
+            entry = _ollama_pick(_http_json(url + "/api/ps").get("models"), model)
+            if entry:
+                return _backend_from_entry(url, entry, True)
+            entry = _http_json(url + "/api/show", {"model": model})
+            return _backend_from_entry(url, entry, False)
+    except Exception:
+        pass
+    try:
+        return probe_litellm(url, model, env.get("ANTHROPIC_MODEL"),
+                             env.get("ANTHROPIC_AUTH_TOKEN")
+                             or env.get("ANTHROPIC_API_KEY"))
     except Exception:
         return None
 
@@ -3385,6 +3626,7 @@ class Engine:
         self._roster_cache = []
         self._resident_cache = {}      # path -> (mtime, (resident, model))
         self._backend_ctx = {}         # model -> served window (probe result)
+        self._model_window = {}        # model -> (window, source), CLI-resolved
         self._agent_map_cache = {}             # agent path -> (mtime, map|None)
         # seek coalescing (latest wins)
         self._seek_cond = threading.Condition()
@@ -3608,25 +3850,80 @@ class Engine:
 
     # ---- local-backend probe ----------------------------------------------------
     def _maybe_probe_backend(self, sess):
-        """Fire the probe once per (session, model), off-thread — the tail
-        loop must never wait on a network answer."""
+        """Resolve the window once per (session, model), off-thread — the
+        tail loop must never wait on `ps` or a network answer."""
         m = sess.model
-        if (not m or m == "?" or sess.provider != "claude"
-                or m.startswith("claude-")):
+        if not m or m == "?" or sess.provider != "claude":
             return
         if getattr(sess, "_probed_model", None) == m:
             return
         sess._probed_model = m
-        threading.Thread(target=self._probe_backend, args=(sess, m),
+        threading.Thread(target=self._resolve_window, args=(sess, m),
                          daemon=True).start()
+
+    def _resolve_window(self, sess, model):
+        """The window this session's model runs under, as per-model
+        metadata: the CLI's own resolution from the session's process env +
+        settings (`claude_window`), then — non-Anthropic only — the served
+        window from the local backend, which caps it (the server truncates
+        before the CLI would compact)."""
+        env = _claude_env_for_model(model)
+        w, src = claude_window(model, env, read_settings())
+        with self.lock:
+            if self.session is not sess or sess.model != model:
+                return
+            self._model_window[model] = (w, src)
+            old = sess.budget
+            if sess.set_window(model, w, src) and old != w:
+                self._backend_event(
+                    sess, "context window %dk (%s): budget %d -> %d"
+                    % (w // 1000, src, old, w))
+            if src == "unknown-model":
+                self._backend_event(
+                    sess, "Claude Code does not recognize %s — auto-compact "
+                    "assumes %dk; set CLAUDE_CODE_MAX_CONTEXT_TOKENS to its "
+                    "real window" % (model, w // 1000))
+            elif src == "env":
+                self._backend_event(
+                    sess, "context window %dk from CLAUDE_CODE_MAX_CONTEXT_"
+                    "TOKENS" % (w // 1000))
+            self._send_meta(sess)
+        if not anthropic_model(model) or env.get("ANTHROPIC_BASE_URL"):
+            self._probe_backend(sess, model, env)
+
+    def _send_meta(self, sess):
+        meta = sess.meta_payload()
+        if meta != self._last_meta:
+            self._last_meta = meta
+            send(dict({"type": "meta"}, **meta))
+
+    def _apply_served(self, sess, model, ctx, why):
+        """A served window (Ollama /api/ps) is the truncation cliff. It is
+        the budget when it is the TIGHTER limit — below the CLI's window —
+        or when the CLI is not enforcing one (`unenforced`); otherwise
+        auto-compact fires first and the CLI window stays the budget."""
+        cli = self._model_window.get(model)
+        cli_w = cli[0] if cli else sess.budget
+        unenforced = bool(cli and cli[1] == "unenforced")
+        if sess.budget_pinned and sess.budget_source != "served":
+            return
+        if not (unenforced or ctx < cli_w):
+            return
+        old = sess.budget
+        sess._budget_model = model
+        sess.budget, sess.budget_source = int(ctx), "served"
+        sess.budget_pinned = True
+        if old != sess.budget:
+            self._backend_event(sess, "%s: budget %d -> %d"
+                                % (why, old, sess.budget))
 
     def _backend_event(self, sess, msg, severity="info"):
         send({"type": "event", "kind": "backend", "severity": severity,
               "ts": now_hhmmss(), "turn": max(0, len(sess.turns) - 1),
               "msg": msg})
 
-    def _probe_backend(self, sess, model):
-        info = probe_local_backend(model)
+    def _probe_backend(self, sess, model, env=None):
+        info = probe_local_backend(model, None, env)
         if info is None:
             return
         with self.lock:
@@ -3636,15 +3933,10 @@ class Engine:
             ctx = info.get("ctx")
             if info.get("loaded") and ctx:
                 self._backend_ctx[model] = int(ctx)   # fleet rows inherit it
-            if info.get("loaded") and ctx and not sess.budget_pinned \
-                    and ctx != sess.budget:
-                # /api/ps ctx is the SERVED window — authoritative, pin it
-                old, sess.budget = sess.budget, int(ctx)
-                sess.budget_pinned = True
-                self._backend_event(
-                    sess, "local backend %s (%s %s): budget %d -> %d"
+                self._apply_served(
+                    sess, model, int(ctx), "local backend %s (%s %s)"
                     % (model, info.get("params") or "?",
-                       info.get("quant") or "?", old, sess.budget))
+                       info.get("quant") or "?"))
             # partial CPU offload: the standing explanation for every slow
             # turn that follows — said once, where the user looks when slow
             size, vram = info.get("size"), info.get("size_vram")
@@ -3652,11 +3944,15 @@ class Engine:
                 self._backend_event(
                     sess, "vram %.1fG/%.1fG — partial CPU offload, "
                     "slow decode expected" % (vram / 1e9, size / 1e9))
-            meta = sess.meta_payload()
-            if meta != self._last_meta:
-                self._last_meta = meta
-                send(dict({"type": "meta"}, **meta))
-        self._backend_watch(sess, model, info["url"])
+            if info.get("kind") == "litellm":
+                self._backend_event(
+                    sess, "gateway %s: %s -> %s%s"
+                    % (info["url"], info.get("alias") or model, info["route"],
+                       " (declared window %dk)" % (info["ctx"] // 1000)
+                       if info.get("ctx") else ", no window declared"))
+            self._send_meta(sess)
+        if info.get("kind") == "ollama":
+            self._backend_watch(sess, model, info["url"])
 
     def _backend_watch(self, sess, model, url):
         """Slow /api/ps poll: model lifecycle as MOMENTS in the events feed —
@@ -3690,12 +3986,8 @@ class Engine:
                 ctx = info.get("ctx")
                 if ctx:
                     self._backend_ctx[model] = int(ctx)
-                if ctx and ctx != sess.budget:
-                    old, sess.budget = sess.budget, int(ctx)
-                    sess.budget_pinned = True
-                    self._backend_event(
-                        sess, "served window changed: budget %d -> %d"
-                        % (old, sess.budget))
+                    self._apply_served(sess, model, int(ctx),
+                                       "served window changed")
                 meta = sess.meta_payload()
                 if meta != self._last_meta:
                     self._last_meta = meta
@@ -4129,13 +4421,23 @@ class Engine:
         row's model has one (local sessions render on THEIR window, not an
         Anthropic rung), else pinned --budget verbatim, else the base budget
         auto-bumped to fit the row's own resident (`fleet_budget`)."""
-        if model and not model.startswith("claude-"):
+        if model and not anthropic_model(model):
             ctx = self._backend_ctx.get(model)
             if ctx:
                 return int(ctx)
         if self.budget_pinned:
             return self.budget
-        return fleet_budget(self.budget, resident)
+        # the window the CLI runs this row's model under (resolved for a
+        # live session of it, else by name); the base budget only for rows
+        # with no model yet
+        if model:
+            known = getattr(self, "_model_window", {}).get(model)
+            base = known[0] if known else claude_window(model, settings={})[0]
+            if anthropic_model(model) and "[1m]" not in model and not known:
+                base = self.budget
+        else:
+            base = self.budget
+        return fleet_budget(base, resident)
 
     # ---- codex provider (SPEC f2 providers; fleet feed only) ----------------
     def _codex_pids(self):

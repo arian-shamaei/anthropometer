@@ -240,6 +240,16 @@ pub struct Turn {
     pub stop: Option<String>,
     #[serde(default)]
     pub tools: u64,
+    /// server-counted thinking tokens (usage.output_tokens_details)
+    #[serde(default)]
+    pub think: Option<u64>,
+    /// effort the CLI requested for this turn
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub speed: Option<String>,
     #[serde(default)]
     pub cost_u: f64,
     #[serde(default)]
@@ -494,6 +504,15 @@ pub struct Meta {
     pub model: String,
     #[serde(default)]
     pub budget: u64,
+    /// where the budget came from — the CLI's own window sources (`env`,
+    /// `1m`, `model-default`, `unknown-model`, `unenforced`), `served`
+    /// (backend probe), `bumped` (resident outgrew the rung), `pin`
+    #[serde(default)]
+    pub budget_source: Option<String>,
+    /// "open": the backend returns its reasoning on the wire, no hidden
+    /// slab exists; "hidden": billed output exceeds everything visible
+    #[serde(default)]
+    pub reasoning: Option<String>,
     #[serde(default)]
     pub t_auto: f64,
     #[serde(default)]
@@ -525,6 +544,9 @@ pub struct Backend {
     /// true when read from the loaded model (/api/ps), not the registry
     #[serde(default)]
     pub loaded: bool,
+    /// gateway route (LiteLLM /model/info): upstream model @ host
+    #[serde(default)]
+    pub route: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

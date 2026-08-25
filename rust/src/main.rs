@@ -3255,6 +3255,10 @@ mod screenshots {
                 dur_ms: None,
                 stop: None,
                 tools: 0,
+                think: None,
+                effort: None,
+                tier: None,
+                speed: None,
                 cost_u: 0.0,
                 hit: 1.0,
             }));
@@ -3575,6 +3579,8 @@ mod screenshots {
             title: None,
             model: "qwen3.8".into(),
             budget: 65_536,
+            budget_source: None,
+            reasoning: None,
             t_auto: 0.85,
             cc_version: None,
             started_at: None,
@@ -3588,6 +3594,7 @@ mod screenshots {
                 quant: "Q4_K_M".into(),
                 ctx: Some(65_536),
                 loaded: true,
+                route: None,
             })
         };
         // backend + all-zero cache -> dormant
@@ -3619,6 +3626,8 @@ mod screenshots {
             title: None,
             model: "qwen3.8".into(),
             budget: 65_536,
+            budget_source: None,
+            reasoning: None,
             t_auto: 0.85,
             cc_version: None,
             started_at: None,
@@ -3629,6 +3638,7 @@ mod screenshots {
                 quant: "Q4_K_M".into(),
                 ctx: Some(65_536),
                 loaded: true,
+                route: None,
             }),
         });
         for i in 0..6 {
@@ -3662,6 +3672,8 @@ mod screenshots {
                 title: None,
                 model: "qwen3.8".into(),
                 budget: 65_536,
+                budget_source: None,
+                reasoning: None,
                 t_auto: 0.85,
                 cc_version: None,
                 started_at: None,
@@ -3701,6 +3713,7 @@ mod screenshots {
             quant: "Q4_K_M".into(),
             ctx: Some(65_536),
             loaded: true,
+            route: None,
         }));
         let got = colors(&mut local);
         assert!(got.contains(&edge(er, eg, eb)),
@@ -4093,6 +4106,22 @@ mod screenshots {
     // ---- review-fix regressions -------------------------------------------
 
     #[test]
+    fn ribbon_marks_assumed_window() {
+        // an unrecognized model runs under a window the CLI ASSUMES (200k,
+        // enforced) — the ribbon marks that number `?`; a known window
+        // (env / 1m / model-default / served) renders plain
+        let mut app = demo_app();
+        app.st.meta.as_mut().unwrap().budget_source = Some("unknown-model".into());
+        let s = draw(&mut app, 140, 30);
+        let ribbon = s.lines().next().unwrap_or("").to_string();
+        assert!(ribbon.contains("R 121k/200k?"), "assumed marker missing:\n{ribbon}");
+        app.st.meta.as_mut().unwrap().budget_source = Some("env".into());
+        let s = draw(&mut app, 140, 30);
+        let ribbon = s.lines().next().unwrap_or("").to_string();
+        assert!(ribbon.contains("R 121k/200k "), "known window marked:\n{ribbon}");
+    }
+
+    #[test]
     fn ribbon_elides_title_never_fields() {
         let mut app = demo_app();
         if let Some(m) = app.st.meta.as_mut() {
@@ -4300,6 +4329,10 @@ mod screenshots {
             dur_ms: Some(5_000),
             stop: Some("tool_use".into()),
             tools: 1,
+            think: None,
+            effort: None,
+            tier: None,
+            speed: None,
             cost_u: 5.0,
             hit: 0.95,
         }

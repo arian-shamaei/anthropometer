@@ -1161,6 +1161,17 @@ fn legend_spans(st: &State) -> Vec<Span<'static>> {
             fg(cat_color(cat)),
         ));
     }
+    // open reasoning (local backends return their thinking): there is no
+    // hidden slab to draw — say so, muted, instead of leaving the category
+    // silently absent (the dormant-cache idiom)
+    if st
+        .meta
+        .as_ref()
+        .and_then(|m| m.reasoning.as_deref())
+        .is_some_and(|r| r == "open")
+    {
+        spans.push(Span::styled("▪reasoning open  ".to_string(), fg(C_DIM)));
+    }
     if spans.is_empty() {
         spans.push(Span::styled("no categories yet".to_string(), fg(C_DIM)));
     }
@@ -2296,6 +2307,23 @@ pub fn render_turns_tab(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
                     ),
                     fg(C_DIM),
                 )];
+                // wire facts the server/CLI stated for this turn (absent → omitted)
+                let mut wire = String::new();
+                if let Some(k) = t.think {
+                    wire.push_str(&format!("   think {}", fmt_k1(k)));
+                }
+                if let Some(e) = t.effort.as_deref() {
+                    wire.push_str(&format!("   effort {e}"));
+                }
+                if let Some(x) = t.tier.as_deref().filter(|x| *x != "standard") {
+                    wire.push_str(&format!("   tier {x}"));
+                }
+                if let Some(x) = t.speed.as_deref().filter(|x| *x != "standard") {
+                    wire.push_str(&format!("   speed {x}"));
+                }
+                if !wire.is_empty() {
+                    l2.push(Span::styled(wire, fg(C_DIM)));
+                }
                 // per-turn faccess counts (omitted when zero accesses)
                 let (mut r, mut w, mut e) = (0u64, 0u64, 0u64);
                 for fa in st.faccess.iter().filter(|fa| fa.turn == t.turn) {
@@ -5479,17 +5507,29 @@ pub fn render_ribbon(
                     parts.push(p.to_string());
                 }
             }
+            // gateway: where the alias actually goes — `litellm·anthropic/qwen-3.6@host`
+            if let Some(route) = b.route.as_deref().filter(|s| !s.is_empty()) {
+                parts.push(route.to_string());
+            }
             parts.join("·")
         }
         None => model.clone(),
     };
     spans.push(Span::styled(format!("{model_txt} "), fg(C_DIM)));
     spans.push(Span::styled("│ ".to_string(), fg(C_GRID)));
+    // an ASSUMED window (the CLI does not recognize the model and enforces
+    // 200k) is marked `?` — the one case the number is not the model's own
+    let assumed = st
+        .meta
+        .as_ref()
+        .and_then(|m| m.budget_source.as_deref())
+        .is_some_and(|s| s == "unknown-model" || s == "unenforced");
     spans.push(Span::styled(
         format!(
-            "R {}/{} {:.0}% ",
+            "R {}/{}{} {:.0}% ",
             fmt_k0(st.resident),
             fmt_k0(st.budget),
+            if assumed { "?" } else { "" },
             ratio * 100.0
         ),
         fg(C_FG),
