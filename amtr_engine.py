@@ -3502,7 +3502,32 @@ def proxy_compose(body):
                           + rec["msgs_chars"])
     return rec
 
-_IN_TOK_RE = re.compile(rb'"input_tokens"\s*:\s*(\d+)')
+def proxy_compose_openai(body):
+    """One composition record from a /chat/completions request body (bytes).
+    Same shape as proxy_compose: system prompt measured separately, tools as
+    a slab, everything else as history — the wire's own bytes, no inference."""
+    try:
+        d = json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(d, dict) or "messages" not in d:
+        return None
+    msgs = d.get("messages") if isinstance(d.get("messages"), list) else []
+    tools = d.get("tools") if isinstance(d.get("tools"), list) else []
+    sys_msgs = [m for m in msgs if isinstance(m, dict) and m.get("role") == "system"]
+    rest = [m for m in msgs if m not in sys_msgs]
+    rec = {"ts": datetime.now(timezone.utc).isoformat(),
+           "api": "openai",
+           "model": str(d.get("model") or ""),
+           "system_chars": sum(_jchars(m.get("content")) for m in sys_msgs),
+           "tools_n": len(tools), "tools_chars": _jchars(tools),
+           "msgs_n": len(rest), "msgs_chars": _jchars(rest),
+           "input_tokens": None}
+    rec["total_chars"] = (rec["system_chars"] + rec["tools_chars"]
+                          + rec["msgs_chars"])
+    return rec
+
+_IN_TOK_RE = re.compile(rb'"(?:input_tokens|prompt_tokens)"\s*:\s*(\d+)')
 
 def latest_proxy_record(model, max_age=900, span=65536):
     """Newest proxy composition record for `model` (fresh within max_age s),
@@ -3574,6 +3599,17 @@ def run_proxy(args):
             rec = None
             if self.command == "POST" and "/messages" in self.path:
                 rec = proxy_compose(body)
+            elif self.command == "POST" and "/chat/completions" in self.path:
+                rec = proxy_compose_openai(body)
+            if rec is not None and os.environ.get("AMTR_PROXY_BODIES"):
+                # opt-in wire recorder: keep the actual bodies so the log can
+                # reconstruct the session (e.g. a graded harness record) —
+                # sizes-only remains the default because bodies are heavy and
+                # may hold user text
+                try:
+                    rec["request_body"] = json.loads(body.decode("utf-8", "replace"))
+                except Exception:
+                    rec["request_body"] = None
             req = urllib.request.Request(upstream + self.path,
                                          data=body or None,
                                          method=self.command)
@@ -3587,6 +3623,14 @@ def run_proxy(args):
             except urllib.error.HTTPError as e:
                 resp = e
             except Exception as e:
+                # the wire saw this request even though upstream did not:
+                # record the composition with the failure, so an outage
+                # never silently thins the audit trail
+                if rec is not None:
+                    rec["upstream_error"] = str(e)[:200]
+                    with wlock:
+                        with open(PROXY_LOG, "a", encoding="utf-8") as fh:
+                            fh.write(json.dumps(rec) + "\n")
                 self.send_error(502, str(e))
                 return
             self.send_response(resp.getcode())
@@ -3608,12 +3652,20 @@ def run_proxy(args):
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     break
-                if rec is not None and rec["input_tokens"] is None \
-                        and len(sniff) < 262144:
+                if rec is not None and len(sniff) < 2097152 \
+                        and (rec["input_tokens"] is None
+                             or "request_body" in rec):
                     sniff += chunk
-                    m = _IN_TOK_RE.search(sniff)
-                    if m:
-                        rec["input_tokens"] = int(m.group(1))
+                    if rec["input_tokens"] is None:
+                        m = _IN_TOK_RE.search(sniff)
+                        if m:
+                            rec["input_tokens"] = int(m.group(1))
+            if rec is not None and "request_body" in rec:
+                try:
+                    rec["response_body"] = json.loads(
+                        sniff.decode("utf-8", "replace"))
+                except Exception:
+                    rec["response_body"] = None
             if rec is not None:
                 with wlock:
                     with open(PROXY_LOG, "a", encoding="utf-8") as fh:
