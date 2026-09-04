@@ -262,6 +262,21 @@ amtr-report --watch        # tails the live session; prints the report when it e
 **Keys:** `1`–`6` tabs · `f` sessions (`tab` wall) · `i` inspect · `m` map mode ·
 `←/→` scrub · `R` report · `?` help · `q` quit.
 
+### As a Claude Code skill
+
+The same instrument, headless, inside the agent: the `amtr` skill lets Claude
+answer "what is eating my context?", "what has this session cost?", "what did the
+compaction drop?" from the real transcript instead of guessing.
+
+```sh
+cp -r skills/amtr ~/.claude/skills/amtr     # personal skill; or .claude/skills/ in a project
+```
+
+Then ask in a session: *"how full is my context and why?"* — it runs
+`skills/amtr/scripts/amtr-report.sh --json` on the session it is in and answers with
+labeled numbers. Works from the checkout alone (stdlib python), and uses an
+installed `amtr` when there is one. Skill spec: [`skills/amtr/SKILL.md`](skills/amtr/SKILL.md).
+
 ---
 
 ## Authoritative vs. estimated
@@ -325,6 +340,7 @@ amtr_engine.py     the engine: discovery, tailing, accounting, checkpoints, repl
 amtr_paper.py      the PDF report builder (amtr_figures/_turns/_phases support it);
                    ships separately as the `amtr-paper` pip plugin (report/)
 rust/              the TUI (cargo test runs a headless screenshot suite)
+skills/amtr/       the Claude Code skill: the report, headless, answering inside the agent
 tests/             engine test suite + synthetic fixtures
 packaging/homebrew the Homebrew formula + tap runbook
 docs/assets/       screenshots and figures for this README

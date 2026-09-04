@@ -1228,6 +1228,31 @@ class TestReport(unittest.TestCase):
         self.assertEqual(d["header"]["turns"], 8)
         self.assertFalse(d["header"]["interrupted"])
 
+    def test_skill_script(self):
+        """skills/amtr/scripts/amtr-report.sh is the Claude Code skill's entry
+        point: same JSON as --report --json, engine resolved by the script."""
+        script = os.path.join(ROOT, "skills", "amtr", "scripts", "amtr-report.sh")
+        env = dict(os.environ, AMTR_ENGINE=os.path.join(ROOT, "amtr_engine.py"))
+        out = subprocess.run(
+            ["sh", script, "--json", "--session", FIX, "--budget", "200000"],
+            cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr.decode("utf-8"))
+        d = json.loads(out.stdout.decode("utf-8"))
+        self.assertEqual(list(d)[:3], ["header", "context", "economics"])
+        self.assertEqual(d["context"]["final_r"], 2960)
+        # the bundled fallback engine must be the canonical one
+        # (packaging/sync-engine.sh keeps it so; release.sh runs it first)
+        bundled = os.path.join(ROOT, "skills", "amtr", "scripts", "amtr_engine.py")
+        with open(bundled, "rb") as a, open(os.path.join(ROOT, "amtr_engine.py"), "rb") as b:
+            self.assertEqual(a.read(), b.read(),
+                             "skills/amtr/scripts/amtr_engine.py drifted: run packaging/sync-engine.sh")
+        # SKILL.md frontmatter per the Agent Skills spec: name matches the dir
+        with open(os.path.join(ROOT, "skills", "amtr", "SKILL.md")) as f:
+            head = f.read().split("---")[1]
+        self.assertIn("name: amtr\n", head)
+        self.assertIn("description: ", head)
+
     def test_shell_fixture_report(self):
         path = os.path.join(ROOT, "tests", "fixtures", "shell.jsonl")
         sess = ce.Session(path, budget=200_000, budget_pinned=True)

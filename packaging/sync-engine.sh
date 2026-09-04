@@ -7,6 +7,7 @@
 set -e
 cd "$(dirname "$0")/.."
 cp amtr_engine.py rust/engine/
+cp amtr_engine.py skills/amtr/scripts/   # the Claude Code skill's bundled fallback
 rm -f rust/engine/amtr_paper.py rust/engine/amtr_figures.py \
       rust/engine/amtr_phases.py rust/engine/amtr_turns.py
-echo "synced $(ls rust/engine | wc -l | tr -d ' ') file(s) into rust/engine/"
+echo "synced $(ls rust/engine | wc -l | tr -d ' ') file(s) into rust/engine/ and skills/amtr/scripts/"
