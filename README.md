@@ -56,6 +56,21 @@ It works on any session — Claude Code interactive or headless (`claude -p`), a
 Codex CLI — because every agent already writes a complete transcript. `amtr` just
 reads it in real time; new agents are a parser away.
 
+### Compared to token usage trackers
+
+If you already run a token usage or cost tracker, `amtr` is not a replacement —
+it answers the question those tools stop at.
+
+| tool | what it answers | reads |
+|------|-----------------|-------|
+| [ccusage](https://github.com/ccusage/ccusage) | how many tokens and dollars per day / session | Claude Code JSONL |
+| [tokscale](https://github.com/junhoyeo/tokscale) | token usage across coding agents, leaderboard | many agents |
+| [Tokdash](https://github.com/JingbiaoMei/Tokdash) | usage heatmaps, quota resets, cost per provider | many agents |
+| **amtr** | **what the tokens *are*** — which files, which tool calls, which subagent, what a compaction dropped, at any past turn | Claude Code, Codex CLI, Gemini CLI transcripts |
+
+A tracker tells you how full the context window is. `amtr` shows you which
+file is filling it, how many times it was read, and lets you press `i` and read it.
+
 ---
 
 ## The live TUI
