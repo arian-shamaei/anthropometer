@@ -208,15 +208,81 @@ fn oklab_to_srgb(l: f64, a: f64, b: f64) -> Option<(u8, u8, u8)> {
 /// Reroll counter for the big-view tank palette (space steps it forward).
 static PAL_ROLL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Advance to the next generated tank palette.
+/// Advance to the next generated tank palette (and take off any pride
+/// flag `p` put on — space is the generative reroll).
 pub fn reroll_palette() {
+    PRIDE_IDX.store(NO_PRIDE, std::sync::atomic::Ordering::Relaxed);
     PAL_ROLL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The current tank palette: one time-based seed rolled per process (the
-/// only randomness in the renderer — deterministic between rerolls), offset
-/// by the reroll counter so space steps to a fresh palette.
+/// Pride-flag tank palettes: the ONE stored palette set (everything else is
+/// generated). Each flag is squeezed to the tank's 4 stops, listed BOTTOM →
+/// TOP of the flag so a full tall tank shows the flag the right way up
+/// (`render_tank` paints stop 0 at the bottom, stop 3 at the surface).
+/// Five- and six-stripe flags drop or merge a stripe; the piecewise-linear
+/// sweep between stops recovers most of what was dropped (rainbow's orange
+/// lives between red and yellow). Hex values are the commonly published ones.
+pub const PRIDE_PALETTES: [(&str, [(u8, u8, u8); 4]); 12] = [
+    ("rainbow", [(0x00, 0x4C, 0xFF), (0x00, 0x80, 0x26), (0xFF, 0xED, 0x00), (0xE4, 0x03, 0x03)]),
+    ("transgender", [(0x5B, 0xCE, 0xFA), (0xF5, 0xA9, 0xB8), (0xFF, 0xFF, 0xFF), (0xF5, 0xA9, 0xB8)]),
+    ("bisexual", [(0x00, 0x38, 0xA8), (0x00, 0x38, 0xA8), (0x9B, 0x4F, 0x96), (0xD6, 0x02, 0x70)]),
+    ("pansexual", [(0x21, 0xB1, 0xFF), (0xFF, 0xD8, 0x00), (0xFF, 0xD8, 0x00), (0xFF, 0x21, 0x8C)]),
+    ("nonbinary", [(0x2C, 0x2C, 0x2C), (0x9C, 0x59, 0xD1), (0xFF, 0xFF, 0xFF), (0xFC, 0xF4, 0x34)]),
+    ("lesbian", [(0xA3, 0x02, 0x62), (0xFF, 0xFF, 0xFF), (0xFF, 0x9A, 0x56), (0xD5, 0x2D, 0x00)]),
+    ("asexual", [(0x80, 0x00, 0x80), (0xFF, 0xFF, 0xFF), (0xA3, 0xA3, 0xA3), (0x00, 0x00, 0x00)]),
+    ("aromantic", [(0x00, 0x00, 0x00), (0xFF, 0xFF, 0xFF), (0xA7, 0xD3, 0x79), (0x3D, 0xA5, 0x42)]),
+    ("genderfluid", [(0x2F, 0x3C, 0xBE), (0xC0, 0x11, 0xD7), (0xFF, 0xFF, 0xFF), (0xFF, 0x76, 0xA4)]),
+    ("genderqueer", [(0x4A, 0x81, 0x23), (0xFF, 0xFF, 0xFF), (0xFF, 0xFF, 0xFF), (0xB5, 0x7E, 0xDC)]),
+    ("agender", [(0xB8, 0xF4, 0x83), (0xFF, 0xFF, 0xFF), (0xB9, 0xB9, 0xB9), (0x00, 0x00, 0x00)]),
+    ("intersex", [(0xFF, 0xD8, 0x00), (0x79, 0x02, 0xAA), (0x79, 0x02, 0xAA), (0xFF, 0xD8, 0x00)]),
+];
+
+/// Which pride flag the tank wears: an index into `PRIDE_PALETTES`, or
+/// `NO_PRIDE` when the generated palette is showing. `p` (gradient mode)
+/// picks; space (generative reroll) clears.
+const NO_PRIDE: usize = usize::MAX;
+static PRIDE_IDX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(NO_PRIDE);
+
+/// The pride flag the tank currently wears, if any.
+pub fn pride_palette() -> Option<&'static str> {
+    PRIDE_PALETTES
+        .get(PRIDE_IDX.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|(name, _)| *name)
+}
+
+/// `p` in gradient mode: dress the tank in a random pride flag — never the
+/// one already showing, so every press visibly changes the tank. Returns the
+/// flag's name for the log line.
+pub fn pick_pride_palette() -> &'static str {
+    let cur = PRIDE_IDX.load(std::sync::atomic::Ordering::Relaxed);
+    let n = PRIDE_PALETTES.len();
+    // draw from the clock, diffused through splitmix64 so consecutive
+    // presses (nanoseconds apart in a key-repeat burst) still scatter
+    let mut z = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let mut idx = (z % n as u64) as usize;
+    if idx == cur {
+        idx = (idx + 1) % n;
+    }
+    PRIDE_IDX.store(idx, std::sync::atomic::Ordering::Relaxed);
+    PRIDE_PALETTES[idx].0
+}
+
+/// The current tank palette: a pride flag when one is picked (`p`),
+/// otherwise one time-based seed rolled per process (the only randomness
+/// in the renderer — deterministic between rerolls), offset by the reroll
+/// counter so space steps to a fresh palette.
 pub fn art_palette() -> [(u8, u8, u8); 4] {
+    if let Some((_, pal)) = PRIDE_PALETTES.get(PRIDE_IDX.load(std::sync::atomic::Ordering::Relaxed)) {
+        return *pal;
+    }
     static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let base = *BASE.get_or_init(|| {
         std::time::SystemTime::now()
@@ -541,6 +607,9 @@ pub struct Ui {
     pub map_pack: bool,
     pub map_mode: MapMode,
     pub rung_override: i8,
+    /// TURNS `$` toggle: stack heights in COST UNITS (the engine's ku
+    /// weights) instead of tokens — column top = the turn's bill, not R_t
+    pub turns_cost: bool,
     pub tier: Tier,
     /// waterline / cc effective at the viewed turn (cursor-aware)
     pub wl: u64,
@@ -850,7 +919,14 @@ fn cell_px(
 }
 
 /// Row-major memory map, half-block cells (age mode: full-cell shade ramp).
-pub fn render_map(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
+/// `plan_h` is the height the rung was PLANNED against (`map_rows_needed`'s
+/// `max_h`) — the rung must be re-picked from that same capacity, never from
+/// the allocated area, or a `+/-` override compounds: sizing picks auto+over
+/// and shrinks the pane, render's auto on the shrunk pane already IS the
+/// overridden rung, and +over lands on top — leaving the pane half black
+/// (field-found on a 1M-budget session). Pass `area.height` when the map was
+/// not pre-sized (Compact fills the body).
+pub fn render_map(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect, plan_h: u16) {
     if area.width <= MAP_GUTTER + 1 || area.height == 0 {
         return;
     }
@@ -871,7 +947,8 @@ pub fn render_map(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
         (s, (scale.div_ceil(s) as usize).min(capacity))
     } else {
         let scale = st.budget.max(1);
-        let s = pick_rung(scale, capacity, ui.rung_override);
+        let plan_cap = map_capacity(area.width, plan_h.max(area.height), full_cell);
+        let s = pick_rung(scale, plan_cap, ui.rung_override);
         (s, (scale.div_ceil(s) as usize).min(capacity))
     };
     let mut owners = cell_owners(segs, s_tok, n_cells);
@@ -1118,18 +1195,27 @@ pub fn render_context_gauge(st: &State, f: &mut Frame<'_>, area: Rect) {
 
 /// Header line above the MAP: scale labels that used to sit in the left gutter,
 /// now one horizontal row (`class · ▪=256 · α1.00`) so the map is full-width.
-/// `map_area` is the MAP's own rect — the rung is computed against it so the
-/// label matches the box exactly.
-pub fn render_map_header(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect, map_area: Rect) {
+/// `map_area` is the MAP's own rect; `plan_h` is the height the rung was
+/// planned against (see `render_map`) so the label matches the box exactly.
+pub fn render_map_header(
+    st: &State,
+    ui: &Ui,
+    f: &mut Frame<'_>,
+    area: Rect,
+    map_area: Rect,
+    plan_h: u16,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let full_cell = ui.map_mode == MapMode::Age;
-    let cap = map_capacity(map_area.width, map_area.height, full_cell);
     let s_tok = if ui.map_pack {
+        // pack sizes cells against the PHYSICAL pane it fills
+        let cap = map_capacity(map_area.width, map_area.height, full_cell);
         let total: u64 = eff_segs(st).iter().map(|s| s.tok).sum();
         (total.max(1) as f64 / cap.max(1) as f64).ceil().max(1.0) as u64
     } else {
+        let cap = map_capacity(map_area.width, plan_h.max(map_area.height), full_cell);
         pick_rung(st.budget.max(1), cap, ui.rung_override)
     };
     let dot = || Span::styled("  ·  ".to_string(), fg(C_GRID));
@@ -1347,43 +1433,65 @@ pub fn render_peek_overlay(
 // EKG (OVERVIEW bottom pane)
 // ---------------------------------------------------------------------------
 
-/// Fixed future margin on the EKG x-axis so the dotted projection has room
-/// to reach the T_auto rule. Window = last 480 turns + 32 future = 512 fixed.
-const EKG_FUTURE: f64 = 32.0;
+/// EKG x-axis: past window caps at 480 turns; the future edge is the
+/// PREDICTED turn where resident context reaches 100% of the budget, so the
+/// axis itself answers "how many turns left". Clamped so a near-flat slope
+/// can't stretch the trace into invisibility, with a small floor of margin
+/// when there is no usable prediction (slope ≤ 0, or already at the limit).
 const EKG_PAST: f64 = 479.0;
+const EKG_FUT_MIN: f64 = 8.0;
+const EKG_FUT_MAX: f64 = 480.0;
 
 pub fn render_ekg(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
     if area.width < 4 || area.height == 0 {
         return;
     }
-    let lanes = if area.height >= 5 { 2u16 } else { 0 };
-    let canvas_h = area.height - lanes;
-    let [plot, lane_out, lane_cost] = if lanes == 2 {
-        let [a, b, c] = Layout::vertical([
-            Constraint::Length(canvas_h),
+    // lanes below the plot: turn axis (height ≥ 6) + the two sparklines
+    // (height ≥ 5); smaller panes stay all-plot
+    let [plot, lane_axis, lane_out, lane_cost] = if area.height >= 6 {
+        let [a, x, b, c] = Layout::vertical([
+            Constraint::Length(area.height - 3),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(area);
-        [a, b, c]
+        [a, x, b, c]
+    } else if area.height >= 5 {
+        let [a, b, c] = Layout::vertical([
+            Constraint::Length(area.height - 2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        [a, Rect::ZERO, b, c]
     } else {
-        [area, Rect::ZERO, Rect::ZERO]
+        [area, Rect::ZERO, Rect::ZERO, Rect::ZERO]
     };
 
     let b = st.budget.max(1) as f64;
     let x1 = st.last_turn().unwrap_or(0) as f64;
-    // fixed 512-turn axis, but LEFT-ANCHORED until the session outgrows it —
+    // LEFT-ANCHORED until the session outgrows the past window —
     // a young session's trace starts at the left edge, not mid-pane
     let x0 = (x1 - EKG_PAST).max(0.0);
-    let x_hi = x0 + EKG_PAST + EKG_FUTURE;
     let t_auto = st.t_auto;
+    let slope = st.slope();
+    let r_now = st.resident as f64;
+    // predicted turn where R_t reaches 100% of the budget — that turn IS the
+    // axis max, so the visible runway always ends at the context limit
+    let pred = if slope > 0.0 && r_now < b {
+        Some(x1 + (b - r_now) / slope)
+    } else {
+        None
+    };
+    let x_hi = pred
+        .unwrap_or(x1 + EKG_FUT_MIN)
+        .clamp(x1 + EKG_FUT_MIN, x1 + EKG_FUT_MAX);
     let pts: Vec<(f64, f64, f64)> = st
         .turns
         .iter()
         .map(|t| (t.turn as f64, t.resident as f64, t.waterline as f64))
         .collect();
-    let slope = st.slope();
-    let r_now = st.resident as f64;
     let cliffs: Vec<(f64, f64)> = st
         .compactions
         .iter()
@@ -1436,15 +1544,17 @@ pub fn render_ekg(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
                         color: rgb(zone),
                     });
                 }
-                // dotted least-squares projection to the T_auto rule
-                if slope > 0.0 && r_now < b * t_auto {
+                // dotted least-squares projection all the way to 100% —
+                // dot spacing scales with the span so density stays even
+                if slope > 0.0 && r_now < b {
+                    let step = ((x_hi - x0) / 256.0).max(0.25);
                     let mut dots: Vec<(f64, f64)> = Vec::new();
                     let mut x = x1;
                     let mut y = r_now;
-                    while x <= x_hi && y <= b * t_auto {
+                    while x <= x_hi && y <= b {
                         dots.push((x, y));
-                        x += 2.0;
-                        y += slope * 2.0;
+                        x += step;
+                        y += slope * step;
                     }
                     ctx.draw(&Points {
                         coords: &dots,
@@ -1474,6 +1584,86 @@ pub fn render_ekg(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
                 }
             });
         f.render_widget(canvas, plot);
+    }
+
+    // turn-number x-axis: dim `╵tN` ticks on the plot's own [x0, x_hi]
+    // mapping · amber `╵tN` at the current turn (where the projection
+    // starts) · red `tN╵` at the predicted 100%-context turn (the axis max
+    // when the prediction is live) — that label right-aligns against its
+    // tick so the runway number never clips at the pane edge
+    if lane_axis.height > 0 {
+        let w = lane_axis.width as usize;
+        let span = (x_hi - x0).max(1.0);
+        let cpt = w as f64 / span; // columns per turn
+        let col_of = |turn: f64| ((turn - x0) * cpt).round() as usize;
+        let step = [1u64, 2, 5, 10, 20, 50, 100, 200, 500]
+            .into_iter()
+            .find(|&s| s as f64 * cpt >= 12.0)
+            .unwrap_or(500);
+        let mut row: Vec<char> = vec![' '; w];
+        // a label that can't fit whole degrades to a bare tick mark
+        let place = |turn: u64, row: &mut Vec<char>| -> Option<(usize, usize)> {
+            let col = col_of(turn as f64);
+            if col >= w {
+                return None;
+            }
+            let label: Vec<char> = format!("╵t{turn}").chars().collect();
+            if col + label.len() <= w {
+                row[col..col + label.len()].copy_from_slice(&label);
+                Some((col, label.len()))
+            } else {
+                row[col] = '╵';
+                Some((col, 1))
+            }
+        };
+        // colored marks: (col, len, color) — pred first (it owns collisions)
+        let now = x1 as u64;
+        let pred_t = pred
+            .filter(|&p| p <= x_hi + 0.5 && p.round() as u64 > now)
+            .map(|p| p.round() as u64);
+        let mut marks: Vec<(usize, usize, (u8, u8, u8))> = Vec::new();
+        if let Some(pt) = pred_t {
+            let col = col_of(pt as f64).min(w - 1);
+            let label: Vec<char> = format!("t{pt}╵").chars().collect();
+            let start = (col + 1).saturating_sub(label.len());
+            row[start..=col].copy_from_slice(&label[label.len() - (col + 1 - start)..]);
+            marks.push((start, col + 1 - start, C_RED));
+        }
+        let clear = |marks: &[(usize, usize, (u8, u8, u8))], col: usize, len: usize| {
+            marks
+                .iter()
+                .all(|&(mc, ml, _)| col + len + 1 <= mc || col > mc + ml)
+        };
+        if clear(&marks, col_of(x1), format!("╵t{now}").chars().count()) {
+            if let Some((c, n)) = place(now, &mut row) {
+                marks.push((c, n, C_AMBER));
+            }
+        }
+        let mut t = (x0 / step as f64).ceil() as u64 * step;
+        while (t as f64) <= x_hi {
+            // skip ticks whose columns would touch a colored mark
+            if clear(&marks, col_of(t as f64), format!("╵t{t}").chars().count()) {
+                place(t, &mut row);
+            }
+            t += step;
+        }
+        marks.sort_by_key(|m| m.0);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut i = 0usize;
+        for &(c, n, color) in &marks {
+            if c > i {
+                spans.push(Span::styled(row[i..c].iter().collect::<String>(), fg(C_DIM)));
+            }
+            spans.push(Span::styled(
+                row[c..c + n].iter().collect::<String>(),
+                fg(color),
+            ));
+            i = c + n;
+        }
+        if i < w {
+            spans.push(Span::styled(row[i..].iter().collect::<String>(), fg(C_DIM)));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), lane_axis);
     }
 
     // sparkline lanes: out/turn (0–16k fixed), cost_u/turn (0–100ku fixed)
@@ -2057,6 +2247,69 @@ fn tick_row(tok: u64, b: f64, logical: usize) -> usize {
     (tok as f64 / b * logical as f64).round() as usize
 }
 
+/// Cost-mode (`$`) y-axis ladder in ku — the smallest value ≥ the visible
+/// window's max turn cost wins, so the scale is stable while scrubbing and
+/// a thrash re-bill towers instead of clipping.
+const KU_LADDER: [f64; 12] = [
+    10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 50000.0,
+];
+
+pub fn ku_axis(max_cost: f64) -> f64 {
+    KU_LADDER
+        .iter()
+        .copied()
+        .find(|&l| l >= max_cost)
+        .unwrap_or(KU_LADDER[KU_LADDER.len() - 1])
+}
+
+fn ku_axis_label(y: f64) -> String {
+    if y >= 1000.0 {
+        format!("{}Mu", y / 1000.0)
+    } else {
+        format!("{y}ku")
+    }
+}
+
+/// Cost-mode band edges, cumulative rounding — five bands bottom-up in the
+/// token stack's order plus `out` on top: cr·0.1 steel · cc_5m·1.25 cyan ·
+/// cc_1h·2.0 purple · in·1.0 red · out·5.0 green. The weights ARE the
+/// engine's `cost_u` formula (`amtr_engine.turn_payload`, /1000 → ku), so
+/// the column top is the turn's bill by identity. Same drift-proofing as
+/// [`stack_edges4`]: an unsplit `cc` renders at the 5m tier. Min-1-row rule
+/// for nonzero `in` and `out` kept (clamped to the pane).
+pub fn stack_edges_cost(
+    t: &crate::ipc::Turn,
+    y_ku: f64,
+    logical: usize,
+) -> (usize, usize, usize, usize, usize) {
+    let (c5, c1) = if t.cc_5m + t.cc_1h > 0 {
+        (t.cc_5m, t.cc_1h)
+    } else {
+        (t.cc, 0)
+    };
+    let parts = [
+        t.cr as f64 * 0.1 / 1000.0,
+        c5 as f64 * 1.25 / 1000.0,
+        c1 as f64 * 2.0 / 1000.0,
+        t.in_tok as f64 * 1.0 / 1000.0,
+        t.out as f64 * 5.0 / 1000.0,
+    ];
+    let mut acc = 0.0f64;
+    let mut e = [0usize; 5];
+    for (i, p) in parts.iter().enumerate() {
+        acc += p;
+        e[i] = (acc / y_ku * logical as f64).round() as usize;
+    }
+    if t.in_tok > 0 && e[3] == e[2] {
+        e[3] = (e[2] + 1).min(logical);
+        e[4] = e[4].max(e[3]);
+    }
+    if t.out > 0 && e[4] == e[3] {
+        e[4] = (e[3] + 1).min(logical);
+    }
+    (e[0], e[1], e[2], e[3], e[4])
+}
+
 /// Lane fg color rules (fixed thresholds, no autoscale): out×stop-reason,
 /// dur×tools, ku×hit — the causally-linked second quantity per lane.
 fn out_lane_color(t: &crate::ipc::Turn) -> (u8, u8, u8) {
@@ -2148,25 +2401,58 @@ pub fn render_turns_tab(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
         0.0
     };
 
+    // `$` cost mode: y in ku on the snapped ladder, bands = the engine's
+    // cost weights, column top = the turn's bill (no waterline tick — that
+    // is a token-space address)
+    let y_ku = if ui.turns_cost {
+        let wmax = st
+            .turns
+            .iter()
+            .filter(|t| t.turn >= t_lo)
+            .map(|t| t.cost_u)
+            .fold(0.0f64, f64::max);
+        ku_axis(wmax)
+    } else {
+        0.0
+    };
+
     // stacked columns: cr steel + cc_5m cyan + cc_1h purple + in red, y
     // fixed 0–B; prev-waterline tick overrides the band color at C_{t−1}
     let col_color = |t: &crate::ipc::Turn, lr: usize| -> Option<Color> {
         // lr counted from the BOTTOM
-        let (e1, e2, e3, e4) = stack_edges4(t.cr, t.cc, t.cc_5m, t.cc_1h, t.in_tok, b, logical);
-        let mut c = if lr < e1 {
-            Some(C_STEEL)
-        } else if lr < e2 {
-            Some(C_CYAN)
-        } else if lr < e3 {
-            Some(C_ATTACH)
-        } else if lr < e4 {
-            Some(C_RED)
+        let mut c = if ui.turns_cost {
+            let (e1, e2, e3, e4, e5) = stack_edges_cost(t, y_ku, logical);
+            if lr < e1 {
+                Some(C_STEEL)
+            } else if lr < e2 {
+                Some(C_CYAN)
+            } else if lr < e3 {
+                Some(C_ATTACH)
+            } else if lr < e4 {
+                Some(C_RED)
+            } else if lr < e5 {
+                Some(C_ASSIST)
+            } else {
+                None
+            }
         } else {
-            None
+            let (e1, e2, e3, e4) =
+                stack_edges4(t.cr, t.cc, t.cc_5m, t.cc_1h, t.in_tok, b, logical);
+            if lr < e1 {
+                Some(C_STEEL)
+            } else if lr < e2 {
+                Some(C_CYAN)
+            } else if lr < e3 {
+                Some(C_ATTACH)
+            } else if lr < e4 {
+                Some(C_RED)
+            } else {
+                None
+            }
         };
         // prev-waterline tick: below steel top = promotion into cache,
         // floating above = invalidation depth. Skipped for a ringless prev.
-        if t.turn > 0 {
+        if !ui.turns_cost && t.turn > 0 {
             if let Some(p) = by_turn.get(&(t.turn - 1)) {
                 let tr = tick_row(p.waterline, b, logical);
                 if tr == lr && tr < logical && p.waterline > 0 {
@@ -2185,9 +2471,13 @@ pub fn render_turns_tab(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(chart.height as usize);
     for row in 0..chart.height as usize {
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(w_turns + 1);
-        // gutter: B at top, 0 at bottom
+        // gutter: B (or the ku axis top in `$` mode) at top, 0 at bottom
         let g = if row == 0 {
-            format!("{:>5} ", fmt_k0(st.budget))
+            if ui.turns_cost {
+                format!("{:>5} ", ku_axis_label(y_ku))
+            } else {
+                format!("{:>5} ", fmt_k0(st.budget))
+            }
         } else if row + 1 == chart.height as usize {
             format!("{:>5} ", "0")
         } else {
@@ -4833,7 +5123,7 @@ fn help_sections(tab: usize) -> Vec<HelpSection> {
         items: vec![
             k("1–6", &["tabs: OVERVIEW FILES TURNS AGENTS EVENTS SHELL"]),
             k("f / 0", &["fleet — every session on the machine"]),
-            k("?", &["this help · q quit · p pause render"]),
+            k("?", &["this help · q quit · p pause render (small window: random pride-flag tank)"]),
             k("w", &["welcome tour — the guided walkthrough (opens once by itself)"]),
             k("x", &["amtr3d — stream this session to the Vision Pro memspace"]),
             k("←/→  ⇧←/→", &["turn cursor ±1 / ±10 · home first · end LIVE"]),
@@ -4841,7 +5131,7 @@ fn help_sections(tab: usize) -> Vec<HelpSection> {
             k("bksp", &["drill OUT of an agent, back to its parent session"]),
             k("m", &["MAP mode: class → heat → age → cache"]),
             k("t · tab", &["block theme · small-window theme tank⇄blocks"]),
-            k("␣ · +/-", &["reroll tank palette · cell rung up/down"]),
+            k("␣ · +/-", &["reroll tank palette (generated; clears a pride flag) · cell rung up/down"]),
             k("c", &["latest compaction post-mortem (←/→ walk history)"]),
             k("R", &["write a ground-truth report (→ ~/.claude/amtr-reports/)"]),
         ],
@@ -4871,6 +5161,11 @@ fn help_sections(tab: usize) -> Vec<HelpSection> {
         items: vec![
             k("←/→  ⇧←/→", &["scrub the turn cursor across the columns"]),
             k("c", &["compaction post-mortem for the latest ▼"]),
+            k("$", &[
+                "y-axis in COST UNITS: bands weighted by price (cr×0.1,",
+                "5m×1.25, 1h×2.0, in×1.0, out×5.0), column top = the",
+                "turn's bill in ku — expensive turns tower; $ again = tokens",
+            ]),
             k("", &["column anatomy: see MAP & TURN ANATOMY below"]),
         ],
     };
@@ -5775,19 +6070,33 @@ pub fn render_footer(
         return;
     }
     if tab == 2 {
-        // TURNS: colored legend — one visual vocabulary with the chart
-        let line = Line::from(vec![
+        // TURNS: colored legend — one visual vocabulary with the chart;
+        // `$` cost mode swaps ▀wl (token-space) for the █out cost band
+        let mut spans = vec![
             Span::styled(" █cr".to_string(), fg(C_STEEL)),
             Span::styled(" █5m".to_string(), fg(C_CYAN)),
             Span::styled(" █1h".to_string(), fg(C_ATTACH)),
             Span::styled(" █in".to_string(), fg(C_RED)),
-            Span::styled(" ▀wl".to_string(), fg(C_WLINE)),
+        ];
+        if ui.turns_cost {
+            spans.push(Span::styled(" █out".to_string(), fg(C_ASSIST)));
+        } else {
+            spans.push(Span::styled(" ▀wl".to_string(), fg(C_WLINE)));
+        }
+        spans.extend([
             Span::styled(" ▼cmp".to_string(), fg(C_MAGENTA)),
             Span::styled(" ▲thr".to_string(), fg(C_RED)),
             Span::styled(" ◆mdl".to_string(), fg(C_WHITE)),
-            Span::styled(" · ←/→ turn ⇧±10".to_string(), fg(C_DIM)),
+            Span::styled(
+                if ui.turns_cost {
+                    " · $ tokens · ←/→ turn ⇧±10".to_string()
+                } else {
+                    " · $ cost · ←/→ turn ⇧±10".to_string()
+                },
+                fg(C_DIM),
+            ),
         ]);
-        f.render_widget(Paragraph::new(line), area);
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
     let hint: String = match tab {

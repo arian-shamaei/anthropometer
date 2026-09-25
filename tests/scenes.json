@@ -33,7 +33,7 @@
    "expect_contains": [
     "class",
     "overhead",
-    "LIVE"
+    "busy"
    ]
   },
   {
@@ -142,6 +142,20 @@
    "animated": false,
    "expect_contains": [
     "cr",
+    "hit"
+   ]
+  },
+  {
+   "name": "turns-cost",
+   "keys": [
+    "3",
+    "Escape",
+    "$"
+   ],
+   "animated": false,
+   "expect_contains": [
+    "50ku",
+    "$ tokens",
     "hit"
    ]
   },

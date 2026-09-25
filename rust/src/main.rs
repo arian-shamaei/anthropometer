@@ -163,6 +163,8 @@ struct App {
     file_detail: bool,
     /// HISTORY (default) ↔ NOW; resets to HISTORY on re-attach
     files_view: FilesView,
+    /// TURNS `$` toggle: stack the chart in cost units instead of tokens
+    turns_cost: bool,
     // AGENTS (unified ledger: selection + sort + filter + wf overrides)
     agent_sel: usize,
     agent_sort: AgentSort,
@@ -227,6 +229,10 @@ struct App {
     /// big-number mode (<50×15) theme (`tab` toggles): false = gradient tank
     /// (default) · true = bare OVERVIEW block map, no background fill
     big_blocks: bool,
+    /// true while the last draw showed the big gradient TANK (small window,
+    /// tank theme) — Cell for the map_geom reason; `p` reads it at press
+    /// time to decide pride-flag pick vs pause
+    big_gauge: std::cell::Cell<bool>,
 
     paused: bool,
     /// one draw is allowed through the pause gate (pause-toggle feedback)
@@ -281,6 +287,7 @@ impl App {
             file_sort: FileSort::Size,
             file_detail: false,
             files_view: FilesView::History,
+            turns_cost: false,
             agent_sel: 0,
             agent_sort: AgentSort::Recent,
             agent_filter: AgentFilter::All,
@@ -310,6 +317,7 @@ impl App {
             map_mode: MapMode::Class,
             rung_override: 0,
             big_blocks: false,
+            big_gauge: std::cell::Cell::new(false),
             paused: false,
             force_draw: false,
             blink: true,
@@ -770,6 +778,7 @@ impl App {
             map_pack: false, // MAP is a FIXED-scale box (context space), not stretched
             map_mode: self.map_mode,
             rung_override: self.rung_override,
+            turns_cost: self.turns_cost,
             tier,
             wl,
             cc,
@@ -1198,6 +1207,21 @@ impl App {
                     _ => false,
                 }
             }
+            2 => {
+                // TURNS — `$` flips the y-axis between tokens and cost units
+                match code {
+                    KeyCode::Char('$') => {
+                        self.turns_cost = !self.turns_cost;
+                        self.st.push_log(if self.turns_cost {
+                            "TURNS in cost units — column top = the turn's bill".into()
+                        } else {
+                            "TURNS in tokens — column top = R".into()
+                        });
+                        true
+                    }
+                    _ => false,
+                }
+            }
             3 => {
                 // AGENTS — unified-ledger selection + sort + filter + drill
                 let rows = viz::agent_view_rows(
@@ -1555,6 +1579,14 @@ impl App {
                 self.fleet_query.clear();
                 self.send(Control::FleetRefresh); // rescan the roster on open
             }
+            KeyCode::Char('p') if self.big_gauge.get() => {
+                // gradient mode: the tank wears a random pride flag
+                let flag = viz::pick_pride_palette();
+                if let Some(m) = &self.st.meta {
+                    viz::export_palette(&m.session_id);
+                }
+                self.st.push_log(format!("tank palette: {flag} pride flag"));
+            }
             KeyCode::Char('p') => {
                 self.paused = !self.paused;
                 self.force_draw = true; // show the ⏸ state change immediately
@@ -1881,6 +1913,7 @@ fn render_all(f: &mut Frame<'_>, app: &App) {
     );
 
     let panes = layout(area);
+    app.big_gauge.set(false);
     if panes.too_small {
         f.render_widget(
             Paragraph::new("amtr\n≥14×6")
@@ -1891,6 +1924,7 @@ fn render_all(f: &mut Frame<'_>, app: &App) {
         return;
     }
     let ui = app.ui(panes.tier);
+    app.big_gauge.set(panes.big && !app.big_blocks);
     if panes.big {
         viz::render_big(&app.st, &ui, app.big_blocks, f, panes.body.unwrap());
         return;
@@ -1992,7 +2026,10 @@ fn render_all(f: &mut Frame<'_>, app: &App) {
 
 /// OVERVIEW's vertical split (map header · MAP · legend/inspect line · EKG).
 /// Shared by the renderer and the tour's focus rects so both agree.
-fn overview_layout(app: &App, tier: Tier, body: Rect) -> [Rect; 4] {
+/// Returns the panes plus the height the map's rung was PLANNED against —
+/// render must re-pick the rung from that same capacity (see
+/// `viz::render_map`), so the plan height travels with the layout.
+fn overview_layout(app: &App, tier: Tier, body: Rect) -> ([Rect; 4], u16) {
     let ui0 = app.ui(tier);
     // legend wraps to the width: reserve exactly the rows it needs
     // (INSPECT replaces it with a single identity line)
@@ -2006,13 +2043,16 @@ fn overview_layout(app: &App, tier: Tier, body: Rect) -> [Rect; 4] {
     let map_h = viz::map_rows_needed(&app.st, &ui0, body.width, max_map)
         .max(3)
         .min(max_map);
-    Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(map_h),
-        Constraint::Length(legend_h),
-        Constraint::Min(3),
-    ])
-    .areas(body)
+    (
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(map_h),
+            Constraint::Length(legend_h),
+            Constraint::Min(3),
+        ])
+        .areas(body),
+        max_map,
+    )
 }
 
 fn render_tab_body(f: &mut Frame<'_>, app: &App, ui: &Ui, tier: Tier, body: Rect) {
@@ -2026,7 +2066,7 @@ fn render_tab_body(f: &mut Frame<'_>, app: &App, ui: &Ui, tier: Tier, body: Rect
             // (SPEC e) — small budgets must not leave a mostly-blank pane.
             if tier == Tier::Compact || body.height < 10 {
                 app.map_geom.set((body.width, body.height));
-                viz::render_map(&app.st, ui, f, body);
+                viz::render_map(&app.st, ui, f, body, body.height);
                 return;
             }
             // MAP (a FIXED-scale box that represents the whole context space:
@@ -2034,10 +2074,12 @@ fn render_tab_body(f: &mut Frame<'_>, app: &App, ui: &Ui, tier: Tier, body: Rect
             // + the EKG trend fills the rest as a line graph. The old headline
             // gauge was dropped — R / % / rate / compaction all live in the top
             // ribbon already, and the MAP box IS the context-space headline.
-            let [maphdr, map, legend, ekg] = overview_layout(app, tier, body);
-            viz::render_map_header(&app.st, ui, f, maphdr, map);
-            app.map_geom.set((map.width, map.height));
-            viz::render_map(&app.st, ui, f, map);
+            let ([maphdr, map, legend, ekg], plan_h) = overview_layout(app, tier, body);
+            viz::render_map_header(&app.st, ui, f, maphdr, map, plan_h);
+            // geom carries the PLAN height: the +/- clamp must reason about
+            // the same capacity the rung is actually picked from
+            app.map_geom.set((map.width, plan_h));
+            viz::render_map(&app.st, ui, f, map, plan_h);
             if app.inspect {
                 // INSPECT: the legend row becomes the segment identity line
                 viz::render_inspect_line(&app.st, ui, f, legend);
@@ -3175,6 +3217,46 @@ mod screenshots {
         assert!(!app.big_blocks);
         let s = draw(&mut app, 12, 5); // < 14×6 → centered floor message
         assert!(s.contains("amtr"), "floor message missing:\n{s}");
+    }
+
+    /// `p` over the big gradient tank dresses it in a random pride flag
+    /// (never the same flag twice in a row, space takes it off again);
+    /// everywhere else `p` is still the render pause.
+    #[test]
+    fn p_is_pride_flag_only_over_the_tank() {
+        let mut app = demo_app();
+        draw(&mut app, 40, 12); // gradient tank on screen
+        assert!(app.big_gauge.get());
+        press(&mut app, KeyCode::Char('p'));
+        assert!(!app.paused, "p over the tank must not pause");
+        let first = viz::pride_palette().expect("p must pick a pride flag");
+        assert!(
+            viz::PRIDE_PALETTES.iter().any(|(n, pal)| *n == first && *pal == viz::art_palette()),
+            "tank must wear the picked flag"
+        );
+        assert!(
+            app.st.log.iter().any(|l| l.contains(first) && l.contains("pride")),
+            "log must name the flag"
+        );
+        for _ in 0..20 {
+            let before = viz::pride_palette();
+            press(&mut app, KeyCode::Char('p'));
+            assert_ne!(viz::pride_palette(), before, "consecutive picks must differ");
+        }
+        // space: back to the generated palette
+        press(&mut app, KeyCode::Char(' '));
+        assert!(viz::pride_palette().is_none());
+        // blocks theme (tab) and the full layout: p pauses again
+        press(&mut app, KeyCode::Tab);
+        draw(&mut app, 40, 12);
+        assert!(!app.big_gauge.get());
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.paused, "p over the block theme must pause");
+        press(&mut app, KeyCode::Char('p'));
+        draw(&mut app, 80, 24);
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.paused, "p in the full layout must pause");
+        assert!(viz::pride_palette().is_none(), "pause must not pick a flag");
     }
 
     #[test]

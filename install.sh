@@ -142,6 +142,13 @@ cp -R "$srcdir"/. "$BUNDLEDIR"/
 chmod 0755 "$BUNDLEDIR/amtr"
 ln -sf "$BUNDLEDIR/amtr" "$BINDIR/amtr"
 
+# man page: the bundle carries man/amtr.1; link it where `man` looks
+# ($PREFIX/share/man is on manpath whenever $PREFIX/bin is on PATH).
+if [ -f "$BUNDLEDIR/man/amtr.1" ]; then
+  mkdir -p "$PREFIX/share/man/man1"
+  ln -sf "$BUNDLEDIR/man/amtr.1" "$PREFIX/share/man/man1/amtr.1"
+fi
+
 note "Installed amtr $tag ($target)"
 note "  bundle:  $BUNDLEDIR"
 note "  binary:  $BINDIR/amtr -> $BUNDLEDIR/amtr"

@@ -30,6 +30,7 @@ class Amtr < Formula
     # 2. The stdlib-only engine. The report modules are NOT installed here —
     #    they ship as the amtr-report pip package.
     libexec.install "amtr_engine.py"
+    man1.install "man/amtr.1"
 
     # 3. Relocate the built binary under libexec and put a wrapper on PATH that
     #    (a) pins AMTR_ENGINE so the engine resolves regardless of the install

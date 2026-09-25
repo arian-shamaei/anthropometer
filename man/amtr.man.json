@@ -1,0 +1,204 @@
+{
+  "name": "amtr",
+  "section": 1,
+  "date": "2026-09-20",
+  "os": "anthropometer 0.6.0",
+  "summary": "agentic debugger for Claude Code, Codex CLI and Gemini CLI sessions",
+  "help": {
+    "style": "manual",
+    "cmd": [
+      "amtr"
+    ],
+    "cwd": "anthropometer"
+  },
+  "synopsis": [
+    "[--session FILE | ID] [--project PATH] [--budget N] [--theme NAME] [--engine PATH] [--python PATH] [--tour | --no-tour] [--engine-args ARGS ...]",
+    "--demo"
+  ],
+  "description": "amtr attaches to a running or finished agent session and lets you debug it the way you would a process: the model's context window as a live memory map, what fills it and the actual text, a scrub back to any turn, the price of every call, each subagent's own window, and an autopsy of every compaction. Pressing R compiles a ground-truth PDF report of the whole session.\n\namtr is the terminal user interface; the numbers come from amtr_engine.py, a standard-library Python program that amtr spawns as a child. The engine is found next to the binary, in ../lib/amtr, or through AMTR_ENGINE. It can also be run on its own for a report on standard output (amtr_engine.py --report) or a headless session roster (--fleet).\n\nWith no session given, amtr attaches to the newest session on the machine.",
+  "arguments": [],
+  "options": [
+    {
+      "flags": [
+        "--session"
+      ],
+      "desc": "Attach to a session: a Claude Code, Codex CLI or Gemini CLI transcript path, or its session id.",
+      "arg": "FILE|ID"
+    },
+    {
+      "flags": [
+        "--project"
+      ],
+      "desc": "Attach to the newest session under this project path.",
+      "arg": "PATH"
+    },
+    {
+      "flags": [
+        "--budget"
+      ],
+      "desc": "Pin the context budget, in tokens; passed to the engine.",
+      "arg": "N"
+    },
+    {
+      "flags": [
+        "--theme"
+      ],
+      "desc": "Block theme.",
+      "arg": "NAME",
+      "default": "terminal",
+      "choices": [
+        "terminal",
+        "ukiyo-e",
+        "bauhaus",
+        "mono"
+      ]
+    },
+    {
+      "flags": [
+        "--engine"
+      ],
+      "desc": "Path of amtr_engine.py.",
+      "arg": "PATH",
+      "default": "next to the binary, or $AMTR_ENGINE"
+    },
+    {
+      "flags": [
+        "--python"
+      ],
+      "desc": "Python interpreter used to run the engine.",
+      "arg": "PATH",
+      "default": "python3"
+    },
+    {
+      "flags": [
+        "--engine-args"
+      ],
+      "desc": "Everything after this flag goes to the engine's argv verbatim.",
+      "arg": "ARGS ..."
+    },
+    {
+      "flags": [
+        "--demo"
+      ],
+      "desc": "Run a deterministic demo session with no engine: the reproducible scene source for visual and animation validation."
+    },
+    {
+      "flags": [
+        "--tour"
+      ],
+      "desc": "Open the welcome tour at launch. It opens by itself on the very first launch, and w reopens it any time."
+    },
+    {
+      "flags": [
+        "--no-tour"
+      ],
+      "desc": "Never open the tour automatically."
+    }
+  ],
+  "commands": [],
+  "environment": [
+    {
+      "name": "AMTR_ENGINE",
+      "desc": "Path of amtr_engine.py; the Homebrew wrapper sets it."
+    },
+    {
+      "name": "AMTR_NO_TOUR",
+      "desc": "Set to 1 to suppress the welcome tour (scripted runs, recordings)."
+    },
+    {
+      "name": "AMTR_NO_FIT",
+      "desc": "Engine: disable the per-category chars-per-token fit and size every category with the single global constant."
+    },
+    {
+      "name": "AMTR_SELF_SESSION",
+      "desc": "Engine: the session id to treat as amtr's own, so it is not listed as a target."
+    },
+    {
+      "name": "AMTR_PROXY_BODIES",
+      "desc": "Engine, with --proxy: also record request bodies."
+    }
+  ],
+  "files": [
+    {
+      "path": "~/.claude/projects/*/*.jsonl",
+      "desc": "Claude Code transcripts, the primary input."
+    },
+    {
+      "path": "~/.codex/sessions/",
+      "desc": "Codex CLI transcripts."
+    },
+    {
+      "path": "~/.claude/amtr-reports/<name>-<id>/",
+      "desc": "Reports compiled with R."
+    },
+    {
+      "path": "~/.claude/amtr/welcomed",
+      "desc": "Marker that the first-launch tour has been shown."
+    }
+  ],
+  "exit_status": "std",
+  "examples": [
+    {
+      "desc": "Attach to the newest session on the machine:",
+      "cmd": "amtr"
+    },
+    {
+      "desc": "Attach to the newest session of one project:",
+      "cmd": "amtr --project ~/Developer/whiskr"
+    },
+    {
+      "desc": "Open a finished session by id, with the mono theme:",
+      "cmd": "amtr --session 3f2c1a9e --theme mono"
+    },
+    {
+      "desc": "A text report of a session, no interface:",
+      "cmd": "amtr_engine.py --session 3f2c1a9e --report"
+    }
+  ],
+  "see_also": [
+    "https://github.com/arian-shamaei/anthropometer"
+  ],
+  "authors": {
+    "name": "Arian Shamaei",
+    "url": "https://github.com/arian-shamaei"
+  },
+  "bugs": "https://github.com/arian-shamaei/anthropometer/issues",
+  "keys": [
+    {
+      "key": "1-6",
+      "desc": "Switch tab."
+    },
+    {
+      "key": "f",
+      "desc": "Sessions list."
+    },
+    {
+      "key": "?",
+      "desc": "Help."
+    },
+    {
+      "key": "w",
+      "desc": "Welcome tour."
+    },
+    {
+      "key": "Left, Right",
+      "desc": "Scrub through turns."
+    },
+    {
+      "key": "m",
+      "desc": "Map mode."
+    },
+    {
+      "key": "t",
+      "desc": "Cycle theme."
+    },
+    {
+      "key": "R",
+      "desc": "Compile the PDF report of the session."
+    },
+    {
+      "key": "q",
+      "desc": "Quit."
+    }
+  ]
+}

@@ -71,6 +71,7 @@ jobs:
           cp "rust/target/${target}/release/amtr" "$bundle/"
           cp amtr_engine.py "$bundle/"
           cp LICENSE README.md "$bundle/"
+          mkdir -p "$bundle/man" && cp man/amtr.1 "$bundle/man/"
 
           # Flat tarball (no leading directory): `tar -C "$bundle" .` archives the
           # bundle's CONTENTS. install.sh extracts these straight into libexec/amtr.

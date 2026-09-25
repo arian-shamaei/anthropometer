@@ -285,7 +285,7 @@ impl Stop {
             if panes.big || panes.tier == viz::Tier::Compact || body.height < 10 {
                 return body;
             }
-            let [hdr, map, legend, ekg] = crate::overview_layout(app, panes.tier, body);
+            let ([hdr, map, legend, ekg], _) = crate::overview_layout(app, panes.tier, body);
             match i {
                 0 => hdr.union(map).union(legend),
                 _ => ekg,
