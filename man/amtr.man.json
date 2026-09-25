@@ -2,7 +2,7 @@
   "name": "amtr",
   "section": 1,
   "date": "2026-09-20",
-  "os": "anthropometer 0.6.0",
+  "os": "anthropometer 0.6.1",
   "summary": "agentic debugger for Claude Code, Codex CLI and Gemini CLI sessions",
   "help": {
     "style": "manual",
