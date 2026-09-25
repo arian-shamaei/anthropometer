@@ -35,9 +35,14 @@ be skipped. Engine stderr is inherited and is NOT part of the protocol.
 - **C (waterline)** — `cache_read_input_tokens` of that record: the exact end of the
   cache-served prefix.
 - **B (budget)** — context budget. Rungs: `{200_000, 1_000_000}`. Initial: 1M if
-  `~/.claude/settings.json` `model` contains `[1m]`, else 200k. Auto-bump to the next
-  rung (with a `log`) if `R` or any compaction `preTokens` exceeds the current rung.
-  `--budget N` overrides and pins.
+  `~/.claude/settings.json` `model` contains `[1m]`, else 200k. Per model it is the
+  window Claude Code itself runs that model under (`claude_window`): 1M for a model
+  whose CLI catalog entry is natively 1M (`CLAUDE_NATIVE_1M`, first-party connection,
+  no suffix anywhere — the transcript records the bare id), 1M for a `[1m]` spelling,
+  the process env's knobs, else 200k. Auto-bump to the next rung (with a `log`) if
+  `R` or any compaction `preTokens` exceeds the current rung, and no later
+  name/env resolution may undercut that evidence — switching into a session keeps
+  the rung its own transcript proved. `--budget N` overrides and pins.
 - **turn** — one assistant API turn = one non-synthetic assistant record carrying
   usage with a NEW `requestId` (multiple assistant records may share a requestId —
   streamed content blocks; the LAST usage per requestId wins). Turn index is
@@ -483,6 +488,15 @@ panes/keys/wire fields:
 Footer legend (colored swatches): ` █cr █5m █1h █in ▀wl ▼cmp ▲thr ◆mdl`.
 Lanes degrade: 3 iff body ≥12 rows, 2 (drop dur) iff ≥8, else 0; rail iff
 chart ≥4 rows.
+6. **`$` cost view** (toggle, session-local): same columns/palette, heights
+   in COST UNITS — bands weighted by the engine's `cost_u` formula (cr×0.1 ·
+   cc_5m×1.25 · cc_1h×2.0 · in×1.0, plus `out`×5.0 green on top), so the
+   column top = the turn's bill by identity (token mode's top = R_t). Y-axis
+   snaps to a ku ladder (10…50000) at the visible window's max cost; gutter
+   label shows it (`100ku`, `2Mu`). Waterline tick is token-space and drops
+   out; rail/pulse/cursor/lanes unchanged. Footer swaps `▀wl` → `█out` and
+   hints `$ tokens`. An unsplit `cc` renders at the 5m tier (same
+   drift-proofing as the token stack).
 ```
 turn 214  16:48:51   in 2 │ cr 512.3k │ cc 17.9k (5m 17.9k·1h 0) │ out 203
 hit 96.6%  cost 21.4ku  dur 8.4s  stop tool_use  tools 3  fa 2r/1w
@@ -663,7 +677,7 @@ never auto-opens (it is the testbench). `w` reopens it any time.
 
 ### Keybindings (dispatch: overlay > tab-contextual > global)
 
-Global: `q` quit · `?` help · `w` welcome tour · `1–5` tabs · `f`/`0` fleet · `p` pause render ·
+Global: `q` quit · `?` help · `w` welcome tour · `1–5` tabs · `f`/`0` fleet · `p` pause render (over the big gradient tank: dress it in a random pride flag instead — the one stored palette set, never the same flag twice in a row; `␣` reroll takes it off) ·
 `x` amtr3d mode · `←/→` cursor ±1 · `Shift+←/→` ±10 · `Home` first ·
 `End`/`Esc` LIVE · `m` MAP mode · `c` latest post-mortem · `R` write report ·
 `+/-` MAP rung override.

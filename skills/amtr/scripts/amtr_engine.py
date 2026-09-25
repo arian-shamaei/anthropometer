@@ -1902,15 +1902,40 @@ class Session:
             return
         self._budget_model = model
         w, src = claude_window(model, env=None, settings={})
-        if anthropic_model(model) and "[1m]" not in model:
+        if src == "model-default" and "[1m]" not in model:
             # the base budget already carries the settings [1m] answer
             src = "1m" if self.budget >= BUDGET_RUNGS[1] else src
             w = self.budget
+        w, src = self._evidence_floor(w, src)
         if w != self.budget:
             self.pending["logs"].append(
                 "model %s: budget %d -> %d (%s)" % (model, self.budget, w, src))
             self.budget = w
         self.budget_source = src
+
+    def _evidence_need(self):
+        """The most context this session has demonstrably held: peak
+        resident, or the pre-compaction size of any compaction. A window
+        below this number is contradicted by the transcript itself."""
+        need = max([t["resident"] for t in self.turns] or [0])
+        for c in self.compactions:
+            need = max(need, int(c.get("pre") or 0))
+        return need
+
+    def _evidence_floor(self, tokens, source):
+        """A name/env-resolved window never undercuts the session's own
+        evidence: a 1M session viewed after a 200k one (or after its
+        compaction shrank it) keeps the rung its resident already proved
+        (field-found 2026-09-25: the resolver's 200k `model-default`
+        answer undid the backfill bump on every switch INTO a 1M
+        session)."""
+        need = self._evidence_need()
+        if tokens >= need:
+            return int(tokens), source
+        for rung in BUDGET_RUNGS:
+            if rung >= need:
+                return rung, "bumped"
+        return BUDGET_RUNGS[-1], "bumped"
 
     def set_window(self, model, tokens, source):
         """Engine-resolved window for `model` (process env, served backend).
@@ -1918,6 +1943,7 @@ class Session:
         self._budget_model = model
         if self.budget_pinned or self.provider_budget:
             return False
+        tokens, source = self._evidence_floor(tokens, source)
         changed = tokens != self.budget
         self.budget = int(tokens)
         self.budget_source = source
@@ -2848,15 +2874,53 @@ def read_settings():
 def _truthy(v):
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
+# Models whose entry in the CLI's built-in catalog declares
+# `context.native_1m`: on a first-party connection they run a 1M window with
+# NO `[1m]` suffix anywhere — not in --model, settings.json, the process env
+# or the transcript (2.1.282 catalog; the transcript records the bare id).
+# `claude-sonnet-5` alone keeps its 1M on Bedrock/Vertex/Foundry.
+CLAUDE_NATIVE_1M = frozenset((
+    "claude-fable-5", "claude-fable-5-1", "claude-mythos-5", "claude-mythos-5-1",
+    "claude-mythos-preview", "claude-opus-4-7", "claude-opus-4-8",
+    "claude-opus-5", "claude-opus-5-5", "claude-sonnet-5"))
+CLAUDE_NATIVE_1M_3P = frozenset(("claude-sonnet-5",))
+
+def canonical_claude(model):
+    """The catalog id behind a model spelling: `[1m]` and a `-YYYYMMDD`
+    date suffix stripped (`claude-opus-5-5[1m]`, `claude-opus-5-5-20260601`
+    -> `claude-opus-5-5`)."""
+    m = re.sub(r"\[[^\]]*\]", "", str(model or "")).strip()
+    return re.sub(r"-\d{8}$", "", m)
+
+def _first_party_base(url):
+    """True when the CLI talks to Anthropic itself (no ANTHROPIC_BASE_URL,
+    or one on anthropic.com): the native 1M window is a first-party fact;
+    a gateway/proxy in between gets the catalog's declared window clamped
+    to 200k (the CLI: `believed`)."""
+    if not url:
+        return True
+    try:
+        from urllib.parse import urlsplit
+        host = (urlsplit(str(url)).hostname or "").lower()
+    except Exception:
+        return False
+    return host == "anthropic.com" or host.endswith(".anthropic.com")
+
 def claude_window(model, env=None, settings=None):
     """The context window Claude Code itself runs `model` under — the
     budget, because auto-compact is sized against THIS number, whatever the
-    server could take. Mirrors the CLI's own resolution (2.1.241), which
+    server could take. Mirrors the CLI's own resolution (2.1.282), which
     names its sources the same way. Returns (tokens, source):
 
       env            CLAUDE_CODE_MAX_CONTEXT_TOKENS in the session's process
+                     (an unknown model, or any model under DISABLE_COMPACT —
+                     a recognized Anthropic model otherwise ignores it)
       1m             the model name carries `[1m]` (settings `model` or
                      --model), unless CLAUDE_CODE_DISABLE_1M_CONTEXT
+      native-1m      the catalog says the model is natively 1M
+                     (`CLAUDE_NATIVE_1M`) and the connection is first-party
+                     — no suffix anywhere, which is why a session's own
+                     transcript can never show it
       model-default  a recognized Anthropic model: 200k
       unknown-model  anything else: the CLI assumes 200k and ENFORCES it
                      (auto-compact at 200k even if the model is larger)
@@ -2874,11 +2938,12 @@ def claude_window(model, env=None, settings=None):
     settings = settings if settings is not None else read_settings()
     m = str(model or "")
     n = _i(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
-    if n > 0:
-        return n, "env"
     ov = settings.get("modelOverrides")
     if isinstance(ov, dict) and isinstance(ov.get(m), str):
         m = ov[m]
+    if n > 0 and (_truthy(env.get("DISABLE_COMPACT")) or not anthropic_model(m)):
+        return n, "env"
+    no_1m = _truthy(env.get("CLAUDE_CODE_DISABLE_1M_CONTEXT"))
     big = "[1m]" in m
     if anthropic_model(m) and not big:
         # settings `model` names the session's main model; its [1m] is the
@@ -2886,8 +2951,18 @@ def claude_window(model, env=None, settings=None):
         # the bare name)
         sm = str(settings.get("model") or "")
         big = "[1m]" in sm and sm.split("[")[0] == m.split("[")[0]
-    if big and not _truthy(env.get("CLAUDE_CODE_DISABLE_1M_CONTEXT")):
+    if big and not no_1m:
         return BUDGET_RUNGS[1], "1m"
+    if anthropic_model(m) and not no_1m:
+        canon = canonical_claude(m)
+        third = any(_truthy(env.get(k)) for k in
+                    ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                     "CLAUDE_CODE_USE_FOUNDRY"))
+        native = (canon in CLAUDE_NATIVE_1M_3P if third
+                  else canon in CLAUDE_NATIVE_1M
+                  and _first_party_base(env.get("ANTHROPIC_BASE_URL")))
+        if native:
+            return BUDGET_RUNGS[1], "native-1m"
     if anthropic_model(m):
         return BUDGET_RUNGS[0], "model-default"
     if _truthy(env.get("CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT")):
@@ -3287,7 +3362,9 @@ def _proc_env(pid):
 
 _WINDOW_ENV_KEYS = ("CLAUDE_CODE_MAX_CONTEXT_TOKENS",
                     "CLAUDE_CODE_DISABLE_1M_CONTEXT",
-                    "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT")
+                    "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT",
+                    "DISABLE_COMPACT", "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
 # the gateway probe needs the alias the CLI asked for and the bearer the CLI
 # sends — the token is used for ONE local request and never leaves the probe
 _GATEWAY_ENV_KEYS = ("ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
@@ -4518,8 +4595,8 @@ class Engine:
         # with no model yet
         if model:
             known = getattr(self, "_model_window", {}).get(model)
-            base = known[0] if known else claude_window(model, settings={})[0]
-            if anthropic_model(model) and "[1m]" not in model and not known:
+            base, src = known if known else claude_window(model, settings={})
+            if src == "model-default" and "[1m]" not in model and not known:
                 base = self.budget
         else:
             base = self.budget

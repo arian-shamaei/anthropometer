@@ -428,8 +428,13 @@ class TestBudgetAndSignals(unittest.TestCase):
         self.assertEqual((s.budget, s.budget_source), (1_000_000, "bumped"))
         # an Anthropic model keeps the settings rung
         a = ce.Session("/y.jsonl", budget=1_000_000)
-        self._turn(a, "req_1", 51_000, 0, 0, model="claude-fable-5")
+        self._turn(a, "req_1", 51_000, 0, 0, model="claude-sonnet-4-6")
         self.assertEqual((a.budget, a.budget_source), (1_000_000, "1m"))
+        # a natively-1M model (CLI catalog) is 1M on a 200k base too — no
+        # [1m] anywhere, the transcript's bare id is the whole evidence
+        n = ce.Session("/n.jsonl", budget=200_000)
+        self._turn(n, "req_1", 51_000, 0, 0, model="claude-opus-5-5")
+        self.assertEqual((n.budget, n.budget_source), (1_000_000, "native-1m"))
         # a --budget pin wins over the drop
         pinned = ce.Session("/z.jsonl", budget=1_000_000, budget_pinned=True)
         self._turn(pinned, "req_1", 51_000, 0, 0, model="Qwen3.6-35B-A3B")
@@ -536,6 +541,29 @@ class TestBudgetAndSignals(unittest.TestCase):
         self._turn(s, "req_3", 60_000, 0, 0, model="local-qwen")
         self.assertEqual((s.budget, s.budget_source), (200_000, "unknown-model"))
 
+    def test_window_resolution_never_undercuts_evidence(self):
+        # switching INTO a 1M session after a 200k one: the backfill bumped
+        # the budget on its 961k resident, then the off-thread name/env
+        # resolution answered 200k and the cap fell back to the former
+        # session's rung (field-found 2026-09-25, Fable 5.1 1M session)
+        s = ce.Session("/x.jsonl", budget=200_000)
+        self._turn(s, "req_1", 961_000, 0, 0, model="claude-sonnet-4-6")
+        self.assertEqual((s.budget, s.budget_source), (1_000_000, "bumped"))
+        s.feed_obj({"type": "system", "subtype": "compact_boundary",
+                    "timestamp": "2026-07-17T11:00:01.000Z", "uuid": "cb",
+                    "compactMetadata": {"trigger": "auto", "preTokens": 967_000,
+                                        "postTokens": 15_000, "durationMs": 5}})
+        self._turn(s, "req_2", 15_000, 0, 0, model="claude-sonnet-4-6")
+        self.assertFalse(s.set_window("claude-sonnet-4-6", 200_000, "model-default"))
+        self.assertEqual((s.budget, s.budget_source), (1_000_000, "bumped"))
+        # a resolution ABOVE the evidence is taken verbatim (same number,
+        # so nothing "changed" on the wire; the source is now the CLI's)
+        self.assertFalse(s.set_window("claude-sonnet-4-6", 1_000_000, "1m"))
+        self.assertEqual((s.budget, s.budget_source), (1_000_000, "1m"))
+        # the name-only layer on a model switch is floored the same way
+        self._turn(s, "req_3", 15_000, 0, 0, model="claude-haiku-4-5")
+        self.assertEqual(s.budget, 1_000_000)
+
     def test_claude_window_mirrors_cli_sources(self):
         W = ce.claude_window
         K = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
@@ -545,9 +573,28 @@ class TestBudgetAndSignals(unittest.TestCase):
         self.assertEqual(W("Qwen3.6-35B-A3B",
                            {"CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1"}, {}),
                          (200_000, "unenforced"))
-        self.assertEqual(W("claude-fable-5", {}, {}), (200_000, "model-default"))
-        self.assertEqual(W("claude-fable-5", {}, {"model": "claude-fable-5[1m]"}),
+        self.assertEqual(W("claude-sonnet-4-6", {}, {}), (200_000, "model-default"))
+        self.assertEqual(W("claude-sonnet-4-6", {}, {"model": "claude-sonnet-4-6[1m]"}),
                          (1_000_000, "1m"))
+        # the catalog's native-1M models: 1M first-party with no suffix
+        # anywhere; a gateway in between clamps them to the CLI's believed
+        # 200k; DISABLE_1M turns it off; a date suffix still resolves
+        for m in ("claude-fable-5", "claude-fable-5-1", "claude-opus-5-5",
+                  "claude-sonnet-5", "claude-opus-5-5-20260601"):
+            self.assertEqual(W(m, {}, {}), (1_000_000, "native-1m"), m)
+        self.assertEqual(W("claude-fable-5-1",
+                           {"ANTHROPIC_BASE_URL": "http://localhost:4000"}, {}),
+                         (200_000, "model-default"))
+        self.assertEqual(W("claude-fable-5-1",
+                           {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}, {}),
+                         (1_000_000, "native-1m"))
+        self.assertEqual(W("claude-fable-5-1", {"CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"}, {}),
+                         (200_000, "model-default"))
+        # third-party clouds: only sonnet-5 keeps its native 1M there
+        self.assertEqual(W("claude-sonnet-5", {"CLAUDE_CODE_USE_BEDROCK": "1"}, {}),
+                         (1_000_000, "native-1m"))
+        self.assertEqual(W("claude-opus-5-5", {"CLAUDE_CODE_USE_VERTEX": "1"}, {}),
+                         (200_000, "model-default"))
         # settings [1m] names the MAIN model; a different Anthropic model
         # (a haiku subagent) does not inherit it
         self.assertEqual(W("claude-haiku-4-5", {}, {"model": "claude-fable-5[1m]"}),
@@ -559,8 +606,12 @@ class TestBudgetAndSignals(unittest.TestCase):
         self.assertEqual(W("Qwen3.6-35B-A3B", {},
                            {"modelOverrides": {"Qwen3.6-35B-A3B": "claude-sonnet-5[1m]"}}),
                          (1_000_000, "1m"))
-        # env outranks everything
-        self.assertEqual(W("claude-fable-5", {K: "500000"}, {"model": "claude-fable-5[1m]"}),
+        # CLAUDE_CODE_MAX_CONTEXT_TOKENS: an unknown model's knob — a
+        # recognized Anthropic model ignores it unless DISABLE_COMPACT is on
+        self.assertEqual(W("claude-sonnet-4-6", {K: "500000"},
+                           {"model": "claude-sonnet-4-6[1m]"}),
+                         (1_000_000, "1m"))
+        self.assertEqual(W("claude-sonnet-4-6", {K: "500000", "DISABLE_COMPACT": "1"}, {}),
                          (500_000, "env"))
 
     def test_t_auto_refined_by_auto_compaction(self):
@@ -1342,7 +1393,7 @@ class TestAgentMap(unittest.TestCase):
              "message": {"role": "user", "content": "survey the schema"}},
             {"type": "assistant", "isSidechain": True, "uuid": "sa1",
              "timestamp": "2026-07-17T10:00:05.000Z", "requestId": "sreq1",
-             "message": {"role": "assistant", "model": "claude-fable-5",
+             "message": {"role": "assistant", "model": "claude-sonnet-4-6",
                          "content": [
                              {"type": "text",
                               "text": "reading the loader now " * 40},
@@ -2062,7 +2113,8 @@ class TestLocalBackendProbe(unittest.TestCase):
                                     _backend_ctx={"qwen3.8": 65536})
         rb = types.MethodType(ce.Engine._row_budget, eng)
         self.assertEqual(rb(57_000, "qwen3.8"), 65536)      # probed window
-        self.assertEqual(rb(57_000, "claude-fable-5"), 200_000)
+        self.assertEqual(rb(57_000, "claude-sonnet-4-6"), 200_000)
+        self.assertEqual(rb(57_000, "claude-fable-5"), 1_000_000)  # native 1M
         self.assertEqual(rb(57_000, ""), 200_000)
         self.assertEqual(rb(57_000, "mistral"), 200_000)    # never probed
         # the CLI-resolved window of a live session on that model (env
@@ -2073,7 +2125,7 @@ class TestLocalBackendProbe(unittest.TestCase):
         # row does not inherit it
         eng.budget = 1_000_000
         self.assertEqual(rb(57_000, "mistral"), 200_000)
-        self.assertEqual(rb(57_000, "claude-fable-5"), 1_000_000)
+        self.assertEqual(rb(57_000, "claude-sonnet-4-6"), 1_000_000)
 
     def test_proxy_compose_and_itemization(self):
         body = json.dumps({
