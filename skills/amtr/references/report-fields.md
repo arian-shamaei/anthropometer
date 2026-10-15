@@ -22,6 +22,12 @@ records in the transcript) or `estimated` (sized from text with a chars-per-toke
   skills: server-side, one number), `user`, `assistant`, `thinking`, `reasoning`,
   `file` (file reads), `bash` (shell output), `tool` (other tool results), `attach`
   (attachments and pasted content), `summary` (compaction summaries).
+- `attach{}`: the `attach` category by attachment type (`instructions`,
+  `hook_additional_context`, `skill_listing`, `total_tokens_reminder`, ...), resident
+  tokens, largest first. A type at 0 was seen but never sent to the model (the CLI's
+  own bookkeeping: `hook_success`, `prompt_snapshot`, `batching_reminder_sent`, ...).
+  `attach_n{}`: records seen per type. This is the answer to "what did the harness
+  inject", separate from what the user typed.
 - `alpha`: share of the resident window the categories account for.
 - `fit{}`: the chars-per-token fit. `active` false means a single global constant
   (`prior_cpt`) sized everything; `active` true means per-category ratios (`cpt{}`)
@@ -36,6 +42,10 @@ share of input), `cost_total`, `cost_mean`, `cost_p95` (in list-price units, `u`
 `table[]`: `path`, `tok` resident now, `pct_r`, `reads`, `writes`, `edits`, `waste`
 (tokens spent re-reading content already in context), `resident`. `totals{}` and
 `total_waste` sum the table; `evicted` counts files dropped by compaction.
+
+Every list in the report is complete (`files.table`, `shell.top`, `agents.top`,
+`compactions[].dropped_files`); `--top N` is the only cut and keeps the first N
+of each, largest first.
 
 ## shell
 `n`, `ok`, `failed`, `interrupted`, `bg` (background), `tok_out` (tokens the outputs

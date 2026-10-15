@@ -1,0 +1,25 @@
+{"type":"session","provider":"opencode","id":"ses_fixture0001","timestamp":"2026-08-01T10:00:00.000Z","directory":"/home/dev/proj","title":"Add a build script","version":"1.18.34","parent_id":null,"model":{"providerID":"local","modelID":"qwen-x"}}
+{"type":"message","id":"msg_u1","timestamp":"2026-08-01T10:00:01.000Z","role":"user","model":"qwen-x","provider_id":"local","agent":"build","parentID":null}
+{"type":"part","id":"prt_u1","message_id":"msg_u1","timestamp":"2026-08-01T10:00:01.100Z","data":{"type":"text","text":"add a build script please"}}
+{"type":"message","id":"msg_a1","timestamp":"2026-08-01T10:00:01.200Z","role":"assistant","model":"qwen-x","provider_id":"local","agent":"build","parentID":"msg_u1"}
+{"type":"part","id":"prt_a1s","message_id":"msg_a1","timestamp":"2026-08-01T10:00:02.000Z","data":{"type":"step-start"}}
+{"type":"part","id":"prt_a1r","message_id":"msg_a1","timestamp":"2026-08-01T10:00:02.100Z","data":{"type":"reasoning","text":"Look at the Makefile first, then the build directory.","time":{"start":1,"end":2}}}
+{"type":"part","id":"prt_a1t1","message_id":"msg_a1","timestamp":"2026-08-01T10:00:02.500Z","data":{"type":"tool","tool":"read","callID":"call_read1","state":{"status":"completed","input":{"filePath":"/home/dev/proj/Makefile"},"output":"<path>/home/dev/proj/Makefile</path>\n<content>\n1: all:\n2: \tcc main.c\n</content>","metadata":{"preview":"all:"},"title":"Makefile","time":{"start":1,"end":2}}}}
+{"type":"part","id":"prt_a1t2","message_id":"msg_a1","timestamp":"2026-08-01T10:00:03.000Z","data":{"type":"tool","tool":"bash","callID":"call_bash1","state":{"status":"completed","input":{"command":"ls build","description":"List build dir"},"output":"ls: build: No such file or directory","metadata":{"exit":1,"description":"List build dir"},"title":"List build dir","time":{"start":1,"end":2}}}}
+{"type":"part","id":"prt_a1f","message_id":"msg_a1","timestamp":"2026-08-01T10:00:03.500Z","data":{"type":"step-finish","reason":"tool-calls","tokens":{"total":1050,"input":200,"output":40,"reasoning":10,"cache":{"read":800,"write":0}},"cost":0}}
+{"type":"part","id":"prt_a2s","message_id":"msg_a1","timestamp":"2026-08-01T10:00:04.000Z","data":{"type":"step-start"}}
+{"type":"part","id":"prt_a2w","message_id":"msg_a1","timestamp":"2026-08-01T10:00:04.200Z","data":{"type":"tool","tool":"write","callID":"call_write1","state":{"status":"completed","input":{"filePath":"/home/dev/proj/build.sh","content":"#!/bin/sh\nmake\n"},"output":"","metadata":{},"title":"build.sh","time":{"start":1,"end":2}}}}
+{"type":"part","id":"prt_a2x","message_id":"msg_a1","timestamp":"2026-08-01T10:00:04.400Z","data":{"type":"text","text":"Added build.sh.","time":{"start":1,"end":2}}}
+{"type":"part","id":"prt_a2f","message_id":"msg_a1","timestamp":"2026-08-01T10:00:05.000Z","data":{"type":"step-finish","reason":"stop","tokens":{"total":1700,"input":400,"output":80,"reasoning":0,"cache":{"read":1100,"write":120}},"cost":0}}
+{"type":"message_done","id":"msg_a1","timestamp":"2026-08-01T10:00:05.100Z","finish":"stop","error":null}
+{"type":"message","id":"msg_u2","timestamp":"2026-08-01T10:00:10.000Z","role":"user","model":"qwen-x","provider_id":"local","agent":"build","parentID":null}
+{"type":"part","id":"prt_u2","message_id":"msg_u2","timestamp":"2026-08-01T10:00:10.100Z","data":{"type":"text","text":"now run it with an agent"}}
+{"type":"message","id":"msg_a2","timestamp":"2026-08-01T10:00:10.200Z","role":"assistant","model":"qwen-x","provider_id":"local","agent":"build","parentID":"msg_u2"}
+{"type":"part","id":"prt_a3s","message_id":"msg_a2","timestamp":"2026-08-01T10:00:11.000Z","data":{"type":"step-start"}}
+{"type":"part","id":"prt_a3t","message_id":"msg_a2","timestamp":"2026-08-01T10:00:11.500Z","data":{"type":"tool","tool":"task","callID":"call_task1","state":{"status":"completed","input":{"description":"run build","prompt":"run ./build.sh","subagent_type":"general"},"output":"build ok","metadata":{"sessionId":"ses_fixture0001child"},"title":"run build","time":{"start":1,"end":2}}}}
+{"type":"part","id":"prt_a3f","message_id":"msg_a2","timestamp":"2026-08-01T10:00:12.000Z","data":{"type":"step-finish","reason":"stop","tokens":{"total":420,"input":400,"output":10,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0}}
+{"type":"message_done","id":"msg_a2","timestamp":"2026-08-01T10:00:12.100Z","finish":"stop","error":null}
+{"type":"message","id":"msg_u3","timestamp":"2026-08-01T10:00:20.000Z","role":"user","model":"qwen-x","provider_id":"local","agent":"build","parentID":null}
+{"type":"part","id":"prt_u3","message_id":"msg_u3","timestamp":"2026-08-01T10:00:20.100Z","data":{"type":"text","text":"again"}}
+{"type":"message","id":"msg_a3","timestamp":"2026-08-01T10:00:20.200Z","role":"assistant","model":"qwen-x","provider_id":"local","agent":"build","parentID":"msg_u3"}
+{"type":"message_done","id":"msg_a3","timestamp":"2026-08-01T10:00:21.000Z","finish":null,"error":{"name":"APIError","data":{"message":"Budget has been exceeded","statusCode":400}}}

@@ -8,8 +8,8 @@ through what fills it and read the actual text, rewind to any turn, price every
 call, drill into each subagent's own window, and autopsy every compaction. Press
 **`R`** and it compiles a ground-truth PDF report of the whole session.
 
-Works on **Claude Code**, **Codex CLI** and **Gemini CLI** sessions — every
-view, every key, one instrument (see [Providers](#providers)).
+Works on **Claude Code**, **Codex CLI**, **Gemini CLI** and **OpenCode**
+sessions — every view, every key, one instrument (see [Providers](#providers)).
 
 ![amtr — the context window filling up over a session](docs/assets/context-fill.gif)
 
@@ -42,7 +42,9 @@ view, every key, one instrument (see [Providers](#providers)).
 A monitor tells you *how much*. A debugger lets you look *inside* and move
 *through time* — and that is what these keys are: **`i`** INSPECT walks the
 context window segment by segment and reads back the bytes the model actually
-holds (`⏎`); **`←/→`** REPLAY re-renders every view at any past turn from the
+holds (`⏎`, rendered with the record's own color and markdown; scroll past the
+clip and the whole record arrives; a coalesced segment answers with every
+record behind it); **`←/→`** REPLAY re-renders every view at any past turn from the
 engine's own snapshot; **`⏎`** on an agent re-targets the whole instrument to
 that subagent's window (backspace returns); **`c`** opens a compaction's
 post-mortem — what was dropped, by category and by file. `/context` gives you
@@ -66,7 +68,7 @@ it answers the question those tools stop at.
 | [ccusage](https://github.com/ccusage/ccusage) | how many tokens and dollars per day / session | Claude Code JSONL |
 | [tokscale](https://github.com/junhoyeo/tokscale) | token usage across coding agents, leaderboard | many agents |
 | [Tokdash](https://github.com/JingbiaoMei/Tokdash) | usage heatmaps, quota resets, cost per provider | many agents |
-| **amtr** | **what the tokens *are*** — which files, which tool calls, which subagent, what a compaction dropped, at any past turn | Claude Code, Codex CLI, Gemini CLI transcripts |
+| **amtr** | **what the tokens *are*** — which files, which tool calls, which subagent, what a compaction dropped, at any past turn | Claude Code, Codex CLI, Gemini CLI, OpenCode transcripts |
 
 A tracker tells you how full the context window is. `amtr` shows you which
 file is filling it, how many times it was read, and lets you press `i` and read it.
@@ -144,25 +146,46 @@ every view to any past turn.
 ## Providers
 
 `amtr` reads each CLI's own transcript and translates it into one accounting
-model, so the whole instrument works the same on all three:
+model, so the whole instrument works the same on all four:
 
 | CLI | transcript it reads | turn = | context window |
 |---|---|---|---|
 | Claude Code | `~/.claude/projects/<slug>/<sid>.jsonl` | one API request | 200k / 1M rung, auto-bumped |
 | Codex CLI | `~/.codex/sessions/Y/M/D/rollout-<ts>-<id>.jsonl` | one `token_count` | `model_context_window` (authoritative) |
 | Gemini CLI | `~/.gemini/tmp/<project>/chats/session-<ts>-<id>.jsonl` | one `gemini` message | the CLI's own model limit (1M; 256k Gemma) |
+| OpenCode | `~/.local/share/opencode/opencode.db` (SQLite), mirrored to `~/.cache/amtr/opencode/<sid>.jsonl` | one `step-finish` | the model's `limit.context` from `opencode.json`, else the models.dev catalog |
 
-Live Codex and Gemini sessions show up in **SESSIONS** (`f`) and the
-**SYSTEM-WIDE** wall next to Claude ones (`name-cx` / `name-gm`), with status,
-resident, last prompt and quicklook; recent transcripts of both are attachable
-too. Once attached: MAP, INSPECT, REPLAY, FILES (Codex `apply_patch` files,
+Live Codex, Gemini and OpenCode sessions show up in **SESSIONS** (`f`) and the
+**SYSTEM-WIDE** wall next to Claude ones (`name-cx` / `name-gm` / `name-oc`),
+with status, resident, last prompt and quicklook; recent sessions of all three
+are attachable too (OpenCode by its `ses_…` id: `amtr --session ses_…`). Once attached: MAP, INSPECT, REPLAY, FILES (Codex `apply_patch` files,
 Gemini `read_file`/`write_file`/`replace`), TURNS (Codex cached vs uncached
 input; Gemini cached vs prompt tokens, thoughts counted as output), SHELL
 (`exec_command` / `run_shell_command` with exit status), EVENTS + post-mortems
-(Codex `compacted`, Gemini history compression / rewind), AGENTS with drill-in
-(Codex subagent rollouts, Gemini subagent recordings) and the PDF report.
+(Codex `compacted`, Gemini history compression / rewind, OpenCode `compaction`
+parts), AGENTS with drill-in
+(Codex subagent rollouts, Gemini subagent recordings, OpenCode `task` child
+sessions) and the PDF report. OpenCode's `read`/`write`/`edit`/`bash`/`task`
+parts map the same way; its SQLite store is mirrored into an append-only
+transcript, so a running `opencode` session streams into amtr turn by turn.
 What a provider does not record (Codex has no cache-write tier, Gemini has no
 compaction sizes) stays absent and labeled *estimated* — never invented.
+
+**See the preamble itself.** No CLI writes its system prompt or tool schemas
+to the transcript, so that slab is measured as R minus everything visible.
+OpenCode's base URL is yours to set, so one prompt through the amtr proxy
+itemizes it from the real request bytes — and keeps every part as a file:
+
+```sh
+AMTR_PROXY_BODIES=1 python3 amtr_engine.py --proxy --listen 11436 --upstream <provider baseURL>
+OPENCODE_CONFIG_CONTENT='{"provider":{"<id>":{"options":{"baseURL":"http://127.0.0.1:11436"}}}}' \
+  opencode run -s <session id> "any prompt"
+```
+
+Then `i` on the overhead segment lists each part: the system prompt, `<env>`,
+every instructions file it loaded, the `<available_skills>` listing, each tool
+schema — sized by the server's own token count — with the files under
+`~/.claude/amtr-proxy/parts/<ts>/`.
 
 `amtr --session <path-or-id>` takes a Codex rollout / Gemini recording path
 or session id directly.

@@ -1,9 +1,9 @@
 {
   "name": "amtr",
   "section": 1,
-  "date": "2026-09-20",
-  "os": "anthropometer 0.6.1",
-  "summary": "agentic debugger for Claude Code, Codex CLI and Gemini CLI sessions",
+  "date": "2026-10-15",
+  "os": "anthropometer 0.7.0",
+  "summary": "agentic debugger for Claude Code, Codex CLI, Gemini CLI and OpenCode sessions",
   "help": {
     "style": "manual",
     "cmd": [
@@ -22,7 +22,7 @@
       "flags": [
         "--session"
       ],
-      "desc": "Attach to a session: a Claude Code, Codex CLI or Gemini CLI transcript path, or its session id.",
+      "desc": "Attach to a session: a Claude Code, Codex CLI or Gemini CLI transcript path, or its session id (an OpenCode session by its ses_ id).",
       "arg": "FILE|ID"
     },
     {
@@ -128,6 +128,10 @@
       "desc": "Codex CLI transcripts."
     },
     {
+      "path": "~/.cache/amtr/opencode/",
+      "desc": "Append-only mirrors of OpenCode sessions, derived from ~/.local/share/opencode/opencode.db (the database wins; never edit)."
+    },
+    {
       "path": "~/.claude/amtr-reports/<name>-<id>/",
       "desc": "Reports compiled with R."
     },
@@ -151,7 +155,7 @@
       "cmd": "amtr --session 3f2c1a9e --theme mono"
     },
     {
-      "desc": "A text report of a session, no interface:",
+      "desc": "A text report of a session, no interface (every list complete; --top N keeps the first N rows):",
       "cmd": "amtr_engine.py --session 3f2c1a9e --report"
     }
   ],

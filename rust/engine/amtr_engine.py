@@ -19,7 +19,7 @@ import json, time, math, copy, glob, re, argparse, threading, zlib, subprocess, 
 from collections import deque
 from datetime import datetime, timezone
 
-ENGINE_VERSION = "0.1.6"
+ENGINE_VERSION = "0.2.0"
 _PROTO_LOCK = threading.Lock()
 _STANDALONE = False   # --validate/--report: fd 1 is the report, log() -> stderr
 
@@ -49,6 +49,16 @@ def log(msg):
 # ---------------------------------------------------------------- estimator
 IMG_TOK = 1200
 MAP_CAP = 1024               # max segs in a full map == UI ring budget (SPEC b)
+PEEK_CLIP = 2000             # peek excerpt chars unless the request says full
+TAIL_CLIP = 700              # fleet_peek chars per message unless full
+# Attachment records the CLI writes for its own bookkeeping. They carry no
+# `rendered` text and never reach the model, so they weigh nothing in
+# context (SPEC b, attachment sizing). Measured on a 2.1.296 transcript:
+# half of all attachment bytes were these.
+ATT_NOT_IN_CONTEXT = frozenset((
+    "hook_success", "hook_cancelled", "hook_system_message",
+    "prompt_snapshot", "batching_reminder_sent", "deferred_tools_record",
+    "credential_org", "command_permissions"))
 BUDGET_RUNGS = (200_000, 1_000_000)
 CATS = ("overhead", "user", "assistant", "thinking", "reasoning", "file",
         "bash", "tool", "attach", "summary")
@@ -431,9 +441,43 @@ def clean_text(s):
     return _CTRL_RE.sub("", s.replace("\r\n", "\n").replace("\r", "\n"))
 
 
+_CTRL_KEEP_SGR_RE = re.compile(
+    r"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)"
+    r"|[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]")
+
+
+def clean_text_sgr(s):
+    """clean_text, but SGR color sequences (`ESC[...m`) survive: the peek
+    renders them, so a record's own color (a shell's output, a hook's
+    status tint) reaches the reader as color, not as stripped text."""
+    if not isinstance(s, str):
+        return ""
+    return _CTRL_KEEP_SGR_RE.sub("", s.replace("\r\n", "\n").replace("\r", "\n"))
+
+
 def head_clip(s, n):
     s = clean_text(s)
     return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def rendered_text(rd):
+    """The text of an attachment record's `rendered` field: the message
+    blocks the CLI actually put in front of the model (a list of
+    {content: str | [blocks]}, or a plain string). "" when nothing was."""
+    if isinstance(rd, str):
+        return rd
+    if not isinstance(rd, list):
+        return ""
+    parts = []
+    for b in rd:
+        c = b.get("content") if isinstance(b, dict) else b
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            parts.append(_blocks_text(c))
+        elif c is not None:
+            parts.append(json.dumps(c, ensure_ascii=False))
+    return "\n".join(p for p in parts if p)
 
 
 def tail_clip(s, n):
@@ -495,6 +539,8 @@ def _fresh_pending():
 #   claude    ~/.claude/projects/<slug>/<sid>.jsonl               requestId
 #   codex     ~/.codex/sessions/Y/M/D/rollout-<ts>-<id>.jsonl     one event_msg token_count
 #   gemini    ~/.gemini/tmp/<proj>/chats/session-<ts>-<id8>.jsonl one `gemini` message
+#   opencode  ~/.cache/amtr/opencode/<sid>.jsonl (a MIRROR of the      one `step-finish` part
+#             CLI's SQLite rows; see the opencode section)
 #
 # Turn ordering law (both adapters): the usage record OPENS the turn first,
 # then the response's content records (own uuids — compaction survivors are
@@ -511,6 +557,9 @@ def detect_provider(path, first_line=None):
         return "codex"
     if "/.gemini/" in p and os.path.basename(p).startswith("session-"):
         return "gemini"
+    if os.path.basename(p).startswith("ses_") and \
+            (os.sep + "opencode" + os.sep) in p:
+        return "opencode"
     if first_line is None:
         try:
             with open(p, "r", encoding="utf-8") as fh:
@@ -524,6 +573,8 @@ def detect_provider(path, first_line=None):
     if isinstance(d, dict):
         if d.get("type") == "session_meta" and isinstance(d.get("payload"), dict):
             return "codex"
+        if d.get("type") == "session" and d.get("provider") == "opencode":
+            return "opencode"
         if isinstance(d.get("sessionId"), str) and isinstance(d.get("projectHash"), str) \
                 and "type" not in d:
             return "gemini"
@@ -1190,9 +1241,527 @@ class GeminiAdapter:
             return out
         return out
 
+# ---------------------------------------------------------------- opencode
+# OpenCode keeps its sessions in SQLite (~/.local/share/opencode/opencode.db:
+# `session` / `message` / `part` rows, a part UPDATED in place while it
+# streams), not in an append-only transcript. The engine is a transcript
+# reader — tail offsets, checkpoints, replay, the fleet quicklook all read a
+# file — so an OpenCode session is MIRRORED into one:
+# ~/.cache/amtr/opencode/<sid>.jsonl, derived, append-only, rebuilt whenever
+# the database disagrees with it (the source wins; never hand-edit). A row
+# joins the mirror only once it is FINAL: a user part at once; an assistant
+# message's parts as the bundle its `step-finish` closes (one step = one API
+# request = one turn — the Codex ordering law, tokens on the finish); what
+# a message still holds when it completes, under `message_done`.
+#
+#   {"type":"session","provider":"opencode", id, timestamp, directory, title,
+#                     version, parent_id, model:{providerID, modelID}}
+#   {"type":"message", id, timestamp, role, model, provider_id, agent, parentID,
+#                      summary (true: the compaction summary)}
+#   {"type":"part",    id, message_id, timestamp, data: <the part row's data>}
+#   {"type":"message_done", id, timestamp, finish, error}
+
+def opencode_db_path():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "opencode", "opencode.db")
+
+
+def opencode_mirror_dir():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "amtr", "opencode")
+
+
+def opencode_mirror_path(sid):
+    return os.path.join(opencode_mirror_dir(), sid + ".jsonl")
+
+
+def _ms_iso(ms):
+    """OpenCode's millisecond epochs → the Zulu ISO stamps every record on
+    the wire carries (hhmmss()/ts_epoch() slice and parse them)."""
+    try:
+        ms = int(ms)
+        return datetime.fromtimestamp(ms // 1000, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S") + ".%03dZ" % (ms % 1000)
+    except Exception:
+        return ""
+
+
+def _oc_connect(db=None):
+    """Read-only connection to the OpenCode database (WAL: a live CLI keeps
+    writing while we read; read-only first, a plain open only when the WAL
+    side files are missing and read-only cannot start)."""
+    import sqlite3
+    db = db or opencode_db_path()
+    if not os.path.isfile(db):
+        return None
+    for uri in ("file:%s?mode=ro" % db, db):
+        try:
+            conn = sqlite3.connect(uri, uri=uri.startswith("file:"), timeout=0.5)
+            conn.execute("select 1 from session limit 1").fetchall()
+            return conn
+        except Exception:
+            continue
+    return None
+
+
+def _oc_loads(s):
+    try:
+        d = json.loads(s)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def opencode_rows(conn, sid):
+    """The mirror rows of one session in emission order (final-time order).
+    Pure: one database state ⇒ one list, so a mirror written earlier is a
+    prefix of a mirror computed later — the append-only property."""
+    s = conn.execute(
+        "select id, parent_id, directory, title, version, model, time_created "
+        "from session where id=?", (sid,)).fetchone()
+    if not s:
+        return []
+    out = []           # (final_ms, seq, row)
+
+    def put(ms, row):
+        out.append((_i(ms), len(out), row))
+
+    put(s[6], {"type": "session", "provider": "opencode", "id": s[0],
+               "timestamp": _ms_iso(s[6]), "directory": s[2] or "",
+               "title": s[3] or "", "version": s[4] or "",
+               "parent_id": s[1], "model": _oc_loads(s[5] or "")})
+    by_msg = {}
+    for pid, mid, tc, data in conn.execute(
+            "select id, message_id, time_created, data from part "
+            "where session_id=? order by time_created, id", (sid,)):
+        by_msg.setdefault(mid, []).append((tc, pid, _oc_loads(data)))
+    for mid, tc, data in conn.execute(
+            "select id, time_created, data from message "
+            "where session_id=? order by time_created, id", (sid,)):
+        d = _oc_loads(data)
+        role = d.get("role")
+        mdl = d.get("model") if isinstance(d.get("model"), dict) else {}
+        put(tc, {"type": "message", "id": mid, "timestamp": _ms_iso(tc),
+                 "role": role, "model": d.get("modelID") or mdl.get("modelID"),
+                 "provider_id": d.get("providerID") or mdl.get("providerID"),
+                 "agent": d.get("agent"), "parentID": d.get("parentID"),
+                 "summary": bool(d.get("summary"))})
+
+        def prow(q):
+            ptc, pid, pd = q
+            return {"type": "part", "id": pid, "message_id": mid,
+                    "timestamp": _ms_iso(ptc), "data": pd}
+        parts = by_msg.get(mid, [])
+        if role == "user":
+            for q in parts:
+                put(q[0], prow(q))
+            continue
+        pending = []
+        for q in parts:
+            pending.append(q)
+            if q[2].get("type") == "step-finish":
+                for p in pending:
+                    put(q[0], prow(p))
+                pending = []
+        done = (d.get("time") or {}).get("completed") \
+            if isinstance(d.get("time"), dict) else None
+        if done:
+            for p in pending:
+                put(done, prow(p))
+            put(done, {"type": "message_done", "id": mid,
+                       "timestamp": _ms_iso(done), "finish": d.get("finish"),
+                       "error": d.get("error")})
+        # else: parts still streaming wait for their step-finish
+    out.sort(key=lambda t: (t[0], t[1]))
+    return [r for _, _, r in out]
+
+
+_OC_MIRROR = {}          # mirror path -> (lines, bytes) as last written by us
+_OC_REWRITTEN = set()    # mirrors rebuilt from scratch since last checked
+
+
+def opencode_sync(sid, conn=None, db=None):
+    """Bring ~/.cache/amtr/opencode/<sid>.jsonl up to the database. Appends
+    the rows the file does not have yet; rewrites the file when it is not a
+    prefix of the computed rows (then flags it in _OC_REWRITTEN so a tailing
+    engine re-attaches). Returns the mirror path, None when unreadable."""
+    own = conn is None
+    conn = conn or _oc_connect(db)
+    if conn is None:
+        return None
+    try:
+        rows = opencode_rows(conn, sid)
+    except Exception as e:
+        log("opencode read error: %s" % e)
+        rows = []
+    finally:
+        if own:
+            conn.close()
+    if not rows:
+        return None
+    path = opencode_mirror_path(sid)
+    enc = [(json.dumps(r, separators=(",", ":"), ensure_ascii=False) + "\n")
+           .encode("utf-8") for r in rows]
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+    except OSError:
+        size = 0
+    n, nb = _OC_MIRROR.get(path, (0, 0))
+    if size != nb:                      # not ours (or first sight): recount
+        n = nb = 0
+        if size:
+            try:
+                with open(path, "rb") as fh:
+                    for line in fh:
+                        n += 1
+                        nb += len(line)
+            except OSError:
+                n = nb = 0
+    prefix = sum(len(b) for b in enc[:n]) if n <= len(enc) else -1
+    if n > len(enc) or prefix != nb:
+        # the file is not a prefix of the truth: rebuild it whole
+        with open(path, "wb") as fh:
+            fh.write(b"".join(enc))
+        _OC_MIRROR[path] = (len(enc), sum(len(b) for b in enc))
+        if n:
+            _OC_REWRITTEN.add(path)
+        return path
+    if n < len(enc):
+        with open(path, "ab") as fh:
+            fh.write(b"".join(enc[n:]))
+    _OC_MIRROR[path] = (len(enc), prefix + sum(len(b) for b in enc[n:]))
+    return path
+
+
+def opencode_budget(provider_id, model_id):
+    """The context window OpenCode runs this model under: the user's own
+    provider config (opencode.json `limit.context`) first, else the
+    models.dev catalog the CLI caches. None when neither names it."""
+    if not provider_id or not model_id:
+        return None
+    cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    for p in (os.path.join(cfg, "opencode", "opencode.json"),
+              os.path.join(cache, "opencode", "models.json")):
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+        except Exception:
+            continue
+        provs = d.get("provider") if "provider" in d else d
+        if not isinstance(provs, dict):
+            continue
+        pv = provs.get(provider_id)
+        if not isinstance(pv, dict):
+            continue
+        m = (pv.get("models") or {}).get(model_id)
+        if isinstance(m, dict) and isinstance(m.get("limit"), dict):
+            w = m["limit"].get("context")
+            if isinstance(w, int) and w > 0:
+                return w
+    return None
+
+
+def opencode_provider_of(model_id):
+    """(provider id, baseURL) of the OpenCode provider serving `model_id`,
+    from the user's opencode.json; (None, None) when it names none."""
+    cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    try:
+        with open(os.path.join(cfg, "opencode", "opencode.json"), "r",
+                  encoding="utf-8") as fh:
+            provs = (json.load(fh) or {}).get("provider") or {}
+    except Exception:
+        return None, None
+    for pid, pv in provs.items():
+        if isinstance(pv, dict) and model_id in (pv.get("models") or {}):
+            opts = pv.get("options") if isinstance(pv.get("options"), dict) else {}
+            return pid, opts.get("baseURL")
+    return None, None
+
+
+class OpenCodeAdapter:
+    """OpenCode mirror → records. Buffers an assistant message's parts until
+    the `step-finish` that carries their tokens (the ordering law), then
+    emits usage → content → tool results; `message_done` flushes leftovers
+    under the last request. Plain data throughout, so Session.clone() carries
+    it into checkpoints and replay resumes mid-stream."""
+    provider = "opencode"
+    _FILE_TOOLS = {"read": "Read", "write": "Write", "edit": "Edit",
+                   "multiedit": "Edit", "patch": "Edit"}
+    _NAMES = {"glob": "Glob", "grep": "Grep", "list": "LS",
+              "todowrite": "TodoWrite", "todoread": "TodoRead",
+              "skill": "Skill", "question": "AskUserQuestion"}
+
+    def __init__(self):
+        self.roles = {}         # message id -> role
+        self.model = ""
+        self.budget = None
+        self.items = []         # buffered content records for the open step
+        self.results = []       # buffered tool_result records
+        self.req_last = None    # the last step-finish id (= requestId)
+        self.req_n = 0
+        self.meta_sent = False
+        self.order = []         # message ids in history order (compaction tail)
+        self.emitted = {}       # message id -> [(record uuid, chars)] emitted
+        self.summary_msgs = set()   # ids of compaction-summary messages
+        self.n_compact = 0
+
+    @staticmethod
+    def _rec(kind, uuid, ts, **kw):
+        d = {"type": kind, "uuid": uuid, "timestamp": ts}
+        d.update(kw)
+        return d
+
+    def _assistant(self, uuid, ts, blocks, usage=None, req=None):
+        msg = {"role": "assistant", "model": self.model, "content": blocks}
+        if usage is not None:
+            msg["usage"] = usage
+        return self._rec("assistant", uuid, ts,
+                         requestId=req or self.req_last or "oc-req-0", message=msg)
+
+    def _set_budget(self, prov, model, out):
+        w = opencode_budget(prov, model)
+        if isinstance(w, int) and w > 0 and w != self.budget:
+            self.budget = w
+            out.append({"type": "provider_meta", "provider": "opencode",
+                        "budget": w})
+
+    def _tool(self, pd, pid, ts):
+        """A finished `tool` part → (tool_use block, tool_result record)."""
+        name = pd.get("tool") or "?"
+        st = pd.get("state") if isinstance(pd.get("state"), dict) else {}
+        cid = pd.get("callID") or pid
+        args = st.get("input") if isinstance(st.get("input"), dict) else {}
+        meta = st.get("metadata") if isinstance(st.get("metadata"), dict) else {}
+        status = st.get("status")
+        output = st.get("output") if isinstance(st.get("output"), str) else ""
+        if status == "error" and not output:
+            output = st.get("error") if isinstance(st.get("error"), str) else ""
+        ok = status != "error"
+        tur = None
+        if name in self._FILE_TOOLS:
+            mapped = self._FILE_TOOLS[name]
+            inp = dict(args)
+            fp = args.get("filePath") or args.get("file_path") or args.get("path")
+            if isinstance(fp, str):
+                inp["file_path"] = fp
+            if mapped == "Edit":
+                inp.setdefault("old_string", args.get("oldString"))
+                inp.setdefault("new_string", args.get("newString"))
+            if mapped == "Read":
+                tur = {"file": {"content": output}}
+        elif name == "bash":
+            mapped = "Bash"
+            inp = {"command": args.get("command") or "",
+                   "description": args.get("description")}
+            ex = meta.get("exit")
+            ok = ok and (ex is None or ex == 0)
+            tur = {"stdout": output, "stderr": "",
+                   "interrupted": status == "error" and
+                   "abort" in str(st.get("error") or "").lower()}
+        elif name == "task":
+            mapped = "Task"
+            inp = {"description": args.get("description") or "",
+                   "prompt": args.get("prompt"),
+                   "subagent_type": args.get("subagent_type")}
+            tur = {"agentId": meta.get("sessionId") or cid,
+                   "status": "completed" if status in ("completed", "error") else None,
+                   "description": args.get("description"),
+                   "agentType": args.get("subagent_type"), "content": output}
+        elif name in ("webfetch", "websearch"):
+            mapped = "WebFetch" if name == "webfetch" else "WebSearch"
+            inp = {"url": args.get("url") or ""} if name == "webfetch" \
+                else {"query": args.get("query") or ""}
+            tur = {"searchCount": None}
+        else:
+            mapped = self._NAMES.get(name, name)
+            inp = args
+        use = {"type": "tool_use", "id": cid, "name": mapped, "input": inp}
+        b = {"type": "tool_result", "tool_use_id": cid, "content": output}
+        if not ok:
+            b["is_error"] = True
+        res = self._rec("user", pid + "#r", ts,
+                        message={"role": "user", "content": [b]})
+        if tur is not None:
+            res["toolUseResult"] = tur
+        return use, res
+
+    def _flush(self, rid, out):
+        for it in self.items:
+            it["requestId"] = rid
+            out.append(it)
+        out.extend(self.results)
+        self.items, self.results = [], []
+
+    def _note(self, mid, uuid, chars):
+        self.emitted.setdefault(mid, []).append((uuid, int(chars)))
+
+    def _compact(self, d, pd, ts, out):
+        """OpenCode compaction (a `compaction` part on the user message that
+        asks for it): everything before `tail_start_id` leaves the context,
+        the tail from that message on survives, and the summary the next
+        assistant message writes lands AFTER the cut as `summary`."""
+        tail = pd.get("tail_start_id")
+        keep, kept_chars = [], 0
+        start = self.order.index(tail) if tail in self.order else len(self.order)
+        for mid in self.order[start:]:
+            for uuid, ch in self.emitted.get(mid, []):
+                keep.append(uuid)
+                kept_chars += ch
+        self.n_compact += 1
+        out.append({"type": "system", "subtype": "compact_boundary",
+                    "uuid": "oc-compact-%d" % self.n_compact, "timestamp": ts,
+                    "compactMetadata": {
+                        "trigger": "auto" if pd.get("auto") else "manual",
+                        "preTokens": 0,              # engine fills R at the cut
+                        "postTokens": int(math.ceil(kept_chars / Est.chars_per_tok)),
+                        "preservedMessages": {"allUuids": keep}}})
+
+    def translate(self, d):
+        t = d.get("type")
+        ts = d.get("timestamp") or ""
+        out = []
+        if t == "session":
+            m = d.get("model") if isinstance(d.get("model"), dict) else {}
+            out.append({"type": "provider_meta", "provider": "opencode",
+                        "sessionId": d.get("id"), "timestamp": ts,
+                        "version": d.get("version") or None,
+                        "cwd": d.get("directory") or None,
+                        "subagent": bool(d.get("parent_id")),
+                        "title": d.get("title") or None})
+            if isinstance(m.get("modelID"), str) and m.get("modelID"):
+                self.model = m["modelID"]
+                self._set_budget(m.get("providerID"), m["modelID"], out)
+            self.meta_sent = True
+            return out
+        if t == "message":
+            self.roles[d.get("id")] = d.get("role")
+            if d.get("id") not in self.order:
+                self.order.append(d.get("id"))
+            if d.get("summary") or d.get("agent") == "compaction":
+                self.summary_msgs.add(d.get("id"))
+            if d.get("role") == "assistant" and isinstance(d.get("model"), str) \
+                    and d["model"]:
+                self.model = d["model"]
+                self._set_budget(d.get("provider_id"), d["model"], out)
+            return out
+        if t == "part":
+            pd = d.get("data") if isinstance(d.get("data"), dict) else {}
+            pid = d.get("id") or ("oc-part-%d" % (len(self.items) + 1))
+            pt = pd.get("type")
+            mid = d.get("message_id")
+            if self.roles.get(mid) == "user":
+                if pt == "compaction":
+                    self._compact(d, pd, ts, out)
+                elif pt == "text" and isinstance(pd.get("text"), str):
+                    if pd.get("synthetic") or pd.get("ignored"):
+                        # the harness's own injected text, not the human
+                        out.append(self._rec("attachment", pid, ts, attachment={
+                            "type": "opencode_context", "text": pd["text"]}))
+                    else:
+                        out.append(self._rec("user", pid, ts, message={
+                            "role": "user",
+                            "content": [{"type": "text", "text": pd["text"]}]}))
+                    self._note(mid, pid, len(pd["text"]))
+                elif pt == "file":
+                    out.append(self._rec("attachment", pid, ts, attachment={
+                        "type": "opencode_file",
+                        "text": pd.get("filename") or pd.get("url") or ""}))
+                return out
+            if pt == "text" and isinstance(pd.get("text"), str) and pd["text"]:
+                if mid in self.summary_msgs:
+                    # the compaction summary: what the model carries forward
+                    self.items.append(self._rec("user", pid, ts, isCompactSummary=True,
+                                                message={"role": "user", "content": [
+                                                    {"type": "text", "text": pd["text"]}]}))
+                else:
+                    self.items.append(self._assistant(
+                        pid, ts, [{"type": "text", "text": pd["text"]}]))
+                self._note(mid, pid, len(pd["text"]))
+            elif pt == "reasoning" and isinstance(pd.get("text"), str) and pd["text"]:
+                self.items.append(self._assistant(
+                    pid, ts, [{"type": "thinking", "thinking": pd["text"]}]))
+                self._note(mid, pid, len(pd["text"]))
+            elif pt == "tool":
+                use, res = self._tool(pd, pid, ts)
+                self.items.append(self._assistant(pid, ts, [use]))
+                self.results.append(res)
+                self._note(mid, pid, _jchars(use.get("input")))
+                self._note(mid, pid + "#r", _jchars(res["message"]["content"][0].get("content")))
+            elif pt == "step-finish":
+                tok = pd.get("tokens") if isinstance(pd.get("tokens"), dict) else {}
+                cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
+                usage = {"input_tokens": _i(tok.get("input")),
+                         "cache_read_input_tokens": _i(cache.get("read")),
+                         "cache_creation_input_tokens": _i(cache.get("write")),
+                         "output_tokens": _i(tok.get("output")) + _i(tok.get("reasoning"))}
+                if isinstance(tok.get("reasoning"), int):
+                    # the provider counted the reasoning itself: the turn's
+                    # authoritative `think` (hidden = billed − text seen)
+                    usage["output_tokens_details"] = {
+                        "thinking_tokens": tok["reasoning"]}
+                self.req_n += 1
+                self.req_last = pid
+                out.append(self._assistant(pid, ts, [], usage=usage, req=pid))
+                self._flush(pid, out)
+            return out
+        if t == "message_done":
+            if self.items or self.results:
+                self._flush(self.req_last or ("oc-req-%s" % d.get("id")), out)
+            err = d.get("error")
+            if isinstance(err, dict) and err:
+                data = err.get("data") if isinstance(err.get("data"), dict) else {}
+                out.append({"type": "provider_event", "kind": "api_error",
+                            "severity": "error", "timestamp": ts,
+                            "msg": "%s: %s" % (err.get("name") or "error",
+                                               str(data.get("message") or "")[:160])})
+            return out
+        return out
+
+
+def opencode_tail_parse(lines):
+    """Status/usage from the tail lines of an OpenCode mirror (SPEC f2
+    providers): a trailing assistant message without its `message_done`
+    (or a trailing user message) is busy, else idle; resident = the last
+    step-finish's input + cache read + cache write; the last user text is
+    the prompt."""
+    res = prompt = None
+    roles = {}
+    last_msg = None          # (id, role)
+    done = set()
+    for raw in lines:
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        t = d.get("type")
+        if t == "message":
+            roles[d.get("id")] = d.get("role")
+            last_msg = (d.get("id"), d.get("role"))
+        elif t == "message_done":
+            done.add(d.get("id"))
+        elif t == "part":
+            pd = d.get("data") if isinstance(d.get("data"), dict) else {}
+            if pd.get("type") == "step-finish":
+                tok = pd.get("tokens") if isinstance(pd.get("tokens"), dict) else {}
+                cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
+                res = _i(tok.get("input")) + _i(cache.get("read")) + _i(cache.get("write"))
+            elif pd.get("type") == "text" and \
+                    roles.get(d.get("message_id")) == "user" and \
+                    isinstance(pd.get("text"), str) and pd["text"].strip():
+                prompt = pd["text"].strip()[:200]
+    busy = bool(last_msg) and (last_msg[1] == "user" or last_msg[0] not in done)
+    return {"status": "busy" if busy else "idle", "resident": res,
+            "budget": None, "last_prompt": prompt, "total": None,
+            "ended": not busy}
+
 
 def make_adapter(provider):
-    return {"codex": CodexAdapter, "gemini": GeminiAdapter}.get(provider, lambda: None)()
+    return {"codex": CodexAdapter, "gemini": GeminiAdapter,
+            "opencode": OpenCodeAdapter}.get(provider, lambda: None)()
 
 
 # ---------------------------------------------------------------- session
@@ -1221,6 +1790,9 @@ class Session:
         # record ring: seg_id -> seg (insertion-ordered dict); evicted removed
         self.ring = {}
         self.by_uuid = {}        # uuid -> [seg_ids]
+        self.seg_members = {}    # merged map seg id -> [ring seg ids] (SPEC b)
+        self.compaction_files = {}  # compaction n -> every dropped file (report)
+        self.att_seen = {}       # attachment type -> record count (all, even 0-tok)
         self.seg_next = 1        # 0 reserved for the overhead segment
         # files
         self.files = {}          # id -> file dict
@@ -1287,6 +1859,7 @@ class Session:
         self.project = None
         self.entrypoint = None
         self.last_ts = None      # newest record timestamp (report wall span)
+        self.last_user_text = "" # the newest human prompt (pairs a wire capture)
         # compactions / events / agents
         self.compactions = []
         self.cum_dropped = 0
@@ -1457,11 +2030,12 @@ class Session:
     def _born(self):
         return max(0, len(self.turns) - 1)
 
-    def _alloc(self, cat, tok, uuid, ts, file_id=None, chars=None):
+    def _alloc(self, cat, tok, uuid, ts, file_id=None, chars=None, sub=None):
         """`chars` = the raw character weight behind `tok`. Segments whose
         tokens are NOT char-derived (hidden reasoning, images) pass None and
         get the prior-implied chars, so the fit — regularized toward that same
-        prior — leaves their pricing alone."""
+        prior — leaves their pricing alone. `sub` = the attachment type for
+        cat "attach" (the per-kind breakdown in `cats.attach`)."""
         if tok <= 0:
             return
         if chars is None:
@@ -1469,7 +2043,7 @@ class Session:
         sid = self.seg_next
         self.seg_next += 1
         seg = {"id": sid, "uuid": uuid, "cat": cat, "est": tok,
-               "chars": float(chars),
+               "chars": float(chars), "sub": sub,
                "file": file_id, "born": self._born(), "ts": ts_epoch(ts)}
         self.ring[sid] = seg
         self.by_uuid.setdefault(uuid, []).append(sid)
@@ -1644,6 +2218,23 @@ class Session:
             return
         t = len(self.turns) - 1
         out = _i(self.turns[-1]["out"])
+        think = self.turns[-1].get("think")
+        if isinstance(think, int):
+            # the provider counted the reasoning itself (OpenCode's step
+            # `tokens.reasoning`, `output_tokens_details.thinking_tokens`):
+            # hidden = the billed reasoning minus the reasoning TEXT seen.
+            # Thoughts returned in the open (Qwen) cover the bill — the
+            # residual is tokenizer error, no slab; a summary far shorter
+            # than the bill (Anthropic) leaves the unseen remainder.
+            seen = int(math.ceil(self._turn_think_chars / Est.chars_per_tok))
+            hid = max(0, min(think, out) - seen)
+            if self._turn_think_chars > 0 and seen >= 0.75 * think:
+                self._reasoning_turns["open"] += 1
+                return
+            if hid > 0:
+                self._reasoning_turns["hidden"] += 1
+                self._alloc("reasoning", hid, "reasoning-t%d" % t, self._turn_ts)
+            return
         hid = max(0, out - self._vis_acc)
         # OPEN reasoning: the thinking blocks carry text and the visible
         # estimate covers the billed output — the model returned its
@@ -2010,6 +2601,8 @@ class Session:
         if isinstance(content, str):
             self._alloc("user", est_text(content), uuid, ts,
                         chars=len(content))
+            if not d.get("isMeta"):
+                self.last_user_text = content
             return
         if not isinstance(content, list):
             return
@@ -2025,6 +2618,8 @@ class Session:
                 txt = b.get("text") or ""
                 cat = "attach" if "<system-reminder>" in txt else "user"
                 self._alloc(cat, est_text(txt), uuid, ts, chars=len(txt))
+                if cat == "user" and not d.get("isMeta") and txt.strip():
+                    self.last_user_text = txt
             elif bt == "image":
                 self._alloc("user", IMG_TOK, uuid, ts)
             elif bt == "tool_result":
@@ -2173,8 +2768,21 @@ class Session:
         ts = d.get("timestamp") or ""
         uuid = d.get("uuid") or ("anon-%d" % self.rec_count)
         att = d.get("attachment")
-        e, ch = est_pair(att)
-        self._alloc("attach", e, uuid, ts, chars=ch)
+        kind = att.get("type") if isinstance(att, dict) else None
+        kind = kind if isinstance(kind, str) and kind else "?"
+        self.att_seen[kind] = self.att_seen.get(kind, 0) + 1
+        # What the model saw, in order of evidence: the record's own
+        # `rendered` text (the CLI writes it for every attachment it sends);
+        # known bookkeeping types weigh nothing; otherwise (older CLIs, no
+        # `rendered` key anywhere) the attachment JSON, as before.
+        if "rendered" in d:
+            txt = rendered_text(d.get("rendered"))
+            e, ch = est_text(txt), len(txt)
+        elif kind in ATT_NOT_IN_CONTEXT:
+            e, ch = 0, 0
+        else:
+            e, ch = est_pair(att)
+        self._alloc("attach", e, uuid, ts, chars=ch, sub=kind)
         if isinstance(att, dict) and att.get("type") == "queued_command":
             self._event("queued_prompt", "info", ts,
                         "queued: %s" % str(att.get("prompt") or "")[:80])
@@ -2311,7 +2919,10 @@ class Session:
         self.zone = 0
         self.map_rev += 1
         self.pending["map_rebuild"] = True
-        top = sorted(dropped_files.items(), key=lambda kv: -kv[1])[:16]
+        allf = sorted(dropped_files.items(), key=lambda kv: -kv[1])
+        top = allf[:16]                  # the wire ring budget (SPEC b)
+        self.compaction_files[len(self.compactions) + 1] = [
+            {"file": f, "tok": int(t)} for f, t in allf]
         comp = {"n": len(self.compactions) + 1, "turn": self._born(),
                 "ts": hhmmss(ts), "trigger": trigger, "pre": pre, "post": post,
                 "dropped": dropped, "cum_dropped": self.cum_dropped,
@@ -2357,19 +2968,38 @@ class Session:
                 diff += take
                 i -= 1
             segs = [s for s in segs if s["tok"] > 0 or s["cat"] == "overhead"]
-        return self._merge_segs(segs, cap)
+        out = self._merge_segs(segs, cap)
+        # A merged seg keeps every member reachable: `peek` on it answers
+        # with all of them (SPEC b). Members live server-side; the wire seg
+        # carries only `n`, the record count.
+        self.seg_members = {}
+        for s in out:
+            ids = s.pop("ids", None)
+            if ids and len(ids) > 1:
+                self.seg_members[s["id"]] = ids
+                s["n"] = len(ids)
+        return out
 
     @staticmethod
     def _merge_segs(segs, cap):
+        """Coalesce to ≤cap segs. Every merged seg carries `ids`, the ring
+        ids it absorbed (in order), so no record ever becomes unreachable;
+        the caller pops them."""
         if len(segs) <= cap:
             return segs
+
+        def absorb(p, s):
+            if "ids" not in p:
+                p["ids"] = [p["id"]]
+            p["ids"].extend(s.get("ids") or [s["id"]])
+            p["tok"] += s["tok"]
+            p["ts"] = max(p["ts"], s["ts"])
+            p["born"] = min(p["born"], s["born"])
         out = [segs[0]]
         for s in segs[1:]:      # pass 1: coalesce adjacent same-cat/same-file
             p = out[-1]
             if p["cat"] == s["cat"] and p["file"] == s["file"] and p["cat"] != "overhead":
-                p["tok"] += s["tok"]
-                p["ts"] = max(p["ts"], s["ts"])
-                p["born"] = min(p["born"], s["born"])
+                absorb(p, s)
             else:
                 out.append(s)
         thr = max(1, sum(x["tok"] for x in out) // cap)
@@ -2380,9 +3010,7 @@ class Session:
                 if p["cat"] != "overhead" and p["tok"] + s["tok"] <= thr:
                     if s["tok"] > p["tok"]:          # plurality owner wins
                         p["cat"], p["file"] = s["cat"], s["file"]
-                    p["tok"] += s["tok"]
-                    p["ts"] = max(p["ts"], s["ts"])
-                    p["born"] = min(p["born"], s["born"])
+                    absorb(p, s)
                 else:
                     nxt.append(s)
             if len(nxt) == len(out):
@@ -2398,8 +3026,19 @@ class Session:
         content = m.get("content")
         parts = []
         if t == "attachment":
-            parts.append(json.dumps(d.get("attachment"), ensure_ascii=False,
-                                    indent=1))
+            att = d.get("attachment")
+            kind = att.get("type") if isinstance(att, dict) else None
+            if "rendered" in d:
+                txt = rendered_text(d.get("rendered"))
+                parts.append(txt if txt else
+                             "[%s: bookkeeping only — not sent to the model]"
+                             % (kind or "attachment"))
+            elif kind in ATT_NOT_IN_CONTEXT:
+                parts.append("[%s: bookkeeping only — not sent to the model]\n"
+                             % kind)
+                parts.append(json.dumps(att, ensure_ascii=False, indent=1))
+            else:
+                parts.append(json.dumps(att, ensure_ascii=False, indent=1))
         elif isinstance(content, str):
             parts.append(content)
         elif isinstance(content, list):
@@ -2414,7 +3053,8 @@ class Session:
                 elif bt == "tool_use":
                     parts.append("%s %s" % (b.get("name"),
                                             json.dumps(b.get("input"),
-                                                       ensure_ascii=False)))
+                                                       ensure_ascii=False,
+                                                       indent=1)))
                 elif bt == "tool_result":
                     c = b.get("content")
                     parts.append(c if isinstance(c, str) else _blocks_text(c))
@@ -2429,29 +3069,87 @@ class Session:
         txt = "\n".join(x for x in parts if x)
         return txt or json.dumps(d, ensure_ascii=False)
 
-    def peek_payload(self, sid):
+    def _record_at(self, uuid):
+        """The transcript record a ring seg's uuid points at, re-read from
+        disk. None when the record is gone or unreadable."""
+        idx = self.uuid_order.get(uuid)
+        if idx is None or idx - 1 >= len(self.rec_offsets):
+            return None
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(self.rec_offsets[idx - 1])
+                line = fh.readline()
+            d = json.loads(line.decode("utf-8", "replace"))
+        except Exception:
+            return None
+        return d if isinstance(d, dict) else None
+
+    REASONING_NOTE = ("Hidden reasoning generated at turn %d. "
+                      "Extended-thinking models emit encrypted "
+                      "signature-only thinking blocks: the reasoning "
+                      "tokens stay resident server-side and are "
+                      "re-billed as cached input every turn, but "
+                      "never appear in the transcript. Measured as "
+                      "that turn's output_tokens minus its visible "
+                      "content (text + thinking + tool inputs).")
+
+    def _peek_one(self, seg):
+        """(kind, text) of one ring seg: the record's text from disk, or
+        the explainer for a synthetic reasoning seg (its uuid names no
+        record). (None, None) when the record is gone."""
+        if seg["cat"] == "reasoning":
+            return "reasoning", self.REASONING_NOTE % int(seg["born"])
+        d = self._record_at(seg["uuid"])
+        if d is None:
+            return None, None
+        kind = d.get("type")
+        if kind == "attachment" and isinstance(d.get("attachment"), dict):
+            kind = "attachment/%s" % (d["attachment"].get("type") or "?")
+        return kind, clean_text_sgr(self._excerpt_for(d, seg["cat"]))
+
+    def peek_payload(self, sid, full=False):
         """INSPECT-mode content lookup (SPEC b/c `peek`): re-read the
         segment's record from disk; the one sanctioned, bounded exception
-        to the no-content wire rule."""
+        to the no-content wire rule. `full` lifts the PEEK_CLIP; a merged
+        map seg answers with every member record, in order."""
+        clip = 0 if full else PEEK_CLIP
         base = {"seg": int(sid), "found": False, "cat": "?", "kind": None,
                 "uuid": None, "born": 0, "est": 0, "tok": 0, "file": None,
-                "excerpt": "", "truncated": False}
+                "excerpt": "", "truncated": False, "clip": clip, "n": 1}
         if sid == 0:
             txt = ("Request preamble the transcript omits: the system "
                    "prompt, tool schemas, skill listings and MCP "
                    "instructions. Measured honestly as R minus everything "
                    "visible (re-based at each compaction).")
-            if self.backend:
-                # local backend: the preamble IS observable — on the wire
+            if self.backend or self.provider == "opencode":
+                # local backend, or a CLI whose base URL is ours to set
+                # (OpenCode): the preamble IS observable — on the wire
                 item = None
-                rec = latest_proxy_record(self.model)
+                rec = latest_proxy_record(self.model,
+                                          user_sha=_user_sha(self.last_user_text))
                 if rec:
                     item = proxy_itemization(rec)
-                txt += "\n\n" + (item or (
-                    "The wire has it: run `amtr_engine.py --proxy "
-                    "--upstream %s` and point ANTHROPIC_BASE_URL at "
-                    "127.0.0.1:11435 to itemize this from the real "
-                    "request bytes." % self.backend.get("url", "...")))
+                if item:
+                    txt += "\n\n" + item
+                elif self.provider == "opencode":
+                    pid, url = opencode_provider_of(self.model)
+                    txt += ("\n\nThe wire has it. Record one prompt of this "
+                            "session through the amtr proxy:\n"
+                            "  AMTR_PROXY_BODIES=1 python3 amtr_engine.py "
+                            "--proxy --listen 11436 --upstream %s\n"
+                            "  OPENCODE_CONFIG_CONTENT='{\"provider\":{\"%s\":"
+                            "{\"options\":{\"baseURL\":\"http://127.0.0.1:11436\"}}}}' "
+                            "opencode run -s %s -m %s/%s \"...\"\n"
+                            "then reopen this peek: every part, sized from "
+                            "the real request bytes, each as a file."
+                            % (url or "<the provider's baseURL>", pid or "<id>",
+                               self.session_id, pid or "<id>", self.model))
+                else:
+                    txt += "\n\n" + (
+                        "The wire has it: run `amtr_engine.py --proxy "
+                        "--upstream %s` and point ANTHROPIC_BASE_URL at "
+                        "127.0.0.1:11435 to itemize this from the real "
+                        "request bytes." % self.backend.get("url", "..."))
             base.update({
                 "found": True, "cat": "overhead", "kind": "overhead",
                 "tok": int(self.overhead), "excerpt": txt})
@@ -2463,37 +3161,36 @@ class Session:
                      "born": int(seg["born"]), "est": int(seg["est"]),
                      "tok": int(self.seg_est(seg) * self.alpha),
                      "file": seg["file"]})
-        if seg["cat"] == "reasoning":
-            # synthetic segment: its uuid names no transcript record, so
-            # answer BEFORE the disk lookup with the explainer
-            base.update({
-                "found": True, "kind": "reasoning",
-                "excerpt": ("Hidden reasoning generated at turn %d. "
-                            "Extended-thinking models emit encrypted "
-                            "signature-only thinking blocks: the reasoning "
-                            "tokens stay resident server-side and are "
-                            "re-billed as cached input every turn, but "
-                            "never appear in the transcript. Measured as "
-                            "that turn's output_tokens minus its visible "
-                            "content (text + thinking + tool inputs)."
-                            % int(seg["born"]))})
-            return base
-        idx = self.uuid_order.get(seg["uuid"])
-        if idx is None or idx - 1 >= len(self.rec_offsets):
-            return base
-        try:
-            with open(self.path, "rb") as fh:
-                fh.seek(self.rec_offsets[idx - 1])
-                line = fh.readline()
-            d = json.loads(line.decode("utf-8", "replace"))
-        except Exception:
-            return base
-        if not isinstance(d, dict):
-            return base
-        raw = clean_text(self._excerpt_for(d, seg["cat"]))
-        base.update({"found": True, "kind": d.get("type"),
-                     "excerpt": raw[:2000],
-                     "truncated": len(raw) > 2000})
+        members = self.seg_members.get(sid)
+        if not members:
+            kind, raw = self._peek_one(seg)
+            if kind is None:
+                return base
+            base.update({"found": True, "kind": kind})
+        else:
+            # merged seg: every member, each under its own header line
+            chunks, seen, n = [], set(), 0
+            for mid in members:
+                ms = self.ring.get(mid)
+                if ms is None:
+                    continue
+                n += 1
+                if ms["uuid"] in seen:
+                    continue
+                seen.add(ms["uuid"])
+                kind, txt = self._peek_one(ms)
+                if kind is None:
+                    continue
+                chunks.append("── #%d %s %s · born t%d · %s tok ──\n%s"
+                              % (mid, ms["cat"], kind, ms["born"],
+                                 "{:,}".format(int(self.seg_est(ms) * self.alpha)),
+                                 txt))
+            if not chunks:
+                return base
+            raw = "\n\n".join(chunks)
+            base.update({"found": True, "kind": "merged", "n": max(1, n)})
+        base.update({"excerpt": raw if not clip else raw[:clip],
+                     "truncated": bool(clip) and len(raw) > clip})
         return base
 
     def turn_at_epoch(self, e):
@@ -2522,6 +3219,27 @@ class Session:
                 "waste": int(f["waste"]), "last_ts": f["last_ts"],
                 "last_epoch": round(float(f.get("last_epoch") or 0.0), 3),
                 "resident": f["resident"]}
+
+    def attach_kinds_payload(self):
+        """Resident attach tokens by attachment type (SPEC b `cats.attach`):
+        the ring holds exactly the resident segs, priced like cats_payload.
+        Types seen but weighing nothing (bookkeeping) are listed at 0 so the
+        reader sees they exist."""
+        inv = self.fit["inv"] if self.fit is not None else None
+        out = {}
+        for s in self.ring.values():
+            if s["cat"] != "attach":
+                continue
+            k = s.get("sub") or "?"
+            if inv is None:
+                v = s["est"] * self.alpha
+            else:
+                v = s["chars"] * inv["attach"] * self.alpha
+            out[k] = out.get(k, 0.0) + v
+        res = {k: int(v) for k, v in sorted(out.items(), key=lambda kv: -kv[1])}
+        for k in self.att_seen:
+            res.setdefault(k, 0)
+        return res
 
     def cats_payload(self):
         out = {"overhead": int(self.overhead)}
@@ -2563,7 +3281,8 @@ class Session:
         rows, so the picker and the ribbon agree)."""
         if self.provider == "claude":
             return session_name(self.session_id)
-        tag = {"codex": "cx", "gemini": "gm"}.get(self.provider, self.provider)
+        tag = {"codex": "cx", "gemini": "gm", "opencode": "oc"}.get(
+            self.provider, self.provider)
         base = os.path.basename((self.project or "").rstrip("/"))
         return "%s-%s" % (base or memorable_name(self.session_id), tag)
 
@@ -3070,7 +3789,26 @@ def history_last_prompts(span=65536):
 
 _PREVIEW_SKIP = ("<command-", "<local-command", "<system-reminder", "<task-notification")
 
-def _provider_tail_msgs(provider, lines, max_msgs):
+def _tail_push(out, role, txt, clip):
+    """Append/merge one tail message under the per-message clip; a clipped
+    message is flagged `cut` so the caller can say so."""
+    if out and out[-1]["role"] == role:
+        full = out[-1]["text"] + "\n" + txt
+        out[-1]["text"] = full if not clip else full[:clip]
+        out[-1]["cut"] = out[-1].get("cut", False) or (bool(clip) and len(full) > clip)
+    else:
+        out.append({"role": role, "text": txt if not clip else txt[:clip],
+                    "cut": bool(clip) and len(txt) > clip})
+
+
+def _strip_cut(out, keep):
+    if not keep:
+        for m in out:
+            m.pop("cut", None)
+    return out
+
+
+def _provider_tail_msgs(provider, lines, max_msgs, clip=TAIL_CLIP, cut=False):
     """Quicklook tail for Codex (event_msg user_message / agent_message) and
     Gemini (message records, upsert by id — the last version wins)."""
     out = []
@@ -3099,11 +3837,8 @@ def _provider_tail_msgs(provider, lines, max_msgs):
                     if isinstance(c, dict))).strip()
             if not txt:
                 continue
-            if out and out[-1]["role"] == role:
-                out[-1]["text"] = (out[-1]["text"] + "\n" + txt)[:700]
-            else:
-                out.append({"role": role, "text": txt[:700]})
-        return out[-max_msgs:]
+            _tail_push(out, role, txt, clip)
+        return _strip_cut(out[-max_msgs:], cut)
     if provider == "gemini":
         seen = {}
         order = []
@@ -3127,15 +3862,45 @@ def _provider_tail_msgs(provider, lines, max_msgs):
             role, txt = seen[mid]
             if not txt:
                 continue
-            if out and out[-1]["role"] == role:
-                out[-1]["text"] = (out[-1]["text"] + "\n" + txt)[:700]
-            else:
-                out.append({"role": role, "text": txt[:700]})
-        return out[-max_msgs:]
+            _tail_push(out, role, txt, clip)
+        return _strip_cut(out[-max_msgs:], cut)
+    if provider == "opencode":
+        # mirror rows: `message` names the role, `part` carries the text;
+        # a part whose message row fell outside the tail is assistant text
+        # when it carries stream timing (user parts never do)
+        roles = {}
+        for line in lines:
+            if b'"type"' not in line:
+                continue
+            try:
+                d = json.loads(line.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if d.get("type") == "message":
+                roles[d.get("id")] = d.get("role")
+                continue
+            if d.get("type") != "part":
+                continue
+            pd = d.get("data") if isinstance(d.get("data"), dict) else {}
+            if pd.get("type") != "text" or not isinstance(pd.get("text"), str):
+                continue
+            role = roles.get(d.get("message_id"))
+            if role is None:
+                role = "assistant" if isinstance(pd.get("time"), dict) else "user"
+            if role not in ("user", "assistant") or pd.get("synthetic"):
+                continue
+            txt = clean_text(pd["text"]).strip()
+            if not txt:
+                continue
+            _tail_push(out, role, txt, clip)
+        return _strip_cut(out[-max_msgs:], cut)
     return out
 
 
-def transcript_tail_msgs(path, max_msgs=12, span=262144):
+def transcript_tail_msgs(path, max_msgs=12, span=262144, clip=TAIL_CLIP,
+                         cut=False):
     """The conversation tail of a transcript, for the fleet quicklook
     (`fleet_peek`): the last user/assistant TEXT messages, oldest first,
     [{"role","text"}]. Tool results, meta records and harness wrappers
@@ -3156,7 +3921,7 @@ def transcript_tail_msgs(path, max_msgs=12, span=262144):
     prov = detect_provider(path, first_line="" if size > span else
                            lines[0].decode("utf-8", "replace") if lines else "")
     if prov != "claude":
-        return _provider_tail_msgs(prov, lines, max_msgs)
+        return _provider_tail_msgs(prov, lines, max_msgs, clip, cut)
     out = []
     for line in lines:
         if b'"type"' not in line:
@@ -3185,11 +3950,8 @@ def transcript_tail_msgs(path, max_msgs=12, span=262144):
         txt = "\n".join(parts).strip()
         if not txt:
             continue                           # tool-result / tool-use / wrapper only
-        if out and out[-1]["role"] == role:
-            out[-1]["text"] = (out[-1]["text"] + "\n" + txt)[:700]
-        else:
-            out.append({"role": role, "text": txt[:700]})
-    return out[-max_msgs:]
+        _tail_push(out, role, txt, clip)
+    return _strip_cut(out[-max_msgs:], cut)
 
 
 def scan_roster():
@@ -3559,8 +4321,80 @@ def _jchars(v):
     except Exception:
         return 0
 
+def _wire_text(c):
+    """The text of a wire message content (a string, or text blocks)."""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join((b.get("text") or "") for b in c if isinstance(b, dict)
+                         and b.get("type") in ("text", "input_text"))
+    return "" if c is None else json.dumps(c, ensure_ascii=False)
+
+
+def _user_sha(text):
+    """Fingerprint of a human prompt: pairs a wire capture to the session
+    that sent it (the transcript's last user text vs the request's)."""
+    t = (text or "").strip()
+    return hashlib.sha1(t.encode("utf-8")).hexdigest()[:12] if t else None
+
+
+def _wire_last_user(msgs):
+    for m in reversed(msgs):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return _wire_text(m.get("content"))
+    return ""
+
+
+def _part(kind, label, chars):
+    return {"kind": kind, "label": re.sub(r"\s+", " ", label).strip()[:60],
+            "chars": int(chars)}
+
+
+_SYS_MARK_RE = re.compile(
+    r"^(Instructions from: .+|<env>|<available_skills>|<skills_instructions>|"
+    r"<user_instructions>|<environment_context>)$", re.M)
+
+
+def _system_sections(text, idx):
+    """A system block split into the parts a CLI composes it from, at the
+    markers the CLIs themselves write: `Instructions from: <path>` (an
+    AGENTS.md/CLAUDE.md the CLI loaded), `<env>` / `<environment_context>`,
+    `<available_skills>` (the skill listing). The text before the first
+    marker is the CLI's own prompt. One part when no marker is present."""
+    cuts = [(m.start(), m.group(1)) for m in _SYS_MARK_RE.finditer(text)]
+    if not cuts:
+        return [_part("system", "system %d: %s" % (idx, text[:60]), len(text))]
+    parts = []
+    if cuts[0][0] > 0:
+        head = text[:cuts[0][0]]
+        parts.append(_part("system", "system %d: %s" % (idx, head[:60]), len(head)))
+    for i, (pos, mark) in enumerate(cuts):
+        end = cuts[i + 1][0] if i + 1 < len(cuts) else len(text)
+        chunk = text[pos:end]
+        if mark.startswith("Instructions from: "):
+            label = "instructions: " + mark[len("Instructions from: "):].replace(
+                os.path.expanduser("~"), "~")
+        elif mark == "<available_skills>":
+            label = "available_skills (%d skills)" % chunk.count("<skill>")
+        else:
+            label = mark.strip("<>")
+        parts.append(_part("system", label, len(chunk)))
+    return parts
+
+
+def _tool_name(t):
+    if isinstance(t, dict):
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        n = fn.get("name")
+        if isinstance(n, str) and n:
+            return n
+    return "tool"
+
+
 def proxy_compose(body):
-    """One composition record from a /v1/messages request body (bytes)."""
+    """One composition record from a /v1/messages request body (bytes):
+    the sizes, plus `parts` — each system block and each tool schema on
+    its own line — and the prompt fingerprint that pairs it to a session."""
     try:
         d = json.loads(body.decode("utf-8", "replace"))
     except Exception:
@@ -3577,6 +4411,17 @@ def proxy_compose(body):
            "input_tokens": None}
     rec["total_chars"] = (rec["system_chars"] + rec["tools_chars"]
                           + rec["msgs_chars"])
+    sysv = d.get("system")
+    blocks = [sysv] if isinstance(sysv, str) else \
+        [b for b in sysv if isinstance(b, dict)] if isinstance(sysv, list) else []
+    parts = []
+    for i, b in enumerate(blocks):
+        txt = b if isinstance(b, str) else (b.get("text") or json.dumps(b))
+        parts += _system_sections(txt, i + 1)
+    for t in tools:
+        parts.append(_part("tool", "tool %s" % _tool_name(t), _jchars(t)))
+    rec["parts"] = parts
+    rec["last_user_sha"] = _user_sha(_wire_last_user(msgs))
     return rec
 
 def proxy_compose_openai(body):
@@ -3602,28 +4447,82 @@ def proxy_compose_openai(body):
            "input_tokens": None}
     rec["total_chars"] = (rec["system_chars"] + rec["tools_chars"]
                           + rec["msgs_chars"])
+    parts = []
+    for i, m in enumerate(sys_msgs):
+        parts += _system_sections(_wire_text(m.get("content")), i + 1)
+    for t in tools:
+        parts.append(_part("tool", "tool %s" % _tool_name(t), _jchars(t)))
+    rec["parts"] = parts
+    rec["last_user_sha"] = _user_sha(_wire_last_user(rest))
     return rec
+
+
+def proxy_write_parts(rec, d):
+    """With bodies kept (AMTR_PROXY_BODIES): every part of the request as
+    its own file under ~/.claude/amtr-proxy/parts/<ts>/ — each system
+    block, each tool schema, the history — so the preamble can be READ,
+    not only sized. Returns the directory (recorded as rec.parts_dir)."""
+    if not isinstance(d, dict):
+        return None
+    pdir = os.path.join(PROXY_DIR, "parts",
+                        re.sub(r"[^0-9]", "", rec.get("ts") or "")[:14] or "x")
+    os.makedirs(pdir, exist_ok=True)
+    n = 0
+
+    def put(name, text):
+        nonlocal n
+        n += 1
+        with open(os.path.join(pdir, "%02d-%s" % (n, name)), "w",
+                  encoding="utf-8") as fh:
+            fh.write(text)
+    sysv = d.get("system")
+    blocks = [sysv] if isinstance(sysv, str) else \
+        [b for b in sysv if isinstance(b, dict)] if isinstance(sysv, list) else []
+    msgs = d.get("messages") if isinstance(d.get("messages"), list) else []
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "system":
+            blocks.append(m.get("content"))
+    for b in blocks:
+        put("system.txt", b if isinstance(b, str) else _wire_text(b)
+            if isinstance(b, list) else (b.get("text") if isinstance(b, dict)
+                                         and isinstance(b.get("text"), str)
+                                         else json.dumps(b, ensure_ascii=False)))
+    for t in d.get("tools") if isinstance(d.get("tools"), list) else []:
+        put("tool-%s.json" % re.sub(r"[^A-Za-z0-9_.-]", "_", _tool_name(t)),
+            json.dumps(t, indent=1, ensure_ascii=False))
+    rest = [m for m in msgs if not (isinstance(m, dict) and m.get("role") == "system")]
+    put("history.json", json.dumps(rest, indent=1, ensure_ascii=False))
+    rec["parts_dir"] = pdir
+    return pdir
 
 _IN_TOK_RE = re.compile(rb'"(?:input_tokens|prompt_tokens)"\s*:\s*(\d+)')
 
-def latest_proxy_record(model, max_age=900, span=65536):
+def latest_proxy_record(model, max_age=900, span=65536, user_sha=None):
     """Newest proxy composition record for `model` (fresh within max_age s),
-    or None. Bounded backward read, same discipline as tail_usage."""
+    or None. Bounded backward read, same discipline as tail_usage. With
+    `user_sha` (the session's last prompt fingerprint) a record of THAT
+    request wins at any age — the capture is paired, not merely recent."""
     try:
         size = os.path.getsize(PROXY_LOG)
         with open(PROXY_LOG, "rb") as fh:
-            fh.seek(max(0, size - span))
-            data = fh.read(span + 1)
+            fh.seek(max(0, size - (span * 64 if user_sha else span)))
+            data = fh.read(span * 64 + 1 if user_sha else span + 1)
     except OSError:
         return None
-    best = None
+    best = paired = None
     for line in data.split(b"\n"):
         try:
             d = json.loads(line.decode("utf-8", "replace"))
         except Exception:
             continue
-        if isinstance(d, dict) and d.get("model") == model:
+        if not isinstance(d, dict):
+            continue
+        if user_sha and d.get("last_user_sha") == user_sha:
+            paired = d
+        if d.get("model") == model:
             best = d
+    if paired is not None:
+        return paired
     if best is None:
         return None
     try:
@@ -3644,12 +4543,29 @@ def proxy_itemization(rec):
     cpt = tot_ch / tot_tok
     part = lambda ch: int(round(ch / cpt))
     hh = (rec.get("ts") or "")[11:16]
-    return ("Itemized from the wire (amtr proxy, %sZ): system prompt "
+    head = ("Itemized from the wire (amtr proxy, %sZ): system prompt "
             "≈%s tok · %d tool schemas ≈%s tok · history ≈%s tok "
             "(server-reported total %s tok)."
             % (hh, fmt_tok(part(rec["system_chars"])), rec["tools_n"],
                fmt_tok(part(rec["tools_chars"])),
                fmt_tok(part(rec["msgs_chars"])), fmt_tok(tot_tok)))
+    parts = rec.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return head
+    lines = [head, "", "  %-52s %10s" % ("part (%.1f chars/tok measured)" % cpt, "tok")]
+    for p in parts:
+        if not isinstance(p, dict):
+            continue
+        lines.append("  %-52s %10s" % (str(p.get("label") or "?")[:52],
+                                       fmt_tok(part(_i(p.get("chars"))))))
+    lines.append("  %-52s %10s" % ("history (%d messages, visible above)" % _i(rec.get("msgs_n")),
+                                   fmt_tok(part(_i(rec.get("msgs_chars"))))))
+    if rec.get("parts_dir"):
+        lines += ["", "Every part as a file: %s" % rec["parts_dir"]]
+    else:
+        lines += ["", "Sizes only. Run the proxy with AMTR_PROXY_BODIES=1 to keep "
+                  "every part as a readable file."]
+    return "\n".join(lines)
 
 def fmt_tok(n):
     return "%.1fk" % (n / 1000.0) if n >= 1000 else str(n)
@@ -3687,7 +4603,10 @@ def run_proxy(args):
                     rec["request_body"] = json.loads(body.decode("utf-8", "replace"))
                 except Exception:
                     rec["request_body"] = None
-            req = urllib.request.Request(upstream + self.path,
+            path = self.path
+            if upstream.endswith("/v1") and path.startswith("/v1/"):
+                path = path[3:]           # client and upstream both say /v1
+            req = urllib.request.Request(upstream + path,
                                          data=body or None,
                                          method=self.command)
             skip = {"host", "content-length", "connection",
@@ -3743,6 +4662,10 @@ def run_proxy(args):
                         sniff.decode("utf-8", "replace"))
                 except Exception:
                     rec["response_body"] = None
+                try:
+                    proxy_write_parts(rec, rec.get("request_body"))
+                except Exception as e:
+                    rec["parts_error"] = str(e)[:200]
             if rec is not None:
                 with wlock:
                     with open(PROXY_LOG, "a", encoding="utf-8") as fh:
@@ -3756,8 +4679,11 @@ def run_proxy(args):
     print("recording request composition to %s" % PROXY_LOG,
           file=sys.stderr)
     print("point the client at it, e.g.:\n"
-          "  ANTHROPIC_BASE_URL=http://127.0.0.1:%d claude --model <name>"
-          % args.listen, file=sys.stderr)
+          "  ANTHROPIC_BASE_URL=http://127.0.0.1:%d claude --model <name>\n"
+          "  OPENCODE_CONFIG_CONTENT='{\"provider\":{\"<id>\":{\"options\":"
+          "{\"baseURL\":\"http://127.0.0.1:%d\"}}}}' opencode run ...\n"
+          "set AMTR_PROXY_BODIES=1 to keep every part as a readable file"
+          % (args.listen, args.listen), file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -3806,6 +4732,10 @@ class Engine:
         self._codex_meta = {}        # path -> meta dict | None
         self._codex_tail = {}        # path -> (mtime, parsed)
         self._codex_tmux = (0.0, {})  # (ts, tty -> locator)
+        self._oc_cwd = {}            # pid -> cwd | None (opencode processes)
+        self._oc_info = {}           # session id -> (time_updated, row facts)
+        self._oc_sync_at = 0.0       # last attached-mirror sync (tail loop)
+        self._oc_synced = {}         # session id -> time_updated mirrored
 
     # ---- reading -------------------------------------------------------------
     def _pump(self, path, off, buf, cb, reset_on_shrink=True):
@@ -3861,6 +4791,11 @@ class Engine:
                 os.path.splitext(os.path.basename(expanded))[0])
             if p:
                 return p
+            # an OpenCode session id: mirror it (the row may not exist yet)
+            if arg.startswith("ses_"):
+                p = opencode_sync(arg)
+                if p:
+                    return p
             # a provider session id (Codex thread / Gemini session): the
             # roster row carries its path
             if isinstance(self._last_fleet, list):
@@ -4004,7 +4939,9 @@ class Engine:
         cats = sess.cats_payload()
         if cats != self._last_cats:
             self._last_cats = cats
-            send({"type": "cats", "totals": cats})
+            send({"type": "cats", "totals": cats,
+                  "attach": sess.attach_kinds_payload(),
+                  "attach_n": dict(sess.att_seen)})
         meta = sess.meta_payload()
         if meta != self._last_meta:
             self._last_meta = meta
@@ -4180,6 +5117,18 @@ class Engine:
                         % os.path.basename(reattach))
                     self.attach(reattach)
                     continue
+                if sess.provider == "opencode" and \
+                        time.time() - self._oc_sync_at >= 0.5:
+                    # the transcript is a mirror of the CLI's database:
+                    # extend it before tailing (a rebuilt mirror re-attaches)
+                    self._oc_sync_at = time.time()
+                    p = opencode_sync(sess.session_id)
+                    if p and p in _OC_REWRITTEN:
+                        _OC_REWRITTEN.discard(p)
+                        log("opencode mirror rebuilt; re-attaching %s"
+                            % os.path.basename(p))
+                        self.attach(p)
+                        continue
                 with self.lock:
                     sess = self.session
                     if sess is None:
@@ -4366,6 +5315,9 @@ class Engine:
                     hits = glob.glob(os.path.expanduser(
                         "~/.codex/sessions/*/*/*/rollout-*-%s.jsonl" % aid))
                     p = hits[0] if hits else None
+                elif sess.provider == "opencode":
+                    # the child session's own mirror (task metadata.sessionId)
+                    p = opencode_sync(aid) if aid.startswith("ses_") else None
                 else:
                     cdir = os.path.dirname(sess.path)
                     cand = os.path.join(cdir, sess.session_id, "%s.jsonl" % aid)
@@ -4375,6 +5327,8 @@ class Engine:
                     sess.pending["agents"].add(aid)
             if not p:
                 continue
+            if sess.provider == "opencode" and ag["state"] == "running":
+                opencode_sync(aid)           # the child keeps writing too
             try:
                 mt = os.path.getmtime(p)
             except OSError:
@@ -4390,6 +5344,7 @@ class Engine:
             except OSError:
                 continue
             info = codex_tail_parse(lines) if sess.provider == "codex" \
+                else opencode_tail_parse(lines) if sess.provider == "opencode" \
                 else gemini_tail_parse(lines)
             self.agent_tails[p] = {"mt": mt, "info": info}
             # own_tok = the agent's last resident (the Claude rule: its
@@ -4411,7 +5366,7 @@ class Engine:
                 sess.pending["agents"].add(aid)
             if ag["state"] == "running":
                 ag["ts_last"] = max(ag.get("ts_last") or 0.0, mt)
-                finished = info.get("ended") if sess.provider == "codex" \
+                finished = info.get("ended") if sess.provider in ("codex", "opencode") \
                     else info.get("status") == "idle"
                 # a finished-or-quiet transcript closes the agent (a
                 # transcript quiet for 5 min counts as finished either way)
@@ -4537,7 +5492,7 @@ class Engine:
         # other providers: live rows first (interleaved with the live Claude
         # rows by the front end's own sort), then their recent transcripts
         try:
-            prov = self._codex_rows() + self._gemini_rows()
+            prov = self._codex_rows() + self._gemini_rows() + self._opencode_rows()
             live_ids = {r["id"] for r in prov}
             prov += [r for r in self._provider_recent_rows()
                      if r["id"] not in live_ids]
@@ -4757,6 +5712,136 @@ class Engine:
                 "provider": "codex"})
         return rows
 
+    # ---- opencode provider (SPEC f2 providers) -------------------------------
+    def _opencode_pids(self):
+        """Live opencode processes as (pid, start_epoch)."""
+        try:
+            out = subprocess.run(["ps", "-axo", "pid=,lstart=,comm="],
+                                 capture_output=True, text=True,
+                                 timeout=5).stdout
+        except Exception:
+            return []
+        rows = []
+        for ln in out.splitlines():
+            parts = ln.split(None, 6)
+            if len(parts) == 7 and os.path.basename(parts[6]) == "opencode":
+                try:
+                    start = time.mktime(time.strptime(
+                        " ".join(parts[1:6]), "%a %b %d %H:%M:%S %Y"))
+                    rows.append((int(parts[0]), start))
+                except (ValueError, OverflowError):
+                    pass
+        return rows
+
+    def _opencode_facts(self, conn, sid, updated):
+        """Status / resident / prompt / model of one session, straight from
+        the database, cached by the session's time_updated (one query set
+        per change, not per tick)."""
+        c = self._oc_info.get(sid)
+        if c and c[0] == updated:
+            return c[1]
+        info = {"status": "idle", "resident": None, "last_prompt": None,
+                "model": "", "provider_id": ""}
+        try:
+            msgs = conn.execute(
+                "select id, data from message where session_id=? "
+                "order by time_created desc, id desc limit 8", (sid,)).fetchall()
+            last_user = None
+            for i, (mid, data) in enumerate(msgs):
+                d = _oc_loads(data)
+                if i == 0:
+                    if d.get("role") == "user":
+                        info["status"] = "busy"
+                    elif isinstance(d.get("time"), dict) and \
+                            not d["time"].get("completed"):
+                        info["status"] = "busy"
+                if d.get("role") == "assistant" and not info["model"]:
+                    info["model"] = d.get("modelID") or ""
+                    info["provider_id"] = d.get("providerID") or ""
+                if d.get("role") == "user" and last_user is None:
+                    last_user = mid
+            if last_user:
+                for (data,) in conn.execute(
+                        "select data from part where message_id=? "
+                        "order by time_created", (last_user,)):
+                    pd = _oc_loads(data)
+                    if pd.get("type") == "text" and isinstance(pd.get("text"), str) \
+                            and pd["text"].strip() and not pd.get("synthetic"):
+                        info["last_prompt"] = pd["text"].strip()[:200]
+                        break
+            row = conn.execute(
+                "select data from part where session_id=? and data like "
+                "'%\"step-finish\"%' order by time_created desc limit 1",
+                (sid,)).fetchone()
+            if row:
+                tok = _oc_loads(row[0]).get("tokens") or {}
+                cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
+                info["resident"] = (_i(tok.get("input")) + _i(cache.get("read"))
+                                    + _i(cache.get("write")))
+        except Exception as e:
+            log("opencode facts error: %s" % e)
+        self._oc_info[sid] = (updated, info)
+        return info
+
+    def _opencode_rows(self, limit=60):
+        """Fleet rows for OpenCode sessions (provider:"opencode"), newest
+        `limit` top-level sessions of the database. Pairing law: each live
+        opencode process claims the newest unclaimed session whose directory
+        is the process cwd and whose last update is not older than the
+        process start; the rest are `offline` rows that can be attached."""
+        conn = _oc_connect()
+        if conn is None:
+            return []
+        rows = []
+        try:
+            sessions = conn.execute(
+                "select id, directory, title, time_updated from session "
+                "where parent_id is null order by time_updated desc limit ?",
+                (limit,)).fetchall()
+            pids = self._opencode_pids()
+            live = {p for p, _ in pids}
+            for k in list(self._oc_cwd):
+                if k not in live:
+                    self._oc_cwd.pop(k, None)
+            owner = {}                  # session id -> pid
+            claimed = set()
+            for pid, start in pids:
+                cwd = self._proc_cwd(pid, self._oc_cwd)
+                for sid, d, _t, upd in sessions:
+                    if sid in claimed or _i(upd) < (start - 60) * 1000:
+                        continue
+                    if cwd and d and os.path.realpath(d) != os.path.realpath(cwd):
+                        continue
+                    owner[sid] = pid
+                    claimed.add(sid)
+                    break
+            for sid, d, title, upd in sessions:
+                pid = owner.get(sid)
+                info = self._opencode_facts(conn, sid, upd)
+                path = opencode_mirror_path(sid)
+                if pid or self._oc_synced.get(sid) != upd or \
+                        not os.path.exists(path):
+                    path = opencode_sync(sid, conn=conn)
+                    self._oc_synced[sid] = upd
+                if not path:
+                    continue
+                base = os.path.basename((d or "").rstrip("/")) or "opencode"
+                bud = opencode_budget(info["provider_id"], info["model"]) \
+                    or self._row_budget(info["resident"], "")
+                rows.append({
+                    "id": sid, "path": path, "pid": pid,
+                    "name": "%s-oc" % base, "project": d or "",
+                    "status": info["status"] if pid else "offline",
+                    "mtime": _i(upd) / 1000.0, "live": bool(pid),
+                    "resident": info["resident"], "budget": bud,
+                    "last_prompt": info["last_prompt"],
+                    "title": title or None, "provider": "opencode"})
+        except Exception as e:
+            log("opencode scan error: %s" % e)
+        finally:
+            conn.close()
+        return rows
+
     # ---- gemini provider (SPEC f2 providers) ---------------------------------
     def _gemini_registry(self):
         """~/.gemini/projects.json: project root -> short id (the tmp dir
@@ -4929,12 +6014,13 @@ class Engine:
         self._resident_cache[path] = (mtime, r)
         return r
 
-    def fleet_peek_payload(self, sid):
+    def fleet_peek_payload(self, sid, full=False):
         """Fleet quicklook (`fleet_peek`): the conversation tail of ANY
         roster session, attached or not — same bounded content exception
-        as `peek`."""
+        as `peek`. `full` lifts the per-message TAIL_CLIP."""
+        clip = 0 if full else TAIL_CLIP
         base = {"id": sid, "found": False, "name": memorable_name(sid),
-                "project": "", "msgs": []}
+                "project": "", "msgs": [], "clip": clip, "truncated": False}
         entry = None
         if isinstance(self._last_fleet, list):
             for e in self._last_fleet:
@@ -4947,10 +6033,13 @@ class Engine:
         tp = (entry or {}).get("path") or find_transcript(sid)
         if not tp or not os.path.isfile(tp):
             return base
-        msgs = transcript_tail_msgs(tp)
+        msgs = transcript_tail_msgs(tp, clip=clip, cut=True)
         if msgs is None:
             return base
-        base.update({"found": True, "msgs": msgs})
+        base.update({"found": True, "msgs": msgs,
+                     "truncated": any(m.get("cut") for m in msgs)})
+        for m in msgs:
+            m.pop("cut", None)
         return base
 
     def kill_session(self, sid):
@@ -5117,7 +6206,8 @@ class Engine:
                 with self.lock:
                     sess = self.session
                 if sess is not None:
-                    send(dict({"type": "peek"}, **sess.peek_payload(sid)))
+                    send(dict({"type": "peek"},
+                              **sess.peek_payload(sid, full=bool(ctrl.get("full")))))
         elif t == "seek":
             turn = ctrl.get("turn")
             if isinstance(turn, (int, float)):
@@ -5140,7 +6230,7 @@ class Engine:
                     # feedback, then spawn amtr_paper --dir in the background
                     # to fill in the PDF, figures, and per-turn capture.
                     name = re.sub(r"[^A-Za-z0-9._-]", "-",
-                                  session_name(sess.session_id))
+                                  sess.display_name())
                     outdir = os.path.join(CLAUDE_DIR, "amtr-reports",
                                           "%s-%s" % (name,
                                                      sess.session_id[:8]))
@@ -5207,7 +6297,8 @@ class Engine:
             sid = ctrl.get("session")
             if isinstance(sid, str) and sid:
                 send(dict({"type": "fleet_peek"},
-                          **self.fleet_peek_payload(sid)))
+                          **self.fleet_peek_payload(
+                              sid, full=bool(ctrl.get("full")))))
         elif t == "sess_kill":
             sid = ctrl.get("session")
             if isinstance(sid, str) and sid:
@@ -5392,7 +6483,13 @@ def run_validate(args):
           sum(1 for f in sess.files.values() if f["resident"])))
     print("compaction: %d events, %s tokens cumulatively dropped"
           % (len(sess.compactions), "{:,}".format(sess.cum_dropped)))
-    top = sorted(sess.files.values(), key=lambda f: -(f["tok"] + f["waste"]))[:10]
+    att = sess.attach_kinds_payload()
+    if att:
+        print("attach    : " + "  ".join(
+            "%s %s" % (k, "{:,}".format(v)) for k, v in att.items()))
+    top = _top(sorted(sess.files.values(),
+                      key=lambda f: -(f["tok"] + f["waste"])),
+               int(getattr(args, "top", 0) or 0))
     for f in top:
         print("  %8s tok  waste %-8s %s%s" % (
             "{:,}".format(int(f["tok"])), "{:,}".format(int(f["waste"])),
@@ -5417,11 +6514,17 @@ def _fmt_span(secs):
         return "%dm %ds" % (s // 60, s % 60)
     return "%ds" % s
 
-def build_report(sess, interrupted=False):
+def _top(rows, top):
+    """The report's one cut: `top` rows when asked for, otherwise all."""
+    return rows[:top] if top and top > 0 else rows
+
+
+def build_report(sess, interrupted=False, top=0):
     """One JSON-able dict holding every report section, in SPEC (f) order.
     Markdown is a rendering of THIS dict and --json dumps it verbatim, so
     both formats carry the same content and the same authoritative/estimated
-    labels — and every number is the Session's own accounting."""
+    labels — and every number is the Session's own accounting. Lists are
+    complete unless `top` asks for the first N (`--top N`)."""
     R = sess.resident()
     B = max(1, sess.budget)
     # -- 1 HEADER
@@ -5437,7 +6540,7 @@ def build_report(sess, interrupted=False):
     t0 = sess.started_epoch
     t1 = ts_epoch(sess.last_ts or "") or t0
     header = {"session_id": sess.session_id, "title": sess.title,
-              "name": session_name(sess.session_id),
+              "name": sess.display_name(),
               "project": sess.project or "", "models": models,
               "model_switches": switches, "cc_version": sess.cc_version,
               "started_at": sess.started_at, "ended_at": sess.last_ts,
@@ -5451,10 +6554,16 @@ def build_report(sess, interrupted=False):
                "pct_budget": round(100.0 * R / B, 1),
                "peak_r": int(peak_r), "peak_turn": int(peak_t),
                "waterline": int(last["waterline"]) if last else 0,
-               "compactions": [dict(c) for c in sess.compactions],
+               "compactions": [
+                   dict(c, dropped_files=_top(
+                       sess.compaction_files.get(c["n"], c["dropped_files"]),
+                       top))
+                   for c in sess.compactions],
                "cum_dropped": int(sess.cum_dropped),
                "rebuilds": [dict(r) for r in sess.rebuilds],
                "cats": sess.cats_payload(), "alpha": round(sess.alpha, 4),
+               "attach": sess.attach_kinds_payload(),
+               "attach_n": dict(sess.att_seen),
                "overhead": int(sess.overhead), "fit": sess.fit_payload()}
     # -- 3 ECONOMICS (authoritative)
     tot = sess.usage_totals()
@@ -5470,7 +6579,7 @@ def build_report(sess, interrupted=False):
     # -- 4 FILES (estimated)
     allf = list(sess.files.values())
     frows = []
-    for f in sorted(allf, key=lambda f: -int(f["tok"]))[:15]:
+    for f in _top(sorted(allf, key=lambda f: -int(f["tok"])), top):
         tok = int(f["tok"])
         frows.append({"tok": tok,
                       "pct_r": (round(100.0 * tok * sess.alpha
@@ -5497,8 +6606,8 @@ def build_report(sess, interrupted=False):
     shell["top"] = [{"ts": c["ts"], "turn": c["turn"], "ok": c["ok"],
                      "interrupted": c["interrupted"], "bg": c["bg"],
                      "tok_out": c["tok_out"], "cmd": c["cmd"]}
-                    for c in sorted(sess.cmds,
-                                    key=lambda c: -c["tok_out"])[:5]]
+                    for c in _top(sorted(sess.cmds,
+                                         key=lambda c: -c["tok_out"]), top)]
     # -- 6 RETRIEVAL
     retrieval = sess.ret_totals()
     retrieval["failures"] = [{"ts": r["ts"], "kind": r["kind"],
@@ -5507,8 +6616,8 @@ def build_report(sess, interrupted=False):
     # -- 7 AGENTS
     agents = sess.agent_totals()
     agents["top"] = []
-    for a in sorted(sess.agents.values(),
-                    key=lambda a: -_i(a["own_tok"]))[:5]:
+    for a in _top(sorted(sess.agents.values(),
+                         key=lambda a: -_i(a["own_tok"])), top):
         ret = a.get("ret_tok")
         agents["top"].append(
             {"type": a.get("agent_type"), "desc": a.get("desc"),
@@ -5639,6 +6748,17 @@ def render_report_md(rep):
                         "—" if r is None else
                         ("%.2f" % r if cat in fitted else "%.2f*" % r)))
     L.append("")
+    att = c.get("attach") or {}
+    if att:
+        att_n = c.get("attach_n") or {}
+        L.append("- attachments by kind (what the CLI injected; 0 = "
+                 "bookkeeping the model never saw):")
+        L += ["", "| attachment | records | tokens | %R |", "|:--|--:|--:|--:|"]
+        for k, v in att.items():
+            L.append("| %s | %d | %s | %.1f |"
+                     % (k, att_n.get(k, 0), _fc(v),
+                        100.0 * v / max(1, c["final_r"])))
+        L.append("")
     if ft.get("active"):
         L.append("- token ratios: %s, fitted from this session's own "
                  "authoritative R — %d turns, R² %.3f, residual RMS %.1f%% of "
@@ -5848,7 +6968,8 @@ def run_report(args):
                     break                # transcript quiet: run ended
         except KeyboardInterrupt:
             interrupted = True           # report what was parsed so far
-    rep = build_report(sess, interrupted=interrupted)
+    rep = build_report(sess, interrupted=interrupted,
+                       top=int(getattr(args, "top", 0) or 0))
     if args.json:
         print(json.dumps(rep, ensure_ascii=False, indent=1))
     else:
@@ -5899,6 +7020,9 @@ def main():
     ap.add_argument("--budget", type=int, help="pin the context budget")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--validate", action="store_true")
+    ap.add_argument("--top", type=int, default=0,
+                    help="report/validate: show only the first N rows of "
+                         "each list (default: every row)")
     ap.add_argument("--report", action="store_true",
                     help="print a ground-truth session report to stdout")
     ap.add_argument("--json", action="store_true",

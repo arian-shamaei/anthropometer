@@ -1,12 +1,12 @@
 ---
 name: amtr
-description: Debug the agent session you are in. Reads the session transcript with amtr (anthropometer) and answers what is filling the context window, what the session has cost, what a compaction dropped, which files are being re-read, and what subagents spent. Use when the user asks about context usage, tokens, cost, cache hits, compaction, or wants a report of a Claude Code, Codex CLI, or Gemini CLI session.
+description: Debug the agent session you are in. Reads the session transcript with amtr (anthropometer) and answers what is filling the context window, what the session has cost, what a compaction dropped, which files are being re-read, and what subagents spent. Use when the user asks about context usage, tokens, cost, cache hits, compaction, or wants a report of a Claude Code, Codex CLI, Gemini CLI, or OpenCode session.
 license: MIT
-compatibility: Claude Code (also reads Codex CLI and Gemini CLI transcripts). Needs python3 3.9 or newer, standard library only. Works from a bare checkout; a system install of amtr is used when present.
+compatibility: Claude Code (also reads Codex CLI, Gemini CLI and OpenCode sessions). Needs python3 3.9 or newer, standard library only. Works from a bare checkout; a system install of amtr is used when present.
 metadata:
   author: arian-shamaei
   source: https://github.com/arian-shamaei/anthropometer
-  version: "0.6.0"
+  version: "0.7.0"
 ---
 
 # amtr
@@ -28,7 +28,7 @@ Keep that label when you repeat a number.
 - "Which files keep getting re-read?" / "Where am I wasting tokens?"
 - "What did the subagents spend?" / "How much did that agent return?"
 - "Write me a report of this session" (or of another session by id or path).
-- After a headless run (`claude -p`, Codex, Gemini) to see what it did.
+- After a headless run (`claude -p`, Codex, Gemini, `opencode run`) to see what it did.
 
 ## What this skill does
 
@@ -59,10 +59,11 @@ bash <skill-dir>/scripts/amtr-report.sh --json
 Targets:
 
 ```sh
---session <path or session id>    a specific transcript (Claude Code, Codex CLI, Gemini CLI)
+--session <path or session id>    a specific transcript (Claude Code, Codex CLI, Gemini CLI, OpenCode `ses_…` id)
 --project <dir>                   the newest session under that project
 --budget <tokens>                 pin the context budget when the model window is unknown
 --watch                           wait for a running headless session to end, then report
+--top <n>                         keep only the first n rows of each list (default: every row)
 ```
 
 Drop `--json` for the markdown report, which is what to write to a file when

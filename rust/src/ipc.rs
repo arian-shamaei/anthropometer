@@ -181,6 +181,10 @@ pub struct Seg {
     /// epoch seconds of last access (heat)
     #[serde(default)]
     pub ts: f64,
+    /// records merged into this seg (0/1 = one record); every one of them
+    /// is still reachable: `peek` answers with all of them
+    #[serde(default)]
+    pub n: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -612,8 +616,9 @@ pub struct Snapshot {
 }
 
 /// Reply to [`Control::Peek`] — the segment's underlying record content,
-/// sanitized and clipped (≤2000 chars): the ONE sanctioned exception to the
-/// no-content wire rule (SPEC §b `peek`). Version-drift law: everything but
+/// sanitized and clipped to `clip` chars (0 = unclipped, a `full` request):
+/// the ONE sanctioned exception to the no-content wire rule (SPEC §b `peek`).
+/// A merged map seg answers with every member record (`n` > 1). Version-drift law: everything but
 /// the seg id is `#[serde(default)]`, and an absent `found` defaults FALSE —
 /// the inverse of the cmd `ok` law, because a missing answer must never
 /// render as content that exists.
@@ -641,6 +646,12 @@ pub struct PeekMsg {
     pub excerpt: String,
     #[serde(default)]
     pub truncated: bool,
+    /// the clip the engine applied, in chars; 0 = none
+    #[serde(default)]
+    pub clip: u64,
+    /// records behind this seg (a merged map seg answers for all of them)
+    #[serde(default)]
+    pub n: u64,
 }
 
 /// One conversation line inside a [`FleetPeekMsg`] preview.
@@ -668,6 +679,12 @@ pub struct FleetPeekMsg {
     pub project: String,
     #[serde(default)]
     pub msgs: Vec<FleetMsg>,
+    /// per-message clip the engine applied, in chars; 0 = none
+    #[serde(default)]
+    pub clip: u64,
+    /// some message was clipped (the `f` key re-asks in full)
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -751,10 +768,12 @@ pub enum Control {
     Seek { turn: u64 },
     /// INSPECT-mode content request. Explicit-request-only (sent on Enter,
     /// never per-cursor-move), so no coalescing is needed (SPEC §c).
-    Peek { seg: u64 },
+    /// `full` lifts the engine's excerpt clip (the `f` key on a clipped peek).
+    Peek { seg: u64, full: bool },
     /// SESSIONS/SYSTEM-WIDE quicklook: the tail of `session`'s conversation.
-    /// Explicit-request-only (sent on `space`), like `Peek`.
-    FleetPeek { session: String },
+    /// Explicit-request-only (sent on `space`), like `Peek`; `full` lifts the
+    /// per-message clip.
+    FleetPeek { session: String, full: bool },
     /// End a fleet session: the engine SIGTERMs its pid (live sessions only).
     SessKill { session: String },
     Live,
@@ -1297,7 +1316,7 @@ for line in sys.stdin:
             .expect("golden map must carry a non-overhead seg")
             .id;
         let peek_for = |want: u64| -> PeekMsg {
-            tx.send(Control::Peek { seg: want }).unwrap();
+            tx.send(Control::Peek { seg: want, full: false }).unwrap();
             loop {
                 match rx.recv_timeout(t).expect("no peek reply within 15s") {
                     Update::Peek(p) if p.seg == want => break p,

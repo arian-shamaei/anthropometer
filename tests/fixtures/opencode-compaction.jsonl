@@ -1,0 +1,32 @@
+{"type":"session","provider":"opencode","id":"ses_fixture0002","timestamp":"2026-08-01T11:00:00.000Z","directory":"/home/dev/proj","title":"Big outputs then compaction","version":"1.18.34","parent_id":null,"model":{"providerID":"local","modelID":"qwen-x"}}
+{"type":"message","id":"msg_u1","timestamp":"2026-08-01T11:00:01.000Z","role":"user","model":"qwen-x","provider_id":"local","agent":"build","parentID":null,"summary":false}
+{"type":"part","id":"prt_u1","message_id":"msg_u1","timestamp":"2026-08-01T11:00:01.100Z","data":{"type":"text","text":"dump the logs"}}
+{"type":"message","id":"msg_a1","timestamp":"2026-08-01T11:00:01.200Z","role":"assistant","model":"qwen-x","provider_id":"local","agent":"build","parentID":"msg_u1","summary":false}
+{"type":"part","id":"prt_a1s","message_id":"msg_a1","timestamp":"2026-08-01T11:00:02.000Z","data":{"type":"step-start"}}
+{"type":"part","id":"prt_a1t","message_id":"msg_a1","timestamp":"2026-08-01T11:00:02.500Z","data":{"type":"tool","tool":"bash","callID":"call_bash1","state":{"status":"completed","input":{"command":"cat big.log"},"output":"LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE LINE","metadata":{"exit":0},"title":"cat big.log","time":{"start":1,"end":2}}}}
+{"type":"part","id":"prt_a1f","message_id":"msg_a1","timestamp":"2026-08-01T11:00:03.000Z","data":{"type":"step-finish","reason":"tool-calls","tokens":{"total":1030,"input":1000,"output":30,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0}}
+{"type":"part","id":"prt_a2s","message_id":"msg_a1","timestamp":"2026-08-01T11:00:03.500Z","data":{"type":"step-start"}}
+{"type":"part","id":"prt_a2x","message_id":"msg_a1","timestamp":"2026-08-01T11:00:03.600Z","data":{"type":"text","text":"Dumped.","time":{"start":1,"end":2}}}
+{"type":"part","id":"prt_a2f","message_id":"msg_a1","timestamp":"2026-08-01T11:00:04.000Z","data":{"type":"step-finish","reason":"stop","tokens":{"total":1210,"input":1200,"output":10,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0}}
+{"type":"message_done","id":"msg_a1","timestamp":"2026-08-01T11:00:04.100Z","finish":"stop","error":null}
+{"type":"message","id":"msg_u2","timestamp":"2026-08-01T11:00:10.000Z","role":"user","model":"qwen-x","provider_id":"local","agent":"build","parentID":null,"summary":false}
+{"type":"part","id":"prt_u2","message_id":"msg_u2","timestamp":"2026-08-01T11:00:10.100Z","data":{"type":"text","text":"and the other one"}}
+{"type":"message","id":"msg_a2","timestamp":"2026-08-01T11:00:10.200Z","role":"assistant","model":"qwen-x","provider_id":"local","agent":"build","parentID":"msg_u2","summary":false}
+{"type":"part","id":"prt_a3s","message_id":"msg_a2","timestamp":"2026-08-01T11:00:11.000Z","data":{"type":"step-start"}}
+{"type":"part","id":"prt_a3x","message_id":"msg_a2","timestamp":"2026-08-01T11:00:11.500Z","data":{"type":"text","text":"Also dumped.","time":{"start":1,"end":2}}}
+{"type":"part","id":"prt_a3f","message_id":"msg_a2","timestamp":"2026-08-01T11:00:12.000Z","data":{"type":"step-finish","reason":"stop","tokens":{"total":1420,"input":1400,"output":20,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0}}
+{"type":"message_done","id":"msg_a2","timestamp":"2026-08-01T11:00:12.100Z","finish":"stop","error":null}
+{"type":"message","id":"msg_u3","timestamp":"2026-08-01T11:00:20.000Z","role":"user","model":"qwen-x","provider_id":"local","agent":"build","parentID":null,"summary":false}
+{"type":"part","id":"prt_u3c","message_id":"msg_u3","timestamp":"2026-08-01T11:00:20.100Z","data":{"type":"compaction","auto":true,"overflow":false,"tail_start_id":"msg_a2"}}
+{"type":"message","id":"msg_a3","timestamp":"2026-08-01T11:00:20.200Z","role":"assistant","model":"qwen-x","provider_id":"local","agent":"compaction","parentID":"msg_u3","summary":true}
+{"type":"part","id":"prt_a4s","message_id":"msg_a3","timestamp":"2026-08-01T11:00:21.000Z","data":{"type":"step-start"}}
+{"type":"part","id":"prt_a4x","message_id":"msg_a3","timestamp":"2026-08-01T11:00:21.500Z","data":{"type":"text","text":"## Objective\nDump two logs.\n## Work State\nBoth dumped.","time":{"start":1,"end":2}}}
+{"type":"part","id":"prt_a4f","message_id":"msg_a3","timestamp":"2026-08-01T11:00:22.000Z","data":{"type":"step-finish","reason":"stop","tokens":{"total":360,"input":300,"output":60,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0}}
+{"type":"message_done","id":"msg_a3","timestamp":"2026-08-01T11:00:22.100Z","finish":"stop","error":null}
+{"type":"message","id":"msg_u4","timestamp":"2026-08-01T11:00:30.000Z","role":"user","model":"qwen-x","provider_id":"local","agent":"build","parentID":null,"summary":false}
+{"type":"part","id":"prt_u4","message_id":"msg_u4","timestamp":"2026-08-01T11:00:30.100Z","data":{"type":"text","text":"thanks"}}
+{"type":"message","id":"msg_a4","timestamp":"2026-08-01T11:00:30.200Z","role":"assistant","model":"qwen-x","provider_id":"local","agent":"build","parentID":"msg_u4","summary":false}
+{"type":"part","id":"prt_a5s","message_id":"msg_a4","timestamp":"2026-08-01T11:00:31.000Z","data":{"type":"step-start"}}
+{"type":"part","id":"prt_a5x","message_id":"msg_a4","timestamp":"2026-08-01T11:00:31.500Z","data":{"type":"text","text":"Welcome.","time":{"start":1,"end":2}}}
+{"type":"part","id":"prt_a5f","message_id":"msg_a4","timestamp":"2026-08-01T11:00:32.000Z","data":{"type":"step-finish","reason":"stop","tokens":{"total":410,"input":400,"output":10,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0}}
+{"type":"message_done","id":"msg_a4","timestamp":"2026-08-01T11:00:32.100Z","finish":"stop","error":null}

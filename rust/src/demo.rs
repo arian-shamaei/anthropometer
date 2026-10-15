@@ -24,7 +24,7 @@ fn rkind(s: &str) -> RetKind {
 /// Populate `app` with the demo scene, timestamps anchored at `now`.
 pub(crate) fn populate(app: &mut App, now: f64) {
     let seg = |id: u64, c: &str, tok: u64, file: Option<u64>, born: u64, age_s: f64| -> Seg {
-        Seg { id, cat: cat(c), tok, file, born, ts: now - age_s }
+        Seg { id, cat: cat(c), tok, file, born, ts: now - age_s, n: 1 }
     };
     // per-agent context map (SPEC b `agent.map`): the stripped {cat,tok,file}
     // seg shape (id/born/ts default), resident summed from the composition so
@@ -32,7 +32,7 @@ pub(crate) fn populate(app: &mut App, now: f64) {
     let amap = |budget: u64, comp: &[(&str, u64, Option<u64>)]| -> MapMsg {
         let segs: Vec<Seg> = comp
             .iter()
-            .map(|&(c, tok, file)| Seg { id: 0, cat: cat(c), tok, file, born: 0, ts: now })
+            .map(|&(c, tok, file)| Seg { id: 0, cat: cat(c), tok, file, born: 0, ts: now, n: 1 })
             .collect();
         let resident: u64 = comp.iter().map(|&(_, tok, _)| tok).sum();
         MapMsg { rev: 0, alpha: 1.0, segs, resident: Some(resident), budget: Some(budget) }

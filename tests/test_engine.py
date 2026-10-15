@@ -43,6 +43,7 @@ import subprocess
 import sys
 import time
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -2181,6 +2182,455 @@ class TestLocalBackendProbe(unittest.TestCase):
         s.backend = {"kind": "ollama", "url": "u", "params": "27.3B",
                      "quant": "Q4_K_M", "ctx": 65536, "loaded": True}
         self.assertEqual(s.meta_payload()["backend"]["ctx"], 65536)
+
+
+OC_FIX = os.path.join(ROOT, "tests", "fixtures", "opencode-session.jsonl")
+OC_CMP = os.path.join(ROOT, "tests", "fixtures", "opencode-compaction.jsonl")
+
+
+class TestOpenCode(unittest.TestCase):
+    """OpenCode sessions through the mirror + adapter (SPEC f2/f3). The
+    fixture is a mirror file (the shape opencode_sync writes); the mirror
+    builder itself runs against a throwaway SQLite database here.
+      turn0: input 200 / cache read 800 / out 40 + reasoning 10
+      turn1: 400 / 1100 / cache write 120 / out 80
+      turn2: 400 / 0 / 0 / 10  (a task agent); then an API error message"""
+
+    def test_detect(self):
+        self.assertEqual(ce.detect_provider("/x/.cache/amtr/opencode/ses_abc.jsonl"), "opencode")
+        self.assertEqual(ce.detect_provider(OC_FIX), "opencode")
+
+    def test_turns_and_meta(self):
+        s = _feed(OC_FIX)
+        self.assertEqual(s.provider, "opencode")
+        self.assertEqual(s.session_id, "ses_fixture0001")
+        self.assertEqual(s.project, "/home/dev/proj")
+        self.assertEqual(s.model, "qwen-x")
+        self.assertEqual(s.title, "Add a build script")
+        self.assertEqual(s.cc_version, "1.18.34")
+        self.assertEqual(s.display_name(), "proj-oc")
+        self.assertEqual(s.meta_payload()["provider"], "opencode")
+        got = [(t["in"], t["cr"], t["cc"], t["out"], t["resident"]) for t in s.turns]
+        self.assertEqual(got, [(200, 800, 0, 50, 1000),
+                               (400, 1100, 120, 80, 1620),
+                               (400, 0, 0, 10, 400)])
+        self.assertEqual(s.resident(), 400)
+        # no window named for provider "local" anywhere -> the base budget
+        self.assertFalse(s.provider_budget)
+        # the failed message landed as an api_error event
+        self.assertIn("api_error", [e["kind"] for e in s.events])
+        # the step's own reasoning count is the turn's authoritative think;
+        # the thoughts came back as text, so nothing is hidden: no slab
+        self.assertEqual([t["think"] for t in s.turns], [10, 0, 0])
+        self.assertEqual(s.reasoning_state(), "open")
+        self.assertFalse([g for g in s.ring.values() if g["uuid"].startswith("reasoning-t")])
+
+    def test_tools_files_shell_agents(self):
+        s = _feed(OC_FIX)
+        # bash -> SHELL console entry, exit from metadata.exit
+        self.assertEqual([(c["cmd"], c["ok"]) for c in s.cmds], [("ls build", False)])
+        # read -> a Read on the file, write -> a Write
+        self.assertEqual(sorted((x["path"], x["writes"], x["edits"], x["reads"])
+                                for x in s.files.values()),
+                         [("/home/dev/proj/Makefile", 0, 0, 1),
+                          ("/home/dev/proj/build.sh", 1, 0, 0)])
+        # task -> an agent keyed by the child session id, done with its result
+        self.assertEqual([(a["id"], a["state"], a["agent_type"], a["desc"])
+                          for a in s.agents.values()],
+                         [("ses_fixture0001child", "done", "general", "run build")])
+        # every content record kept its own uuid (compaction survivors match by it)
+        self.assertIn("prt_a2x", [g["uuid"] for g in s.ring.values()])
+
+    def test_replay(self):
+        s = _feed(OC_FIX)
+        c0 = s.state_at_turn(0)
+        self.assertEqual(len(c0.turns), 1)
+        self.assertEqual(c0.resident(), 1000)
+        self.assertIn("prt_u1", [g["uuid"] for g in c0.ring.values()])
+        self.assertNotIn("prt_a2x", [g["uuid"] for g in c0.ring.values()])
+        c1 = s.state_at_turn(1)
+        self.assertEqual(c1.resident(), 1620)
+
+    def test_compaction(self):
+        """A `compaction` part cuts the history: the tail from tail_start_id
+        survives, the summary message's text lands after the cut as summary,
+        and the summary request is a turn of its own — no rebuild event."""
+        s = _feed(OC_CMP)
+        self.assertEqual(len(s.compactions), 1)
+        c = s.compactions[0]
+        self.assertEqual((c["pre"], c["preserved_msgs"]), (1400, 1))
+        self.assertEqual(c["dropped"], c["pre"] - c["post"])
+        self.assertEqual(sorted(g["uuid"] for g in s.ring.values()),
+                         ["prt_a3x", "prt_a4x", "prt_a5x", "prt_u4"])
+        self.assertEqual([g["cat"] for g in s.ring.values() if g["uuid"] == "prt_a4x"],
+                         ["summary"])
+        kinds = [e["kind"] for e in s.events]
+        self.assertIn("compaction", kinds)
+        self.assertNotIn("rebuild", kinds)
+        self.assertEqual([t["resident"] for t in s.turns], [1000, 1200, 1400, 300, 400])
+
+    def test_tail_and_quicklook(self):
+        lines = open(OC_FIX, encoding="utf-8").read().splitlines()
+        info = ce.opencode_tail_parse(lines)
+        self.assertEqual((info["status"], info["resident"], info["last_prompt"], info["ended"]),
+                         ("idle", 400, "again", True))
+        # a trailing assistant message without its message_done is busy; so
+        # is a trailing user prompt
+        self.assertEqual(ce.opencode_tail_parse(lines[:-1])["status"], "busy")
+        self.assertEqual(ce.opencode_tail_parse(lines[:3])["status"], "busy")
+        q = ce.transcript_tail_msgs(OC_FIX, 2)
+        self.assertEqual([m["role"] for m in q], ["assistant", "user"])
+        self.assertEqual(q[0]["text"], "Added build.sh.")
+
+    def _db(self, path):
+        import sqlite3
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            create table session (id text primary key, parent_id text, directory text,
+                title text, version text, model text, time_created integer,
+                time_updated integer);
+            create table message (id text primary key, session_id text,
+                time_created integer, time_updated integer, data text);
+            create table part (id text primary key, message_id text, session_id text,
+                time_created integer, time_updated integer, data text);
+        """)
+        conn.commit()
+        return conn
+
+    def test_mirror_builder_and_sync(self):
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "opencode.db")
+            conn = self._db(db)
+            sid = "ses_mirror01"
+            conn.execute("insert into session values (?,?,?,?,?,?,?,?)",
+                         (sid, None, "/home/dev/proj", "t", "1.0",
+                          '{"providerID":"p","id":"m"}', 1000, 1000))
+            conn.execute("insert into message values (?,?,?,?,?)",
+                         ("msg_u", sid, 1001, 1001, '{"role":"user"}'))
+            conn.execute("insert into part values (?,?,?,?,?,?)",
+                         ("prt_u", "msg_u", sid, 1002, 1002,
+                          '{"type":"text","text":"hi"}'))
+            conn.execute("insert into message values (?,?,?,?,?)",
+                         ("msg_a", sid, 1003, 1003,
+                          '{"role":"assistant","modelID":"m","providerID":"p","time":{"created":1003}}'))
+            conn.execute("insert into part values (?,?,?,?,?,?)",
+                         ("prt_a_txt", "msg_a", sid, 1004, 1004,
+                          '{"type":"text","text":"streaming..."}'))
+            conn.commit()
+            # the streaming part has no step-finish yet: it is NOT emitted
+            rows = ce.opencode_rows(conn, sid)
+            self.assertEqual([r["type"] for r in rows],
+                             ["session", "message", "part", "message"])
+            self.assertEqual(rows[2]["data"]["text"], "hi")
+            env = {"XDG_CACHE_HOME": os.path.join(tmp, "cache"),
+                   "XDG_CONFIG_HOME": os.path.join(tmp, "cfg")}
+            with unittest.mock.patch.dict(os.environ, env):
+                p = ce.opencode_sync(sid, db=db)
+                self.assertTrue(p.endswith(os.path.join("amtr", "opencode", sid + ".jsonl")))
+                with open(p, encoding="utf-8") as fh:
+                    self.assertEqual(len(fh.readlines()), 4)
+                # the step finishes and the message completes: the bundle
+                # (text part + step-finish) and message_done APPEND
+                conn.execute("insert into part values (?,?,?,?,?,?)",
+                             ("prt_a_fin", "msg_a", sid, 1010, 1010,
+                              '{"type":"step-finish","tokens":{"input":50,"output":5,"reasoning":0,"cache":{"read":20,"write":0}}}'))
+                conn.execute("update message set data=? where id=?",
+                             ('{"role":"assistant","modelID":"m","providerID":"p","time":{"created":1003,"completed":1011},"finish":"stop"}', "msg_a"))
+                conn.commit()
+                p2 = ce.opencode_sync(sid, db=db)
+                self.assertEqual(p2, p)
+                self.assertNotIn(p, ce._OC_REWRITTEN)
+                with open(p, encoding="utf-8") as fh:
+                    lines = [json.loads(l) for l in fh]
+                self.assertEqual([r["type"] for r in lines],
+                                 ["session", "message", "part", "message",
+                                  "part", "part", "message_done"])
+                self.assertEqual(lines[4]["data"]["text"], "streaming...")
+                # it feeds like any transcript: one turn, resident 70
+                s = _feed(p)
+                self.assertEqual(s.provider, "opencode")
+                self.assertEqual([(t["in"], t["cr"], t["resident"]) for t in s.turns],
+                                 [(50, 20, 70)])
+                self.assertEqual(s.project, "/home/dev/proj")
+                # a mirror that is no longer a prefix of the truth is rebuilt
+                with open(p, "a", encoding="utf-8") as fh:
+                    fh.write('{"type":"junk"}\n')
+                ce.opencode_sync(sid, db=db)
+                self.assertIn(p, ce._OC_REWRITTEN)
+                ce._OC_REWRITTEN.discard(p)
+                with open(p, encoding="utf-8") as fh:
+                    self.assertEqual(len(fh.readlines()), 7)
+                # budget: the user's opencode.json names the window
+                os.makedirs(os.path.join(tmp, "cfg", "opencode"))
+                with open(os.path.join(tmp, "cfg", "opencode", "opencode.json"), "w") as fh:
+                    json.dump({"provider": {"p": {"models": {"m": {"limit": {"context": 131072}}}}}}, fh)
+                self.assertEqual(ce.opencode_budget("p", "m"), 131072)
+                self.assertIsNone(ce.opencode_budget("p", "other"))
+                s = _feed(p)
+                self.assertEqual(s.budget, 131072)
+                self.assertTrue(s.provider_budget)
+            conn.close()
+
+
+class TestWireParts(unittest.TestCase):
+    """The proxy records every part of a request (SPEC f3 proxy): each
+    system section at the CLI's own markers, each tool schema, the history,
+    and the prompt fingerprint that pairs the capture to its session."""
+
+    SYS = ("You are opencode, an interactive CLI tool.\n\n# Tone\nBe brief.\n"
+           "<env>\n  cwd: /home/dev/proj\n</env>\n"
+           "Instructions from: /home/dev/AGENTS.md\n# AGENTS.md\nread me\n"
+           "<available_skills>\n  <skill>\n    <name>a</name>\n  </skill>\n"
+           "  <skill>\n    <name>b</name>\n  </skill>\n</available_skills>")
+
+    def test_system_sections(self):
+        parts = ce._system_sections(self.SYS, 1)
+        self.assertTrue(parts[0]["label"].startswith("system 1: You are opencode"))
+        self.assertEqual([p["label"] for p in parts][1:],
+                         ["env", "instructions: /home/dev/AGENTS.md",
+                          "available_skills (2 skills)"])
+        self.assertEqual(sum(p["chars"] for p in parts), len(self.SYS))
+        # a heading inside a loaded file is content, not a marker
+        self.assertEqual(len(ce._system_sections("# AGENTS.md\nplain", 1)), 1)
+
+    def test_openai_compose_parts_and_pairing(self):
+        body = json.dumps({
+            "model": "qwen-x",
+            "messages": [{"role": "system", "content": self.SYS},
+                         {"role": "user", "content": "hi there"},
+                         {"role": "assistant", "content": "hello"},
+                         {"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+            "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}},
+                      {"type": "function", "function": {"name": "read", "parameters": {}}}],
+        }).encode("utf-8")
+        rec = ce.proxy_compose_openai(body)
+        self.assertEqual([p["label"] for p in rec["parts"]][-2:], ["tool bash", "tool read"])
+        self.assertEqual(len(rec["parts"]), 6)
+        self.assertEqual(rec["msgs_n"], 3)
+        self.assertEqual(rec["last_user_sha"], ce._user_sha("ping"))
+        # itemization: one line per part, scaled by the measured ratio
+        rec["input_tokens"] = rec["total_chars"] // 4
+        txt = ce.proxy_itemization(rec)
+        self.assertIn("available_skills (2 skills)", txt)
+        self.assertIn("tool bash", txt)
+        self.assertIn("history (3 messages", txt)
+        self.assertIn("Sizes only", txt)
+        # the session's last prompt pairs it, at any age
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "requests.jsonl")
+            old = dict(rec, ts="2020-01-01T00:00:00+00:00", last_user_sha=ce._user_sha("ping"))
+            other = dict(rec, ts="2020-01-01T00:00:01+00:00", last_user_sha="nope")
+            with open(log, "w") as fh:
+                fh.write(json.dumps(old) + "\n" + json.dumps(other) + "\n")
+            with unittest.mock.patch.object(ce, "PROXY_LOG", log):
+                self.assertIsNone(ce.latest_proxy_record("qwen-x"))       # stale
+                got = ce.latest_proxy_record("qwen-x", user_sha=ce._user_sha("ping"))
+                self.assertEqual(got["ts"], old["ts"])
+
+    def test_write_parts_files(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(ce, "PROXY_DIR", tmp):
+                rec = {"ts": "2026-10-07T00:11:54.651698+00:00"}
+                d = {"messages": [{"role": "system", "content": "sys text"},
+                                  {"role": "user", "content": "hi"}],
+                     "tools": [{"type": "function", "function": {"name": "bash"}}]}
+                pdir = ce.proxy_write_parts(rec, d)
+                self.assertEqual(rec["parts_dir"], pdir)
+                self.assertEqual(sorted(os.listdir(pdir)),
+                                 ["01-system.txt", "02-tool-bash.json", "03-history.json"])
+                with open(os.path.join(pdir, "01-system.txt")) as fh:
+                    self.assertEqual(fh.read(), "sys text")
+
+    def test_session_last_user_and_opencode_peek(self):
+        s = _feed(OC_FIX)
+        self.assertEqual(s.last_user_text, "again")
+        pk = s.peek_payload(0)
+        self.assertEqual(pk["kind"], "overhead")
+        # no capture yet: the peek says how to record one for THIS session
+        self.assertIn("OPENCODE_CONFIG_CONTENT", pk["excerpt"])
+        self.assertIn("ses_fixture0001", pk["excerpt"])
+
+
+class TestNoTruncation(unittest.TestCase):
+    """Nothing amtr shows is cut without saying so, and every cut can be
+    lifted: peek `full`, merged-seg members, attachment sizing by what the
+    model saw, complete report lists (`--top` is the only cut)."""
+
+    @staticmethod
+    def _rec(t, uuid, **kw):
+        d = {"type": t, "uuid": uuid, "parentUuid": None, "isSidechain": False,
+             "timestamp": "2026-07-17T11:00:00.000Z",
+             "sessionId": "feedbeef-0000-4000-8000-1234567890ab"}
+        d.update(kw)
+        return d
+
+    def _feed(self, sess, recs):
+        off = sess.rec_offsets[-1] + 1 if sess.rec_offsets else 0
+        with open(sess.path, "ab") as fh:
+            for r in recs:
+                raw = (json.dumps(r, ensure_ascii=False) + "\n").encode("utf-8")
+                fh.write(raw)
+        # re-read the whole file so rec_offsets stay disk-true for peek
+        size = os.path.getsize(sess.path)
+        with open(sess.path, "rb") as fh:
+            fh.seek(off)
+            for raw in fh:
+                sess.feed_line(raw.decode("utf-8"), off)
+                off += len(raw)
+        self.assertEqual(off, size)
+
+    def _copy_fixture(self):
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        dst = os.path.join(d, "feedbeef-0000-4000-8000-1234567890ab.jsonl")
+        shutil.copy(FIX, dst)
+        return dst
+
+    def test_peek_full_lifts_clip(self):
+        dst = self._copy_fixture()
+        sess = load_session(dst)
+        long = "L" * 5000
+        self._feed(sess, [self._rec("user", "u-long",
+                                    message={"role": "user", "content": long})])
+        seg = next(s for s in sess.ring.values()
+                   if s["cat"] == "user" and s["uuid"] == "u-long")
+        p = sess.peek_payload(seg["id"])
+        self.assertTrue(p["found"])
+        self.assertEqual((len(p["excerpt"]), p["truncated"], p["clip"], p["n"]),
+                         (ce.PEEK_CLIP, True, ce.PEEK_CLIP, 1))
+        f = sess.peek_payload(seg["id"], full=True)
+        self.assertEqual((len(f["excerpt"]), f["truncated"], f["clip"]),
+                         (5000, False, 0))
+
+    def test_merged_seg_keeps_every_member_reachable(self):
+        sess = load_session()
+        # the uncapped map's segs are the reachable universe (the sum-to-R
+        # correction may zero a trailing seg before any merge; that is the
+        # map's existing accounting, not the merge's)
+        live = {s["id"] for s in sess.build_map_segs(cap=10 ** 6)}
+        segs = sess.build_map_segs(cap=3)
+        self.assertLessEqual(len(segs), 3)
+        for s in segs:
+            self.assertNotIn("ids", s)            # members never cross the wire
+        reach = {s["id"] for s in segs}
+        for ids in sess.seg_members.values():
+            reach |= set(ids)
+        self.assertEqual(live - reach, set())      # nothing became unreachable
+        merged = [s for s in segs if s.get("n", 1) > 1]
+        self.assertTrue(merged)
+        big = max(merged, key=lambda s: s["n"])
+        self.assertEqual(big["n"], len(sess.seg_members[big["id"]]))
+        p = sess.peek_payload(big["id"], full=True)
+        self.assertTrue(p["found"])
+        self.assertEqual((p["kind"], p["n"], p["truncated"]),
+                         ("merged", big["n"], False))
+        # one header per distinct record (segs sharing a record share a header)
+        uuids = {sess.ring[i]["uuid"] for i in sess.seg_members[big["id"]]}
+        self.assertEqual(p["excerpt"].count("── #"), len(uuids))
+        # the synthetic reasoning seg, if merged in, answers its explainer
+        if any(sess.ring[i]["cat"] == "reasoning"
+               for i in sess.seg_members[big["id"]]):
+            self.assertIn("Hidden reasoning", p["excerpt"])
+        # the default map (cap 1024) merges nothing here: no `n`, no members
+        self.assertFalse(any("n" in s for s in sess.build_map_segs()))
+        self.assertEqual(sess.seg_members, {})
+
+    def test_attachment_sized_by_what_the_model_saw(self):
+        dst = self._copy_fixture()
+        sess = load_session(dst)
+        before = dict(sess.cats_payload())
+        seen = ("x" * 380)
+        self._feed(sess, [
+            # the CLI says what it rendered: that text is the weight
+            self._rec("attachment", "at-r",
+                      attachment={"type": "hook_additional_context",
+                                  "content": ["irrelevant", "json", "bulk" * 200]},
+                      rendered=[{"content": seen}], renderedRole="system"),
+            # bookkeeping: never sent, weighs nothing, still counted
+            self._rec("attachment", "at-b",
+                      attachment={"type": "hook_success", "stdout": "y" * 4000}),
+            # an older CLI's record (no `rendered` key, unknown type): the
+            # attachment JSON, as before
+            self._rec("attachment", "at-o",
+                      attachment={"type": "mystery", "text": "z" * 38}),
+        ])
+        segs = {s["uuid"]: s for s in sess.ring.values()
+                if s["cat"] == "attach"}
+        self.assertEqual(segs["at-r"]["est"], ce.est_text(seen))
+        self.assertEqual(segs["at-r"]["sub"], "hook_additional_context")
+        self.assertNotIn("at-b", segs)             # 0 tokens: never allocated
+        self.assertEqual(segs["at-o"]["est"], ce.est_pair(
+            {"type": "mystery", "text": "z" * 38})[0])
+        self.assertEqual(sess.att_seen["hook_success"], 1)
+        kinds = sess.attach_kinds_payload()
+        self.assertEqual(kinds["hook_success"], 0)
+        self.assertGreater(kinds["hook_additional_context"], 0)
+        self.assertGreater(kinds["mystery"], 0)
+        # the peek shows the rendered text and names the kind
+        p = sess.peek_payload(segs["at-r"]["id"])
+        self.assertEqual(p["kind"], "attachment/hook_additional_context")
+        self.assertIn(seen, p["excerpt"])
+        self.assertNotIn("bulk", p["excerpt"])
+        # golden attachments (no `rendered` anywhere) price as they always did
+        self.assertEqual(sess.cats_payload()["summary"], before["summary"])
+
+    def test_report_lists_complete_unless_top(self):
+        sess = load_session()
+        rep = ce.build_report(sess)
+        self.assertEqual(len(rep["files"]["table"]),
+                         rep["files"]["totals"]["files"])
+        self.assertIn("attach", rep["context"])
+        self.assertIn("attach_n", rep["context"])
+        self.assertTrue(set(sess.att_seen) <= set(rep["context"]["attach_n"]))
+        top1 = ce.build_report(sess, top=1)
+        self.assertEqual(len(top1["files"]["table"]), 1)
+        self.assertLessEqual(len(top1["shell"]["top"]), 1)
+        self.assertLessEqual(len(top1["agents"]["top"]), 1)
+        for c in top1["context"]["compactions"]:
+            self.assertLessEqual(len(c["dropped_files"]), 1)
+        for c in rep["context"]["compactions"]:
+            self.assertEqual(len(c["dropped_files"]),
+                             len(sess.compaction_files[c["n"]]))
+        md = ce.render_report_md(rep)
+        self.assertIn("attachments by kind", md)
+
+    def test_peek_keeps_sgr_color_only(self):
+        dst = self._copy_fixture()
+        sess = load_session(dst)
+        raw = "ok \x1b[31mFAIL\x1b[0m\x1b]8;;http://x\x07 \x1b[2J\x07 done"
+        self._feed(sess, [self._rec("user", "u-sgr",
+                                    message={"role": "user", "content": raw})])
+        seg = next(s for s in sess.ring.values() if s["uuid"] == "u-sgr")
+        p = sess.peek_payload(seg["id"])
+        # SGR survives for the overlay to render; OSC, clears and bells go
+        self.assertEqual(p["excerpt"], "ok \x1b[31mFAIL\x1b[0m  done")
+        self.assertEqual(ce.clean_text(raw), "ok FAIL  done")
+
+    def test_tail_clip_lifts(self):
+        import tempfile
+        fh = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False,
+                                         encoding="utf-8")
+        fh.write(json.dumps({"type": "user", "message": {
+            "role": "user", "content": "q" * 1000}}) + "\n")
+        fh.write(json.dumps({"type": "assistant", "message": {
+            "role": "assistant", "content": [{"type": "text",
+                                              "text": "a" * 1000}]}}) + "\n")
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        m = ce.transcript_tail_msgs(fh.name)
+        self.assertEqual([len(x["text"]) for x in m], [ce.TAIL_CLIP] * 2)
+        self.assertEqual(sorted(m[0]), ["role", "text"])   # no flag leaks
+        m = ce.transcript_tail_msgs(fh.name, clip=0)
+        self.assertEqual([len(x["text"]) for x in m], [1000, 1000])
+        m = ce.transcript_tail_msgs(fh.name, cut=True)
+        self.assertTrue(all(x["cut"] for x in m))
+        m = ce.transcript_tail_msgs(fh.name, clip=0, cut=True)
+        self.assertFalse(any(x["cut"] for x in m))
 
 
 if __name__ == "__main__":

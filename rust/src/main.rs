@@ -43,7 +43,7 @@ amtr — context monitor for Claude Code sessions (UI side; data via amtr_engine
 usage: amtr [--session FILE|ID] [--project PATH] [--budget N]
             [--engine PATH] [--python PATH] [--engine-args ARGS...]
 
-  --session      attach to a session: Claude Code, Codex CLI or Gemini CLI
+  --session      attach to a session: Claude Code, Codex CLI, Gemini CLI or OpenCode
                  transcript path, or its session id
   --project      newest session under this project path
   --budget       pin the context budget (tokens); passed to the engine
@@ -156,6 +156,9 @@ struct App {
     /// peek body scroll (j/k · wheel); Cell for the map_geom reason —
     /// render clamps it to the wrapped record's real height
     peek_scroll: std::cell::Cell<usize>,
+    /// the open (clipped) peek has already been re-asked in full: scrolling
+    /// a clipped record asks once, never per keystroke
+    peek_full_asked: bool,
 
     // FILES
     file_sel: usize,
@@ -283,6 +286,7 @@ impl App {
             inspect_idx: 0,
             peek: None,
             peek_scroll: std::cell::Cell::new(0),
+            peek_full_asked: false,
             file_sel: 0,
             file_sort: FileSort::Size,
             file_detail: false,
@@ -500,8 +504,13 @@ impl App {
             // selected seg — a stale reply (the user walked on before it
             // arrived) must never open an overlay for the wrong segment.
             if self.inspect && self.selected_seg_id() == Some(p.seg) {
+                // a `full` re-ask of the open record keeps the reader's place;
+                // a fresh record starts at the top
+                if self.peek.as_ref().map(|q| q.seg) != Some(p.seg) {
+                    self.peek_scroll.set(0);
+                    self.peek_full_asked = false;
+                }
                 self.peek = Some(p.clone());
-                self.peek_scroll.set(0); // a fresh record starts at the top
                 self.dirty = true;
             }
             return; // UI-modal state; never session state
@@ -510,8 +519,10 @@ impl App {
             // quicklook reply: only meaningful while a fleet surface is
             // still open — a reply landing after the picker closed is dropped
             if self.show_fleet {
+                if self.fleet_peek.as_ref().map(|q| q.id.as_str()) != Some(p.id.as_str()) {
+                    self.fleet_peek_scroll.set(usize::MAX); // open at the tail
+                }
                 self.fleet_peek = Some(p.clone());
-                self.fleet_peek_scroll.set(usize::MAX); // open at the tail
                 self.dirty = true;
             }
             return; // UI-modal state; never session state
@@ -617,12 +628,12 @@ impl App {
     /// Request the walked segment's content. Live: ask the engine. Demo: no
     /// engine, so synthesize the reply from the segment's own metadata so the
     /// INSPECT peek overlay is fully exercised by the testbench.
-    fn request_peek(&mut self) {
+    fn request_peek(&mut self, full: bool) {
         let Some(id) = self.selected_seg_id() else {
             return;
         };
         if !self.demo {
-            self.send(Control::Peek { seg: id });
+            self.send(Control::Peek { seg: id, full });
             return;
         }
         let segs = viz::eff_segs(&self.st);
@@ -659,16 +670,30 @@ impl App {
                 file: sg.file,
                 excerpt,
                 truncated: false,
+                clip: 0,
+                n: sg.n.max(1),
             }));
+        }
+    }
+
+    /// Scroll the open peek by `delta` lines (render clamps). Scrolling a
+    /// clipped record is the ask for the rest of it: the engine is re-asked
+    /// in full once, so the reader just keeps scrolling.
+    fn peek_scroll_by(&mut self, delta: i64) {
+        let s = self.peek_scroll.get() as i64;
+        self.peek_scroll.set((s + delta).max(0) as usize);
+        if delta > 0 && !self.peek_full_asked && self.peek.as_ref().is_some_and(|p| p.truncated) {
+            self.peek_full_asked = true;
+            self.request_peek(true);
         }
     }
 
     /// Quicklook a fleet session (`space` on a tile): ask the engine for the
     /// conversation tail. Demo: no engine, so synthesize the reply from the
     /// roster entry so the overlay is fully exercised by the testbench.
-    fn request_fleet_peek(&mut self, sess: String) {
+    fn request_fleet_peek(&mut self, sess: String, full: bool) {
         if !self.demo {
-            self.send(Control::FleetPeek { session: sess });
+            self.send(Control::FleetPeek { session: sess, full });
             return;
         }
         let Some(s) = self.st.fleet.iter().find(|s| s.id == sess) else {
@@ -696,6 +721,8 @@ impl App {
                         .into(),
                 },
             ],
+            clip: 0,
+            truncated: false,
         }));
     }
 
@@ -900,15 +927,31 @@ impl App {
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') => self.peek = None,
                 KeyCode::Char('q') => self.quit(),
-                // j/k scroll the record (arrows stay parked for the walk)
-                KeyCode::Char('j') => {
-                    self.peek_scroll.set(self.peek_scroll.get().saturating_add(1));
+                // j/k and ↑/↓ scroll the record (←/→ stay parked for the walk);
+                // page keys and space jump; scrolling a clipped record fetches
+                // the rest of it
+                KeyCode::Char('j') | KeyCode::Down => self.peek_scroll_by(1),
+                KeyCode::Char('k') | KeyCode::Up => self.peek_scroll_by(-1),
+                KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('d') => {
+                    self.peek_scroll_by(20)
                 }
-                KeyCode::Char('k') => {
-                    self.peek_scroll.set(self.peek_scroll.get().saturating_sub(1));
-                }
+                KeyCode::PageUp | KeyCode::Char('u') => self.peek_scroll_by(-20),
                 KeyCode::Char('g') => self.peek_scroll.set(0),
-                KeyCode::Char('G') => self.peek_scroll.set(usize::MAX), // render clamps
+                KeyCode::Char('G') => {
+                    self.peek_scroll.set(usize::MAX); // render clamps
+                    self.peek_scroll_by(0);
+                    if self.peek.as_ref().is_some_and(|p| p.truncated) && !self.peek_full_asked {
+                        self.peek_full_asked = true;
+                        self.request_peek(true);
+                    }
+                }
+                // f: the whole record — re-ask the engine with the clip lifted
+                KeyCode::Char('f') => {
+                    if self.peek.as_ref().is_some_and(|p| p.truncated) {
+                        self.peek_full_asked = true;
+                        self.request_peek(true);
+                    }
+                }
                 _ => {}
             }
             return;
@@ -945,6 +988,17 @@ impl App {
                 }
                 KeyCode::Char('g') => self.fleet_peek_scroll.set(0),
                 KeyCode::Char('G') => self.fleet_peek_scroll.set(usize::MAX),
+                // f: the whole tail — re-ask with the per-message clip lifted
+                KeyCode::Char('f') => {
+                    if let Some(id) = self
+                        .fleet_peek
+                        .as_ref()
+                        .filter(|p| p.truncated)
+                        .map(|p| p.id.clone())
+                    {
+                        self.request_fleet_peek(id, true);
+                    }
+                }
                 KeyCode::Enter => {
                     if let Some(p) = self.fleet_peek.take() {
                         self.clear_replay_for_attach();
@@ -984,7 +1038,7 @@ impl App {
                             .get(self.fleet_sel)
                             .map(|s| s.id.clone());
                         if let Some(sess) = target {
-                            self.request_fleet_peek(sess);
+                            self.request_fleet_peek(sess, false);
                         }
                     }
                     KeyCode::Char('x') => {
@@ -1124,12 +1178,12 @@ impl App {
                                         self.st.push_log(format!("$EDITOR ← {path}"));
                                         self.pending_editor = Some(path);
                                     }
-                                    None => self.request_peek(),
+                                    None => self.request_peek(false),
                                 }
                                 true
                             }
                             KeyCode::Char('p') => {
-                                self.request_peek();
+                                self.request_peek(false);
                                 true
                             }
                             KeyCode::Esc => {
@@ -1529,12 +1583,7 @@ impl App {
                 (i + 1).min(self.st.compactions.len().saturating_sub(1))
             });
         } else if self.peek.is_some() {
-            let s = self.peek_scroll.get();
-            self.peek_scroll.set(if up {
-                s.saturating_sub(3)
-            } else {
-                s.saturating_add(3) // render clamps to the record's end
-            });
+            self.peek_scroll_by(if up { -3 } else { 3 }); // render clamps
         } else if self.fleet_peek.is_some() {
             let s = self.fleet_peek_scroll.get();
             self.fleet_peek_scroll.set(if up {
@@ -1824,23 +1873,11 @@ struct Panes {
     footer: Option<Rect>,
     tier: Tier,
     big: bool,
-    too_small: bool,
 }
 
 fn layout(area: Rect) -> Panes {
     let (w, h) = (area.width, area.height);
-    if w < 14 || h < 6 {
-        return Panes {
-            ribbon: None,
-            tabs: None,
-            scrubber: None,
-            body: None,
-            footer: None,
-            tier: Tier::Compact,
-            big: false,
-            too_small: true,
-        };
-    }
+    // no floor: below 50×15 the gauge owns the screen at every size
     if w < 50 || h < 15 {
         return Panes {
             ribbon: None,
@@ -1850,7 +1887,6 @@ fn layout(area: Rect) -> Panes {
             footer: None,
             tier: Tier::Compact,
             big: true,
-            too_small: false,
         };
     }
     let tier = if w >= 110 && h >= 30 {
@@ -1877,7 +1913,6 @@ fn layout(area: Rect) -> Panes {
             footer: Some(footer),
             tier,
             big: false,
-            too_small: false,
         }
     } else {
         // ≥50×15: one primary pane per tab, 1-line ribbon, no scrubber
@@ -1896,7 +1931,6 @@ fn layout(area: Rect) -> Panes {
             footer: Some(footer),
             tier,
             big: false,
-            too_small: false,
         }
     }
 }
@@ -1914,15 +1948,6 @@ fn render_all(f: &mut Frame<'_>, app: &App) {
 
     let panes = layout(area);
     app.big_gauge.set(false);
-    if panes.too_small {
-        f.render_widget(
-            Paragraph::new("amtr\n≥14×6")
-                .style(viz::fg(viz::C_DIM))
-                .alignment(Alignment::Center),
-            area,
-        );
-        return;
-    }
     let ui = app.ui(panes.tier);
     app.big_gauge.set(panes.big && !app.big_blocks);
     if panes.big {
@@ -2627,6 +2652,7 @@ mod screenshots {
 
     fn seg(id: u64, c: &str, tok: u64, file: Option<u64>, born: u64, age_s: f64) -> Seg {
         Seg {
+            n: 1,
             id,
             cat: cat(c),
             tok,
@@ -2730,6 +2756,8 @@ mod screenshots {
             file,
             excerpt: excerpt.into(),
             truncated,
+            clip: 2000,
+            n: 1,
         }
     }
 
@@ -3043,7 +3071,7 @@ mod screenshots {
         wheel(&mut app, MouseEventKind::ScrollDown);
         assert_eq!(app.peek_scroll.get(), 3);
         let s = draw(&mut app, 110, 30);
-        assert!(s.contains("j/k scroll"), "scroll range footer missing:\n{s}");
+        assert!(s.contains("↕ "), "scroll range footer missing:\n{s}");
         app.peek_scroll.set(usize::MAX);
         let _ = draw(&mut app, 110, 30);
         assert!(app.peek_scroll.get() < usize::MAX, "render must clamp peek scroll");
@@ -3182,6 +3210,8 @@ mod screenshots {
             name: "late".into(),
             project: String::new(),
             msgs: vec![],
+            clip: 0,
+            truncated: false,
         }));
         assert!(app.fleet_peek.is_none(), "stale fleet_peek must be dropped");
     }
@@ -3204,7 +3234,7 @@ mod screenshots {
     }
 
     #[test]
-    fn big_number_and_too_small() {
+    fn big_number_at_every_size() {
         let mut app = demo_app();
         let s = draw(&mut app, 40, 12); // < 50×15 → big-number mode
         assert!(s.contains('%'), "big-number % missing:\n{s}");
@@ -3215,8 +3245,20 @@ mod screenshots {
         assert!(s.contains('%'), "blocks-theme % missing:\n{s}");
         app.on_key(KeyEvent::from(KeyCode::Tab)); // toggles back
         assert!(!app.big_blocks);
-        let s = draw(&mut app, 12, 5); // < 14×6 → centered floor message
-        assert!(s.contains("amtr"), "floor message missing:\n{s}");
+        // no floor: the tank shows however small the window gets
+        for (w, h) in [(13, 5), (6, 3), (3, 1), (1, 1)] {
+            let s = draw(&mut app, w, h);
+            assert!(app.big_gauge.get(), "tank must show at {w}×{h}");
+            assert!(!s.contains("≥14×6"), "floor message at {w}×{h}:\n{s}");
+        }
+        // percentage would cover half the window or more → bare number, no
+        // tank cells behind it
+        let s = draw(&mut app, 6, 1);
+        assert!(s.contains('%'), "bare % missing at 6×1:\n{s}");
+        assert!(!s.contains('█') && !s.contains('▌'), "tank behind 6×1 text:\n{s}");
+        // the readout drops what does not fit instead of clipping mid-number
+        let s = draw(&mut app, 2, 2);
+        assert!(!s.contains('%'), "clipped % readout at 2×2:\n{s}");
     }
 
     /// `p` over the big gradient tank dresses it in a random pride flag
@@ -3949,8 +3991,8 @@ mod screenshots {
             other => panic!("wrong variant: {other:?}"),
         }
         assert_eq!(
-            serde_json::to_string(&Control::Peek { seg: 3 }).unwrap(),
-            r#"{"type":"peek","seg":3}"#
+            serde_json::to_string(&Control::Peek { seg: 3, full: false }).unwrap(),
+            r#"{"type":"peek","seg":3,"full":false}"#
         );
 
         // SHELL wire row: desc:null parses, and a MISSING `ok` defaults TRUE
@@ -6008,6 +6050,8 @@ mod screenshots {
             file: Some(fid),
             excerpt: "x".into(),
             truncated: false,
+            clip: 0,
+            n: 1,
         });
         app.blink = true;
         let white_blink_on = count(&mut app, viz::rgb(viz::C_WHITE));
@@ -6045,7 +6089,7 @@ mod screenshots {
             .collect();
         assert_eq!(
             sent,
-            vec![r#"{"type":"peek","seg":3}"#.to_string()],
+            vec![r#"{"type":"peek","seg":3,"full":false}"#.to_string()],
             "Enter on a non-file chunk must peek exactly the walked seg"
         );
         press(&mut app, KeyCode::Right);
@@ -6125,9 +6169,11 @@ mod screenshots {
             "excerpt missing:\n{s}"
         );
         assert!(
-            s.contains("…truncated at 2000 chars"),
+            s.contains("…cut at 2000 chars · f full"),
             "truncation marker missing:\n{s}"
         );
+        // f re-asks the engine for the whole record (not in demo: the peek
+        // is synthesized unclipped there, so the key is a no-op)
         // the walk keys are parked while the overlay is open
         press(&mut app, KeyCode::Right);
         assert_eq!(app.inspect_idx, 3, "overlay must park the walk keys");

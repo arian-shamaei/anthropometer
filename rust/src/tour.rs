@@ -243,7 +243,7 @@ impl Stop {
                 } else if k == n {
                     if let Some(s) = live.get(app.fleet_sel.min(n - 1)) {
                         let id = s.id.clone();
-                        app.request_fleet_peek(id);
+                        app.request_fleet_peek(id, false);
                     }
                 } else if k == cycle - 1 {
                     app.fleet_peek = None;

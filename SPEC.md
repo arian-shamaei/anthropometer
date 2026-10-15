@@ -112,7 +112,15 @@ subtype / tool name. Token sources per record:
   else `tool`. Prefer `toolUseResult.file.content` length when present (structured,
   exact); image results 1200 each. `text` blocks containing `<system-reminder>` →
   `attach`.
-- `attachment`: → `attach`.
+- `attachment`: → `attach`, sized by what the model saw: the record's `rendered`
+  text when the CLI wrote one (every attachment it sent carries it); known
+  bookkeeping types without one (`hook_success`, `prompt_snapshot`,
+  `batching_reminder_sent`, `deferred_tools_record`, `hook_cancelled`,
+  `hook_system_message`, `credential_org`, `command_permissions`) weigh 0 and are
+  still counted; otherwise (older CLIs, no `rendered` anywhere) the attachment JSON.
+  Measured on a 2.1.296 transcript: half of all attachment bytes were bookkeeping.
+  Each attach seg remembers its attachment type (`sub`) for the `cats.attach`
+  breakdown.
 - `system`/`compact_boundary`: see compaction. Other system subtypes are events,
   not context (they cost ~0; do not allocate).
 - The post-compaction `user` record with `isCompactSummary:true` → `summary`.
@@ -138,7 +146,9 @@ injected into the parent. `amp = own_tok / max(1, ret_tok)`.
 
 Weight rules: no file contents ever cross the wire; paths sent once and interned
 (`files` upserts introduce integer `id`; every other message references files by
-id); `map` ≤ 1024 segs (merge smallest adjacent same-cat/same-file first);
+id); `map` ≤ 1024 segs (merge smallest adjacent same-cat/same-file first; the
+merged seg carries `n` and the engine keeps its member ids, so nothing merged
+becomes unreachable — `peek` answers with all of them);
 per-event messages < 200 bytes typical. The engine MUST emit a fresh coalesced
 `map` (rev+1) BEFORE the UI-side ring (1024+overhead) would overflow — i.e.
 whenever `base_segs + map_add segs since the last rebuild ≥ 1024` — not only at
@@ -156,7 +166,7 @@ strings on the wire ("HH:MM:SS") are UTC, including engine-synthesized events.
 | `map_add` | `rev:int, segs:[Seg]` | appended segments between rebuilds (same rev) |
 | `files` | `upserts:[File]` | change-detected batches, ≤ 1/tick |
 | `faccess` | `turn:int, ts:str, file:int, op:"r"\|"w"\|"e", tok:int` | one per file access |
-| `cats` | `totals:{cat:int}` | change-detected |
+| `cats` | `totals:{cat:int}, attach:{type:int}, attach_n:{type:int}` | change-detected; `attach` = resident attach tokens by attachment type (0 = seen, never sent), `attach_n` = records seen per type (additive fields) |
 | `compaction` | `n:int, turn:int, ts, trigger:"auto"\|"manual", pre:int, post:int, dropped:int, cum_dropped:int, dur_ms:int, dropped_cats:{cat:int}, dropped_files:[{file:int,tok:int}]≤16, preserved_msgs:int` | per compact_boundary |
 | `agent` | `id:str, state:"running"\|"done"\|"failed", agent_type?, desc?, wf?:str, path?:str, turn0:int, ts0:str, t0:float, ts_last:float, turn1?:int, own_tok:int, ret_tok?:int, tools?:{r:int,s:int,b:int,e:int}, dur_ms?:int, map?:{resident:int, budget:int, segs:[{cat,tok,file}]}` | upsert per lifecycle change (also on own_tok growth); `t0`/`ts_last` = epoch UTC of launch / newest own-transcript activity, 0 = unknown; `path` = the agent's own transcript (drill-in target), absent until dir-scanned; `map` = the agent's OWN context map — its sidechain transcript parsed through a Session (`sidechain_ok`) and laid out via `build_map_segs`, carrying the agent's own `resident`/`budget` so the mini-map renders on its own fixed budget scale (stripped `Seg`: `{cat,tok,file}` only, no id/born/ts). Built cached by (path,mtime) — never re-parsed while unchanged. Omitted (null) for an empty/unparseable transcript |
 | `cmd` | `turn:int, ts:str, epoch:float, cmd:str(≤240), desc:str\|null, out:str(≤600), err:str(≤300), ok:bool, interrupted:bool, bg:bool, tok_out:int` | one per completed Bash execution (the SHELL console feed). `cmd` is the command's head, `out`/`err` are TAILS of stdout/stderr with control characters stripped (ESC sequences, \r) — truncation is engine-side, marked with a leading `…` when cut; `tok_out` = estimated tokens of the FULL result as charged to context (ties the console to context cost); `bg` = backgrounded. Never anything but Bash — file tools stay in FILES |
@@ -167,8 +177,8 @@ strings on the wire ("HH:MM:SS") are UTC, including engine-synthesized events.
 | `fleet` | `sessions:[Sess]` | change-detected roster refresh (~2 s scan) |
 | `snapshot` | `turn:int, resident:int, waterline:int, cc:int, map:Map, files:[File], cats:{cat:int}, agents:[Agent], tasks:Tasks` | reply to `seek` (latest-wins); `resident/waterline/cc` are that turn's values so replay renders (cache mode, MAP fill) never fall back to live numbers |
 | `report_done` | `ok:bool, path:str, msg:str` | reply to `report`: the report was written to `path` (the UI flashes it in the footer) |
-| `peek` | `seg:int, found:bool, cat:str, kind:str\|null, uuid:str\|null, born:int, est:int, tok:int, file:int\|null, excerpt:str(≤2000), truncated:bool` | reply to `peek`: the segment's underlying record content, sanitized (control chars stripped) and clipped — the ONE sanctioned exception to the no-content wire rule, bounded and on-demand. `kind` = the record type (user/assistant/attachment/…); the overhead segment answers `kind:"overhead"` with an explainer excerpt (system prompt + tool schemas + skills are server-side and unmeasurable per-item); a segment that no longer exists (evicted/unknown) answers `found:false` |
-| `fleet_peek` | `id:str, found:bool, name:str, project:str, msgs:[{role:"user"\|"assistant", text:str(≤700)}]` | reply to `fleet_peek`: the conversation TAIL of a roster session (attached or not) — the last user/assistant text messages from its transcript's final 256 KB, oldest first. Tool results, meta records and harness wrappers (command echoes, system reminders — filtered per block) are skipped; consecutive same-role records merge. Same bounded content-exception status as `peek`; an unreadable/absent transcript answers `found:false` |
+| `peek` | `seg:int, found:bool, cat:str, kind:str\|null, uuid:str\|null, born:int, est:int, tok:int, file:int\|null, excerpt:str, truncated:bool, clip:int, n:int` | reply to `peek`: the segment's underlying record content, sanitized (control chars stripped) and clipped to `clip` chars (2000; a `full:true` request lifts it: `clip:0`, never `truncated`) — the ONE sanctioned exception to the no-content wire rule, bounded and on-demand. A merged map seg (`Seg.n` > 1) answers `kind:"merged"` with EVERY member record in order, each under a `── #id cat kind · born t · tok ──` header, `n` = member count: coalescing never makes a record unreachable. `kind` = the record type (user/assistant/attachment/…); the overhead segment answers `kind:"overhead"` with an explainer excerpt (system prompt + tool schemas + skills are server-side and unmeasurable per-item); a segment that no longer exists (evicted/unknown) answers `found:false` |
+| `fleet_peek` | `id:str, found:bool, name:str, project:str, msgs:[{role:"user"\|"assistant", text:str}], clip:int, truncated:bool` | reply to `fleet_peek` (`text` clipped to `clip` chars per message, 700; `full:true` lifts it to 0; `truncated` = some message was clipped): the conversation TAIL of a roster session (attached or not) — the last user/assistant text messages from its transcript's final 256 KB, oldest first. Tool results, meta records and harness wrappers (command echoes, system reminders — filtered per block) are skipped; consecutive same-role records merge. Same bounded content-exception status as `peek`; an unreadable/absent transcript answers `found:false` |
 | `log` | `msg:str` | anything unexpected |
 
 Sub-objects:
@@ -179,7 +189,8 @@ Sub-objects:
   locator when the session is tmux-hosted; front ends may use it to focus the
   session (amtrino's notification click)
 - `Seg  = {id:int, cat:str, tok:int, file:int|null, born:int (turn), ts:float (epoch
-  of last access)}`
+  of last access), n?:int}` — `n` > 1 marks a merged seg (coalesced at the ≤1024
+  cap): the plurality owner's cat/file/id, and `peek` on it answers for every member
 - `Fit  = {active:bool, mode:"cats"|"scale"|"prior", reason:str, turns:int,
   prior_cpt:float, cpt?:{cat:float}, fitted_cats?:[str], clamped?:[str],
   overhead?:int, r2?:float, rms_pct?:float, mae_pct?:float,
@@ -204,11 +215,11 @@ Ordering per attach: `meta` → `map` → `backfill` → `ready` → incremental
 |---|---|---|
 | `attach` | `session:str` (id or path; agent transcript paths under `subagents/` are valid — the engine parses them as MAIN despite `isSidechain:true` records, titling the session from the agent's meta description) | detach current, backfill new, re-`ready` |
 | `seek` | `turn:int` | **latest-wins**: engine coalesces (only newest pending seek is answered); reply is one `snapshot`; live tailing never pauses |
-| `peek` | `seg:int` | on-demand content inspection (MAP INSPECT mode): the engine re-reads the segment's record from disk and replies with one `peek`. Explicit-request-only (sent on Enter, never per-cursor-move), so no coalescing is needed |
+| `peek` | `seg:int, full?:bool` | on-demand content inspection (MAP INSPECT mode): the engine re-reads the segment's record from disk and replies with one `peek`. Explicit-request-only (sent on Enter, never per-cursor-move), so no coalescing is needed. `full:true` (the `f` key on a clipped overlay) lifts the excerpt clip |
 | `live` | — | leave replay; engine stops answering stale seeks |
 | `report` | — | write a ground-truth report (§f) of the ATTACHED session — the live engine already has it parsed, so it is instant — to `~/.claude/amtr-reports/<name>-<id8>/report.md`; replies `report_done`. Then, if a paper builder exists (a sibling `amtr_paper.py` whose deps import, else `amtr-paper` on PATH — the plugin split), spawn it detached to fill in the PDF/figures, its output logged to `paper.log` in the report dir; if none exists, `report_done.msg` names the missing plugin (`pip install amtr-paper`). Bound to `R` in the TUI (one-key, seamless) |
 | `set` | `key:str, value` | `chars_per_tok:float` (the global prior/fallback), `fit:0\|1` (per-category ratio fit on/off), `poll_ms:int`, `t_auto:float`; unknown keys silently ignored |
-| `fleet_peek` | `session:str` | quicklook a roster session (SESSIONS/SYSTEM-WIDE `space`): the engine reads the session's transcript tail and replies with one `fleet_peek`. Explicit-request-only, like `peek` |
+| `fleet_peek` | `session:str, full?:bool` | quicklook a roster session (SESSIONS/SYSTEM-WIDE `space`): the engine reads the session's transcript tail and replies with one `fleet_peek`. Explicit-request-only, like `peek`; `full:true` (the `f` key) lifts the per-message clip |
 | `sess_kill` | `session:str` | end a fleet session: SIGTERM its roster pid (the polite signal — Claude Code shuts down cleanly; never -9). Roster-verified: a dead/absent pid answers with a `log` line instead. Confirmed UI-side before sending |
 | `fleet_refresh` | — | force roster rescan |
 | `quit` | — | cooperative shutdown; stdin EOF is the equivalent fallback |
@@ -357,7 +368,9 @@ toggles a second theme: the OVERVIEW MAP's colored content cells instead of
 the tank, bare — free space stays terminal background — filling in the tank's
 orientation (tall bottom-up, flat left-to-right), budget spanning the whole
 area so the painted fraction IS the fullness; the corner readout overlays on
-an app-bg scrim) · <14×6 centered `amtr ≥14×6`.
+an app-bg scrim) · no size floor: the gauge shows at every size, the readout
+dropping the name, then the number, when they do not fit; where the number
+would cover half the window or more (e.g. 6×1) it shows alone, no background.
 
 ### Tab 1 OVERVIEW — MAP + EKG
 
@@ -411,8 +424,19 @@ segment's identity
 chunk opens it in `$EDITOR` (suspend/resume), on any other chunk it requests
 `peek`; `p` requests `peek` unconditionally (the in-context copy can differ
 from disk). The peek overlay shows the record's actual text (excerpt, wrapped;
-`…` marks the clip; `found:false` renders "evicted — no longer in the
-transcript window"). Esc closes the overlay, then exits INSPECT; the turn
+`…` marks the view clip; the footer says `…truncated at N chars · f full` when
+the engine clipped, and `f` re-asks with `full:true` for the whole record,
+keeping the reader's scroll; `found:false` renders "evicted — no longer in the
+transcript window"). Scrolling (`j/k`, `↑/↓`, page keys, the wheel) a clipped
+record asks for the rest of it once, so the reader just keeps scrolling. The
+body is the record's own formatting, rendered: ANSI SGR color where the record
+carries it (the engine keeps `ESC[…m` in peek excerpts and strips every other
+control), light markdown where it does not (headings, bullets, `code`,
+**bold**, fences, `<tag>` lines dim), and a bracketed structure (JSON, a dict
+repr) that overflows the width unfolds one element per line with its keys
+tinted. Text is only ever styled or reflowed, never dropped. A merged segment
+(`×n records` in the identity row) answers with every member record under its
+own header. Esc closes the overlay, then exits INSPECT; the turn
 cursor keys are captured by INSPECT while it is active (`←/→` walk segments,
 not turns). Works in replay (the snapshot's segs carry the same ids).
 
@@ -819,12 +843,27 @@ are built (TUI picker included):
   (1,048,576; 256k for Gemma 4), `last_prompt` = last user text. Recent
   offline transcripts of both providers (Codex: last 30 day-dirs; Gemini:
   newest 60) join the roster as `offline` rows so they can be attached.
+  OpenCode: its sessions live in SQLite (`~/.local/share/opencode/
+  opencode.db`), not in files, so the engine MIRRORS each of the newest 60
+  top-level sessions into `~/.cache/amtr/opencode/<sid>.jsonl` (derived,
+  append-only; section f3) and the roster reads the database directly:
+  status is busy while the newest message is a user prompt or an
+  assistant message without `time.completed`, else idle; `resident` = the
+  last `step-finish` input + cache read + cache write; `budget` = the
+  model's `limit.context` from the user's `opencode.json`, else the
+  models.dev catalog the CLI caches; `last_prompt` = the last user text
+  part. Pairing law: each live `opencode` process claims the newest
+  unclaimed session whose `directory` is the process cwd and whose last
+  update is not older than the process start; every other session is an
+  `offline` row. Facts are cached per session by `time_updated`, so a
+  quiet database costs one query per tick.
 
-## (f3) Providers → attach — one accounting core, three transcript formats
+## (f3) Providers → attach — one accounting core, four transcript formats
 
 A `Session` detects its provider from the path (`/.codex/`, `rollout-*` ·
-`/.gemini/` + `session-*`) or the first line (`session_meta` · a
-`sessionId`+`projectHash` metadata line) and, for a non-Claude provider,
+`/.gemini/` + `session-*` · `ses_*` under an `opencode` dir) or the first
+line (`session_meta` · a `sessionId`+`projectHash` metadata line · a
+`session` row tagged `provider: opencode`) and, for a non-Claude provider,
 feeds every raw line through a stateful, deep-copyable ADAPTER that emits
 Claude-shaped records (`user` · `assistant` · `attachment` · `system
 compact_boundary` · `provider_meta` · `provider_event`) which `feed_obj`
@@ -833,7 +872,7 @@ replay/seek resumes mid-stream; `state_at_turn` replays raw lines through
 `translate()` and stops on the first emitted record that would open a turn
 past the target (the Claude law).
 
-**Ordering law (both adapters):** the usage record OPENS the turn first,
+**Ordering law (every adapter):** the usage record OPENS the turn first,
 then the response's content records (each with its OWN uuid — compaction
 survivors match by uuid), then the tool_result records; content is held
 until the request's usage is known, so allocations always land in the turn
@@ -883,11 +922,65 @@ survivors are the ids before it. `budget` = `tokenLimit(model)`. The
 recording never names its project: `~/.gemini/tmp/<short>/.project_root`
 (else the registry inverse) fills it at attach.
 
+**OpenCode** (`~/.cache/amtr/opencode/<sid>.jsonl`, a MIRROR the engine
+writes from the CLI's SQLite rows — `session` / `message` / `part`, a part
+UPDATED in place while it streams — never hand-edited, the database wins):
+a row joins the mirror only once it is final — a user part at once, an
+assistant message's parts as the bundle its `step-finish` closes, the
+leftovers under `message_done` when the message completes — and the mirror
+is rebuilt whole whenever it stops being a prefix of the rows the database
+yields (a tailing engine then re-attaches). `opencode_rows()` is pure: one
+database state ⇒ one row list, in final-time order. Rows: `session` →
+provider_meta (id, directory = cwd, version, title; a `parent_id` marks a
+subagent) + budget (`opencode_budget`: the model's `limit.context` from
+`opencode.json`, else the cached models.dev catalog); `message` → the
+role of its parts and the assistant model; a user `text` part → user
+(`synthetic`/`ignored` ones → attach), a `file` part → attach; one
+`step-finish` = one turn: `in = tokens.input`, `cr = cache.read`, `cc =
+cache.write`, `out = output + reasoning`, `tokens.reasoning` → the turn's
+authoritative `think` (hidden reasoning is then the billed count minus the
+reasoning text seen — zero for a model that returns its thoughts, as Qwen
+does, instead of `out − visible` and its tokenizer slack); assistant
+`text` → assistant, `reasoning` → thinking, a finished `tool` part → tool_use + tool_result:
+`read` → Read (the output is the file copy), `write` → Write,
+`edit`/`multiedit`/`patch` → Edit, `bash` → Bash (`metadata.exit` is the
+status, the output the stdout → SHELL), `glob`/`grep`/`list` → Glob/Grep/LS,
+`webfetch`/`websearch` → WebFetch/WebSearch, `task` → a Task agent whose
+id is `metadata.sessionId` (the child session, mirrored and tailed like a
+parent; a trailing message without its `message_done` ⇒ running); a
+`message_done` with `error` → an `api_error` event. Compaction: a
+`compaction` part on the user message that asks for it (`auto`,
+`tail_start_id`) → a compact_boundary whose survivors are every record of
+the messages from `tail_start_id` on (`pre` = R at the cut, `post` = the
+kept tail's estimate); the assistant message marked `summary: true` (agent
+`compaction`) that follows is a real request (its own turn) whose text
+lands after the cut as `summary`.
+
+**The preamble, itemized (the proxy, for OpenCode too).** OpenCode's
+database never holds the request preamble (its system prompt, the `<env>`
+block, every `Instructions from:` file it loaded, the `<available_skills>`
+listing, the tool schemas) — but its base URL is the user's to set, so one
+prompt sent through `amtr_engine.py --proxy` (`OPENCODE_CONFIG_CONTENT`
+overriding the provider's `baseURL`, no config edit) records the request's
+COMPOSITION: `parts` = each system section split at the CLI's own markers
+(`Instructions from: <path>` · `<env>` · `<available_skills>`, N skills
+counted) and each tool schema by name, sized in wire chars, plus the
+history slab; `last_user_sha` fingerprints the prompt so the overhead peek
+(seg 0) pairs the capture to the session that sent it at any age (the
+newest-by-model rule within 15 min remains the fallback). The peek then
+lists every part scaled by the one measured chars/token ratio, and with
+`AMTR_PROXY_BODIES=1` each part is also a file under
+`~/.claude/amtr-proxy/parts/<ts>/` (`NN-system.txt`, `NN-tool-<name>.json`,
+`NN-history.json`) — the preamble read, not inferred. A client whose base
+URL already ends in `/v1` (OpenAI-style SDKs) is relayed without doubling it.
+
 Everything downstream — MAP, INSPECT peek, REPLAY, FILES, TURNS, SHELL,
 RETRIEVAL, EVENTS, post-mortems, AGENTS drill-in, quicklook tails
 (`_provider_tail_msgs`), the report — is provider-blind. Fixtures:
-`tests/fixtures/codex-rollout.jsonl`, `tests/fixtures/gemini-session.jsonl`
-(real recorder shapes, synthetic content); tests in `TestProviders`.
+`tests/fixtures/codex-rollout.jsonl`, `tests/fixtures/gemini-session.jsonl`,
+`tests/fixtures/opencode-session.jsonl` (real recorder shapes, synthetic
+content); tests in `TestProviders` (the OpenCode mirror builder runs
+against a throwaway SQLite database there).
 
 ## (g) Demo / visual-testbench mode
 

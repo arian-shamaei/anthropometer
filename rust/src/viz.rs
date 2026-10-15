@@ -1333,6 +1333,10 @@ pub fn render_inspect_line(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
         spans.push(Span::styled(tail_trunc(&path, 36), fg(hue_of(st, fid))));
     }
     spans.push(Span::styled(format!(" · born t{}", sg.born), fg(C_DIM)));
+    if sg.n > 1 {
+        // a merged seg: the walk shows the plurality owner, the peek shows all
+        spans.push(Span::styled(format!(" · ×{} records", sg.n), fg(C_DIM)));
+    }
     if sg.cat == Cat::Overhead || alpha <= 0.0 {
         // overhead is measured (R − Σest), not estimator-derived: no ×α story
         spans.push(Span::styled(format!(" · {} tok", fmt_k1(sg.tok)), fg(C_FG)));
@@ -1353,9 +1357,11 @@ pub fn render_inspect_line(st: &State, ui: &Ui, f: &mut Frame<'_>, area: Rect) {
 
 /// PEEK overlay (INSPECT `Enter`): the record's ACTUAL text, served on
 /// demand by the engine. Centered ~76 cols; the excerpt splits on `\n` and
-/// soft-wraps; a dim `…` line marks a view clip and `…truncated` marks the
-/// engine's 2000-char cap. `found:false` renders the eviction notice; the
-/// overhead segment's answer is the engine's explainer excerpt.
+/// soft-wraps; a dim `…` line marks a view clip and `…cut at N chars ·
+/// f full` marks the engine's clip (the `f` key re-asks unclipped).
+/// `found:false` renders the eviction notice; the overhead segment's answer
+/// is the engine's explainer excerpt; a merged seg's answer carries every
+/// member record under its own header line.
 pub fn render_peek_overlay(
     st: &State,
     p: &PeekMsg,
@@ -1372,7 +1378,11 @@ pub fn render_peek_overlay(
     // header: `#id cat kind · born tN · est → tok`
     let kind = p.kind.clone().unwrap_or_else(|| "?".into());
     let mut head: Vec<Span<'static>> = vec![Span::styled(
-        format!(" #{} {} {}", p.seg, p.cat.label(), kind),
+        if p.n > 1 {
+            format!(" #{} {} ×{} records", p.seg, p.cat.label(), p.n)
+        } else {
+            format!(" #{} {} {}", p.seg, p.cat.label(), kind)
+        },
         fg(cat_color(p.cat)).add_modifier(Modifier::BOLD),
     )];
     head.push(Span::styled(
@@ -1404,16 +1414,17 @@ pub fn render_peek_overlay(
     } else if p.excerpt.is_empty() {
         body.push(Line::styled(" (empty record)".to_string(), fg(C_DIM)));
     } else {
-        for raw in p.excerpt.split('\n') {
-            for chunk in wrap_line(raw, text_w) {
-                body.push(Line::styled(format!(" {chunk}"), fg(C_FG)));
-            }
+        // the record's own formatting, rendered (ANSI SGR, light markdown)
+        for mut line in rich_lines(&p.excerpt, text_w) {
+            line.spans.insert(0, Span::raw(" "));
+            body.push(line);
         }
     }
     // shared pane: scroll clamp, footer range, position bar all uniform
     let mut foot = String::from(" esc close");
     if p.truncated {
-        foot.push_str(" · …truncated at 2000 chars");
+        let clip = if p.clip > 0 { p.clip } else { 2000 };
+        foot.push_str(&format!(" · …cut at {clip} chars · f full"));
     }
     render_pane(
         &PaneFrame {
@@ -3768,6 +3779,487 @@ fn last_line(s: &str) -> Option<&str> {
 /// byte-for-byte — only the one break space is swallowed. Every popup and
 /// lane view wraps through here; the old char-chunking split words across
 /// lines ("th/e", "s/ame").
+// ---------------------------------------------------------------------------
+// PEEK rich text: the record's own formatting, rendered
+// ---------------------------------------------------------------------------
+
+/// One styled run of record text (the unit `rich_lines` wraps).
+#[derive(Debug, Clone, PartialEq)]
+struct Run {
+    text: String,
+    style: Style,
+}
+
+/// ANSI SGR state carried across a record's lines (a shell's color does not
+/// reset at a newline).
+#[derive(Debug, Clone, Copy)]
+struct Sgr {
+    fg: Option<Color>,
+    bg: Option<Color>,
+    mods: Modifier,
+}
+
+impl Sgr {
+    fn new() -> Self {
+        Sgr { fg: None, bg: None, mods: Modifier::empty() }
+    }
+    fn style(&self, base: Style) -> Style {
+        let mut s = base.add_modifier(self.mods);
+        if let Some(c) = self.fg {
+            s = s.fg(c);
+        }
+        if let Some(c) = self.bg {
+            s = s.bg(c);
+        }
+        s
+    }
+    fn is_plain(&self) -> bool {
+        self.fg.is_none() && self.bg.is_none() && self.mods.is_empty()
+    }
+    /// Apply one `ESC[...m` parameter list.
+    fn apply(&mut self, params: &str) {
+        let ps: Vec<u16> = if params.is_empty() {
+            vec![0]
+        } else {
+            params.split(';').map(|p| p.parse().unwrap_or(0)).collect()
+        };
+        let mut i = 0;
+        while i < ps.len() {
+            let p = ps[i];
+            match p {
+                0 => *self = Sgr::new(),
+                1 => self.mods |= Modifier::BOLD,
+                2 => self.mods |= Modifier::DIM,
+                3 => self.mods |= Modifier::ITALIC,
+                4 => self.mods |= Modifier::UNDERLINED,
+                7 => self.mods |= Modifier::REVERSED,
+                9 => self.mods |= Modifier::CROSSED_OUT,
+                22 => self.mods.remove(Modifier::BOLD | Modifier::DIM),
+                23 => self.mods.remove(Modifier::ITALIC),
+                24 => self.mods.remove(Modifier::UNDERLINED),
+                27 => self.mods.remove(Modifier::REVERSED),
+                29 => self.mods.remove(Modifier::CROSSED_OUT),
+                30..=37 => self.fg = Some(Color::Indexed((p - 30) as u8)),
+                90..=97 => self.fg = Some(Color::Indexed((p - 90 + 8) as u8)),
+                39 => self.fg = None,
+                40..=47 => self.bg = Some(Color::Indexed((p - 40) as u8)),
+                100..=107 => self.bg = Some(Color::Indexed((p - 100 + 8) as u8)),
+                49 => self.bg = None,
+                38 | 48 => {
+                    let c = match ps.get(i + 1) {
+                        Some(5) => {
+                            let n = ps.get(i + 2).copied().unwrap_or(0) as u8;
+                            i += 2;
+                            Some(Color::Indexed(n))
+                        }
+                        Some(2) => {
+                            let r = ps.get(i + 2).copied().unwrap_or(0) as u8;
+                            let g = ps.get(i + 3).copied().unwrap_or(0) as u8;
+                            let b = ps.get(i + 4).copied().unwrap_or(0) as u8;
+                            i += 4;
+                            Some(Color::Rgb(r, g, b))
+                        }
+                        _ => None,
+                    };
+                    if c.is_some() {
+                        if p == 38 {
+                            self.fg = c;
+                        } else {
+                            self.bg = c;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Split one line on `ESC[...m` sequences into styled runs, carrying `sgr`
+/// across calls. Returns the runs and whether any SGR was seen on the line.
+fn sgr_runs(line: &str, sgr: &mut Sgr, base: Style) -> (Vec<Run>, bool) {
+    let mut runs: Vec<Run> = Vec::new();
+    let mut cur = String::new();
+    let mut seen = false;
+    let mut rest = line;
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix("\u{1b}[") {
+            if let Some(end) = r.find(|ch: char| ch.is_ascii_alphabetic()) {
+                let params = &r[..end];
+                let term = r[end..].chars().next().unwrap_or('m');
+                rest = &r[end + term.len_utf8()..];
+                if term == 'm' {
+                    seen = true;
+                    if !cur.is_empty() {
+                        runs.push(Run { text: std::mem::take(&mut cur), style: sgr.style(base) });
+                    }
+                    sgr.apply(params);
+                }
+                continue;
+            }
+        }
+        let c = rest.chars().next().unwrap_or(' ');
+        cur.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    if !cur.is_empty() || runs.is_empty() {
+        runs.push(Run { text: cur, style: sgr.style(base) });
+    }
+    (runs, seen)
+}
+
+/// A bracketed structure (JSON, a Python dict/list repr) printed on one
+/// line wraps mid-key; unfold it one element per line, indented by depth,
+/// the way a pretty-printer would. Only when the line overflows `w` and the
+/// brackets balance; text is reflowed, never dropped.
+fn unfold_structure(line: &str, w: usize) -> Option<String> {
+    if line.chars().count() <= w || !line.contains(['{', '[']) || !line.contains(',') {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
+    let mut esc = false;
+    for c in line.chars() {
+        match quote {
+            Some(q) => {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '{' | '[' => depth += 1,
+                '}' | ']' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return None;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    if depth != 0 || quote.is_some() {
+        return None;
+    }
+    let mut out = String::new();
+    let mut depth = 0usize;
+    quote = None;
+    esc = false;
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    let nl = |out: &mut String, d: usize| {
+        out.push('\n');
+        out.push_str(&"  ".repeat(d));
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            out.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            '{' | '[' => {
+                // an empty pair stays inline
+                let close = if c == '{' { '}' } else { ']' };
+                if chars.get(i + 1) == Some(&close) {
+                    out.push(c);
+                    out.push(close);
+                    i += 2;
+                    continue;
+                }
+                depth += 1;
+                out.push(c);
+                nl(&mut out, depth);
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                nl(&mut out, depth);
+                out.push(c);
+            }
+            ',' => {
+                out.push(c);
+                nl(&mut out, depth);
+                // swallow the space that followed the comma inline
+                if chars.get(i + 1) == Some(&' ') {
+                    i += 1;
+                }
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+/// Tint a `'key':` / `"key":` prefix on a structure line (the unfolded
+/// form above, or a pretty-printed JSON record from the engine).
+fn key_runs(line: &str, base: Style) -> Option<Vec<Run>> {
+    let trimmed = line.trim_start();
+    let q = trimmed.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    let end = trimmed[1..].find(q)? + 1;
+    if !trimmed[end + 1..].starts_with(':') {
+        return None;
+    }
+    let indent = line.len() - trimmed.len();
+    Some(vec![
+        Run { text: line[..indent].to_string(), style: base },
+        Run { text: trimmed[..=end].to_string(), style: base.fg(rgb(C_STEEL)) },
+        Run { text: trimmed[end + 1..].to_string(), style: base },
+    ])
+}
+
+/// Light markdown for a plain line: a heading is bold white, a bullet gets
+/// the dot, `code` and **bold** inside the line are styled, a `<tag>` line
+/// is dim, and lines inside a ``` fence are code-tinted. Never a
+/// transformation that hides text.
+fn md_runs(line: &str, in_fence: &mut bool, base: Style) -> Vec<Run> {
+    let code = base.fg(rgb((150, 175, 210)));
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("```") {
+        *in_fence = !*in_fence;
+        return vec![Run { text: line.to_string(), style: fg(C_DIM) }];
+    }
+    if *in_fence {
+        return vec![Run { text: line.to_string(), style: code }];
+    }
+    if trimmed.starts_with('<') && trimmed.ends_with('>') && !trimmed.contains(' ') {
+        return vec![Run { text: line.to_string(), style: fg(C_DIM) }];
+    }
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        if rest.starts_with('#') || rest.starts_with(' ') {
+            return vec![Run {
+                text: line.to_string(),
+                style: fg(C_WHITE).add_modifier(Modifier::BOLD),
+            }];
+        }
+    }
+    if let Some(runs) = key_runs(line, base) {
+        return runs;
+    }
+    let mut out: Vec<Run> = Vec::new();
+    let mut body = line;
+    let indent = line.len() - trimmed.len();
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        out.push(Run { text: format!("{}• ", &line[..indent]), style: fg(C_STEEL) });
+        body = &trimmed[2..];
+    }
+    // inline: `code` and **bold**
+    let mut cur = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '`' {
+            let mut inner = String::new();
+            let mut closed = false;
+            for ch in chars.by_ref() {
+                if ch == '`' {
+                    closed = true;
+                    break;
+                }
+                inner.push(ch);
+            }
+            if closed && !inner.is_empty() {
+                if !cur.is_empty() {
+                    out.push(Run { text: std::mem::take(&mut cur), style: base });
+                }
+                out.push(Run { text: inner, style: code });
+            } else {
+                cur.push('`');
+                cur.push_str(&inner);
+            }
+        } else if c == '*' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut inner = String::new();
+            let mut closed = false;
+            let mut prev = '\0';
+            for ch in chars.by_ref() {
+                if ch == '*' && prev == '*' {
+                    inner.pop();
+                    closed = true;
+                    break;
+                }
+                inner.push(ch);
+                prev = ch;
+            }
+            if closed && !inner.is_empty() {
+                if !cur.is_empty() {
+                    out.push(Run { text: std::mem::take(&mut cur), style: base });
+                }
+                out.push(Run { text: inner, style: base.add_modifier(Modifier::BOLD) });
+            } else {
+                cur.push_str("**");
+                cur.push_str(&inner);
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(Run { text: cur, style: base });
+    }
+    out
+}
+
+/// Wrap styled runs to `w` columns, breaking at a space when one is in
+/// reach (the `wrap_line` rule), keeping every char's style.
+fn wrap_runs(runs: &[Run], w: usize) -> Vec<Line<'static>> {
+    let cells: Vec<(char, Style)> = runs
+        .iter()
+        .flat_map(|r| r.text.chars().map(move |c| (c, r.style)))
+        .collect();
+    let to_line = |seg: &[(char, Style)]| -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (c, st) in seg {
+            match spans.last_mut() {
+                Some(sp) if sp.style == *st => sp.content.to_mut().push(*c),
+                _ => spans.push(Span::styled(c.to_string(), *st)),
+            }
+        }
+        Line::from(spans)
+    };
+    if cells.is_empty() || w == 0 {
+        return vec![Line::from("")];
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < cells.len() {
+        if cells.len() - i <= w {
+            out.push(to_line(&cells[i..]));
+            break;
+        }
+        let win = &cells[i..i + w];
+        match win.iter().rposition(|(c, _)| *c == ' ') {
+            Some(p) if p > 0 => {
+                out.push(to_line(&cells[i..i + p]));
+                i += p + 1;
+            }
+            _ => {
+                out.push(to_line(win));
+                i += w;
+            }
+        }
+    }
+    out
+}
+
+/// The PEEK body: the record's text with its own formatting rendered —
+/// ANSI SGR color where the record carries it, light markdown where it
+/// does not — wrapped to `w` columns. Text is never dropped, only styled.
+pub fn rich_lines(excerpt: &str, w: usize) -> Vec<Line<'static>> {
+    let base = fg(C_FG);
+    let mut sgr = Sgr::new();
+    let mut in_fence = false;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for raw in excerpt.split('\n') {
+        let (runs, seen) = sgr_runs(raw, &mut sgr, base);
+        if seen || !sgr.is_plain() {
+            out.extend(wrap_runs(&runs, w));
+            continue;
+        }
+        let plain: String = runs.iter().map(|r| r.text.as_str()).collect();
+        match unfold_structure(&plain, w) {
+            Some(unfolded) if !in_fence => {
+                for l in unfolded.split('\n') {
+                    out.extend(wrap_runs(&md_runs(l, &mut in_fence, base), w));
+                }
+            }
+            _ => out.extend(wrap_runs(&md_runs(&plain, &mut in_fence, base), w)),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod rich_tests {
+    use super::*;
+
+    fn flat(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn sgr_color_renders_and_text_survives() {
+        let l = rich_lines("ok \u{1b}[31mFAIL\u{1b}[0m done", 80);
+        assert_eq!(flat(&l), "ok FAIL done");
+        let red = l[0].spans.iter().find(|s| s.content == "FAIL").unwrap();
+        assert_eq!(red.style.fg, Some(Color::Indexed(1)));
+        let tail = l[0].spans.iter().find(|s| s.content == " done").unwrap();
+        assert_eq!(tail.style.fg, Some(rgb(C_FG)));
+        // truecolor + bold, carried across a newline until reset
+        let l = rich_lines("\u{1b}[1;38;2;10;20;30mA\nB\u{1b}[0mC", 80);
+        assert_eq!(flat(&l), "A\nBC");
+        let b = l[1].spans.iter().find(|s| s.content == "B").unwrap();
+        assert_eq!(b.style.fg, Some(Color::Rgb(10, 20, 30)));
+        assert!(b.style.add_modifier.contains(Modifier::BOLD));
+        let c = l[1].spans.iter().find(|s| s.content == "C").unwrap();
+        assert_eq!(c.style.fg, Some(rgb(C_FG)));
+    }
+
+    #[test]
+    fn markdown_lite_styles_without_hiding_text() {
+        let src = "# Title\n- item with `code` and **bold**\n```\nlet x = 1;\n```\n<system-reminder>\nplain";
+        let l = rich_lines(src, 80);
+        assert_eq!(flat(&l), "# Title\n• item with code and bold\n```\nlet x = 1;\n```\n<system-reminder>\nplain");
+        assert!(l[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        let code = l[1].spans.iter().find(|s| s.content == "code").unwrap();
+        assert_eq!(code.style.fg, Some(rgb((150, 175, 210))));
+        let bold = l[1].spans.iter().find(|s| s.content == "bold").unwrap();
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(l[3].spans[0].style.fg, Some(rgb((150, 175, 210))), "fenced line is code-tinted");
+        assert_eq!(l[5].spans[0].style.fg, Some(rgb(C_DIM)), "tag line is dim");
+        assert_eq!(l[6].spans[0].style.fg, Some(rgb(C_FG)));
+        // an unclosed backtick is literal text
+        assert_eq!(flat(&rich_lines("a `b c", 80)), "a `b c");
+    }
+
+    #[test]
+    fn overflowing_structure_unfolds_one_key_per_line() {
+        let src = "user {'parentUuid': 707, 'message': {'a': 1, 'b': []}, 'slug': 95}";
+        let l = rich_lines(src, 30);
+        let text = flat(&l);
+        assert_eq!(
+            text,
+            "user {\n  'parentUuid': 707,\n  'message': {\n    'a': 1,\n    'b': []\n  },\n  'slug': 95\n}"
+        );
+        let key = l[1].spans.iter().find(|s| s.content == "'parentUuid'").unwrap();
+        assert_eq!(key.style.fg, Some(rgb(C_STEEL)));
+        // a short line, an unbalanced one, and a string with a brace stay as they are
+        assert_eq!(flat(&rich_lines(src, 200)), src);
+        assert_eq!(flat(&rich_lines("x {'a': 1, 'b': 2", 10)), "x {'a':\n1, 'b': 2");
+        let s2 = "say '{not, a dict}' then more words that overflow the width";
+        assert_eq!(flat(&rich_lines(s2, 20)).replace('\n', " "), s2);
+    }
+
+    #[test]
+    fn wrap_keeps_styles_across_the_break() {
+        let l = rich_lines("\u{1b}[32mgreen words here\u{1b}[0m and plain", 11);
+        assert_eq!(flat(&l), "green\nwords here\nand plain");
+        assert_eq!(l[1].spans[0].style.fg, Some(Color::Indexed(2)), "green carries past the break");
+        assert_eq!(l[2].spans.last().unwrap().style.fg, Some(rgb(C_FG)), "reset lands after it");
+    }
+}
+
 fn wrap_line(s: &str, w: usize) -> Vec<String> {
     if s.is_empty() || w == 0 {
         return vec![String::new()];
@@ -4502,14 +4994,15 @@ pub fn render_pane(pf: &PaneFrame<'_>, f: &mut Frame<'_>, area: Rect) {
     if max_scroll > 0 {
         const CELLS: usize = 8;
         let total = pf.body.len().max(1);
-        let range = format!("j/k scroll {}–{} of {} ", s + 1, end, total);
+        let range = format!("↕ {}–{} of {} ", s + 1, end, total); // j/k · ↑↓ · wheel
         let a = s * CELLS / total;
         let b = ((s + viewh) * CELLS).div_ceil(total).min(CELLS);
         let bar: String = (0..CELLS)
             .map(|i| if i >= a && i < b { '█' } else { '▂' })
             .collect();
         let pad = (inner.width as usize)
-            .saturating_sub(pf.footer.chars().count() + range.chars().count() + CELLS + 1);
+            .saturating_sub(pf.footer.chars().count() + range.chars().count() + CELLS + 1)
+            .max(1); // the footer text and the scroll hint never touch
         foot.push(Span::raw(" ".repeat(pad)));
         foot.push(Span::styled(range, fg(C_DIM)));
         foot.push(Span::styled(bar, fg(C_STEEL)));
@@ -5020,7 +5513,12 @@ pub fn render_fleet_peek_overlay(
                 Line::from(""),
             ],
             body,
-            footer: " ␣/esc close · ⏎ attach".to_string(),
+            footer: if p.truncated {
+                let clip = if p.clip > 0 { p.clip } else { 700 };
+                format!(" ␣/esc close · ⏎ attach · …cut at {clip}/msg · f full")
+            } else {
+                " ␣/esc close · ⏎ attach".to_string()
+            },
             scroll,
         },
         f,
@@ -6149,7 +6647,16 @@ pub fn render_big(st: &State, ui: &Ui, blocks: bool, f: &mut Frame<'_>, area: Re
     let pct = (ratio * 100.0).round() as u64;
     let zone = zone_color(ratio);
 
-    if blocks {
+    // a window so small that the percentage would cover half of it or more
+    // shows the bare number only: a few stray gauge cells behind the text
+    // read as noise, not as a tank. Too small for even the number → the
+    // gauge alone.
+    let pct_w = format!("{pct}%").len();
+    let cells = area.width as usize * area.height as usize;
+    let text_only = pct_w <= area.width as usize && pct_w * 2 >= cells;
+    if text_only {
+        // no background
+    } else if blocks {
         render_big_blocks(st, ui, f, area);
     } else {
         // gradient tank: cells covered = context left, palette sweeps its
@@ -6173,15 +6680,28 @@ pub fn render_big(st: &State, ui: &Ui, blocks: bool, f: &mut Frame<'_>, area: Re
         .unwrap_or_else(|| "—".to_string());
     let mut pct_style = fg(lerp(zone, C_WHITE, 0.20)).add_modifier(Modifier::BOLD);
     let mut name_style = fg(C_FG);
-    if blocks {
+    if blocks && !text_only {
         pct_style = pct_style.bg(rgb(C_BG));
         name_style = name_style.bg(rgb(C_BG));
     }
-    let spans = vec![
-        Span::styled(format!(" {pct}%"), pct_style),
-        Span::styled(format!(" · {name} "), name_style),
-    ];
-    let line = Line::from(spans);
+    // the readout drops what does not fit (name first, then the pad, then
+    // the number itself) so a tiny window never shows a clipped percentage
+    let aw = area.width as usize;
+    let pct_span = Span::styled(format!(" {pct}%"), pct_style);
+    let line = if pct_span.width() + 1 > aw {
+        let bare = Span::styled(format!("{pct}%"), pct_style);
+        if bare.width() > aw {
+            return;
+        }
+        Line::from(bare)
+    } else {
+        let name_span = Span::styled(format!(" · {name} "), name_style);
+        if pct_span.width() + name_span.width() > aw {
+            Line::from(pct_span)
+        } else {
+            Line::from(vec![pct_span, name_span])
+        }
+    };
     let rect = Rect {
         x: area.x,
         y: area.y,
